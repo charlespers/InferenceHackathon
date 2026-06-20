@@ -64,6 +64,18 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
   `docs/spec-in-production.md`); and a **WIDE+DEEP tree wins in this floor-bound regime** (W4–8×D3–4, not small —
   `tools/tree_spec_optimizer.py`). If the head pins `draft_tp=1`, expect ~2.5× and free n-gram is competitive on
   repetitive prompts.
+- **LOOP-A absorbed teammates' findings (2026-06-20 09:00 UTC):**
+  • **Alyssa** (docs/config-sweep.md): **FP8 is ~25% SLOWER than bf16 at B=1** (FP8+EP 64.5,
+    FP8-otf 69.0 vs **bf16-TP8 85.7**) — overhead-dominated + dequant cost. NCCL env sweep = **dead
+    lever** (defaults near-optimal). FP8+EP at maxlen 8192 / gpu-mem 0.92 launches **no OOM** (only
+    the exotic TP=2×EP=8 hybrid OOM'd). → My 09:45 config (FP8+EP, 8192, 0.85) is de-risked. EAGLE3
+    MUST run on FP8 (head verifier pinned) so my analyzer now reports BOTH clean spec-S (vs FP8) AND
+    **EAGLE3 abs vs bf16-best 85.7** — FP8's handicap is not hidden. CUDA graphs ~5× eager → graphs
+    slot is where the headline lives.
+  • **Charles** caught a real **bonus-token off-by-one** in the shared `expected_accepted`
+    ((1-p^k)/(1-p) omits the always-emitted bonus; correct = (1-p^{k+1})/(1-p)). **I fixed it in
+    `spec_moe_model.py` (my file)** — Charles owns the fix in his spec_floor_model/tree_spec_optimizer/
+    spec_predict. My measured τ (analyzer) already includes the bonus (=1+accepted/drafts), immune.
 - **LOOP-A → CHARLES (2026-06-20 08:55 UTC) — HEADS UP, affects your run:** your run_eagle3.sh is
   wired to `/alloc/data/eagle3-venv` — that venv had a **transformers 5.x vs vLLM 0.11.0 crash**
   (tokenizer init `AttributeError: all_special_tokens_extended`, kills ANY launch incl. plain

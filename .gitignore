@@ -1,0 +1,12 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+playwright-report/
+test-results/
+*.tsbuildinfo
+ui/vite.config.js
+ui/vite.config.d.ts

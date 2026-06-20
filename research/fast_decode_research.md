@@ -119,20 +119,19 @@ For B=1 *latency* (not throughput) can beat TP=8. Cheap A/B on the existing harn
 This is the comparison worth understanding precisely. Both **defer the per-layer all-reduce and
 overlap it with later work** instead of blocking on it. The difference is *how they stay correct*.
 
-**Kog Delayed Tensor Parallelism (DTP)** — from the primary source
-([delayed-TP blog](https://blog.kog.ai/delayed-tensor-parallelism-for-faster-transformer-inference/)):
-- 🟡 *"at the end of a module we launch the communication of each device local output to all other
-  devices, though we do not all-reduce those outputs straight away"* — it **defers + overlaps**,
-  does not skip/approximate.
-- 🟡 **Lossless** — *"a scaling factor (√L) compensates for delayed aggregation to preserve
-  numerical equivalence."* Aggregation happens δ layers later; result equals standard TP.
-- 🟡 **Requires the model to be TRAINED with the DTP architecture** — *"training a LLM with the
-  DTP architecture gets the best of both worlds."* It is an **architectural change**, not a
-  drop-in serving trick.
-- 🟡 Hides the collective **behind weight streaming**, explicitly targets *"batch-size-one token
-  generation speed…the metric that matters."* No custom comms library is described in this post
-  (the overlap comes from the architecture, using standard collectives).
-- 🟡 Demonstrated on a **2B model** (MI300X / H200).
+**Kog Delayed Tensor Parallelism (DTP)** — CORRECTED after deep verification
+(✅ 3-0; an earlier "lossless deferral" reading was **REFUTED 0-3**):
+- ✅ DTP is **NOT lossless and NOT a runtime reorder** — it is an **approximate architectural variant
+  that must be PRETRAINED.** Un-reduced local activations are forwarded with a **√L factor that
+  *mimics* the all-reduce's scale** (`X_l^{n+1} = X_l^n + √L·o_l^n`). *"Training… with such
+  no-communication architecture heavily degrades performance"*; DTP-pretraining only *"claws back"*
+  quality to *"very close to"* vanilla. "Lossless" in their post = quality-preserving **after
+  retraining**, not mathematical equivalence.
+- ✅ Their **collective library** is a separable, reusable win: **NaN-sentinel polling** (consumers
+  poll only the values they need) — **0.80–0.93µs vs 7.59–7.88µs (~9×)**, a *synthetic* microbench.
+  Usable **without** the lossy architecture / retraining.
+- ✅ Explicitly targets B=1 latency; demonstrated on a **2B dense FP16** model (MI300X/H200, a
+  bandwidth-bound regime) — **large MoE is explicitly future work.**
 
 **The key mechanistic insight DTP exploits (and we can too):** at B=1 there is ~0 compute to hide
 comms behind — **but there is ~3.3 ms of weight streaming per token.** NVLink collectives and HBM
@@ -141,16 +140,17 @@ weight reads use **different hardware paths**, so an (exact) all-reduce of layer
 
 **How N4 (speculative/stale TP) relates:**
 
-| | Kog DTP | N4 Speculative/Stale TP |
-|---|---|---|
-| Defers the all-reduce? | Yes, δ layers | Yes, K layers |
-| Correctness | **Lossless** (√L-compensated) | **Approximate** (tolerate drift) or **speculative** (predict + rollback) |
-| Needs retraining? | **Yes** — model trained in DTP form | **No** — runs on stock Qwen3-235B |
-| What fills the gap | Exact deferred value, overlapped w/ weight streaming | Predicted/stale value (temporal coherence or learned correction) |
-| Risk | Low quality risk, high *adoption* cost (can't retrain 235B at a hackathon) | Low adoption cost, **quality risk** (needs parity gate) |
-| Relationship | The lossless, training-time ideal | The inference-only, no-retraining approximation of the same idea |
+| | Kog DTP | Ladder-Residual (ICML'25) | N4 Speculative/Stale TP |
+|---|---|---|---|
+| Defers/staggers the collective? | Yes, √L-deferred | Yes, depth-1 stale residual | Yes, every K layers |
+| Correctness | **Approximate** (√L mimics scale) | **Approximate** (exact collective, stale input) | **Approximate** (tolerate drift / predict+rollback) |
+| Needs retraining? | **Yes** — pretrained DTP | **Yes** — from-scratch or ~3B-token convert | **Unknown — the open question** (probe tests no-retrain) |
+| Proven at B=1/8×H100? | No (2B dense, MI300X/H200) | **Yes — 70B dense, 23.7% latency / 30.8% tok/s** | TBD |
+| MoE? | future work | untested | untested (2nd novel angle) |
 
-◆ **Bottom line:** N4 is essentially *"DTP without the retraining"* — we trade Kog's √L exactness
+◆ **Bottom line (corrected):** N4 is *"the runtime-only, K-layer generalization of Ladder-Residual."*
+The literature is unanimous that the quality-recovering versions (Kog, Ladder) **need training** — so
+N4's bet is precisely whether you can skip that. We trade Kog/Ladder's retrained quality
 for an approximation we can validate with a parity gate. **There is a third, safer middle option
 that may dominate both:** **exact deferred-overlap on the stock model** — overlap layer L's *exact*
 NVLS all-reduce with layers L+1…L+δ weight streaming, deferring only as far as the data dependency
@@ -158,10 +158,12 @@ NVLS all-reduce with layers L+1…L+δ weight streaming, deferring only as far a
 all-reduce and the next attention's QKV weight-load can overlap). This is lossless, needs no
 retraining, and is the natural thing to bake into the N1 megakernel. **Recommended sequencing:**
 do exact deferred-overlap first (free, lossless), then push to stale/speculative (N4) only if the
-exposed-comms residue is still material. Whether N4 (true cross-layer staleness on a stock model)
-is novel for B=1 MoE decode is the open question Run 2 (`wf_07e8b2cc-0b1`) is checking; preliminary
-read is that **exact** overlap (Flux/async-TP/DTP) is well-explored but **approximate cross-layer
-staleness on a non-retrained model for single-stream decode is largely untried.**
+exposed-comms residue is still material. **✅ Novelty now confirmed (`wf_07e8b2cc-0b1`):** the
+K-layer runtime-only variant is **novel**; the nearest neighbor is **Ladder-Residual (ICML 2025)** —
+a depth-1 (K=1) stale-residual, *retrained* architecture that is **measured at B=1/TP=8/8×H100:
+23.7% decode-latency, 30.8% tok/s on 70B dense** — proving the idea pays at B=1 despite ~0 compute,
+but also that quality recovery **needs training**. Full deep-dive + experiment plan:
+**[`research/n4_speculative_stale_tp.md`](n4_speculative_stale_tp.md).**
 
 ---
 

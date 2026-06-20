@@ -66,6 +66,7 @@ using namespace q3;
 #include "k2_flash_decode.cu"   // k2_flash_decode_partial/_reduce + k2_launch + k2_pick_splits
 #include "k3_attn_epilogue.cu"  // k3_attn_epilogue + k3_launch
 #include "k4_router.cu"         // k4_router + k4_launch
+#include "k6_graph_capture.cu"  // K6: build_decode_graph / replay_decode_step / destroy_decode_graph
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) {                       \
   printf("CUDA err %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_));           \
@@ -458,19 +459,15 @@ int main(int argc, char** argv) {
   // =============================================================================================
   // (1) CUDA-GRAPH CAPTURE of the whole 94-layer step + head.
   // =============================================================================================
-  cudaStream_t cap;
-  CK(cudaStreamCreate(&cap));
-  // Warm up once OUTSIDE capture so cudaFuncSetAttribute / lazy module load happen before capture.
-  enqueue_decode_step(S, cap);
-  CK(cudaStreamSynchronize(cap));
-
-  cudaGraph_t graph; cudaGraphExec_t exec;
-  CK(cudaStreamBeginCapture(cap, cudaStreamCaptureModeThreadLocal));
-  enqueue_decode_step(S, cap);                  // record K1..K5 x94 + final norm + lm_head + argmax
-  CK(cudaStreamEndCapture(cap, &graph));
-  CK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
-  size_t nnodes = 0; CK(cudaGraphGetNodes(graph, nullptr, &nnodes));
-  printf("\ncaptured graph: %zu nodes instantiated.\n", nnodes);
+  // Whole-step capture via K6 (kernels/k6_graph_capture.cu): warm-up outside capture, then record
+  // K1..K5 x94 + final-norm + lm_head + argmax into one graph and instantiate it.
+  DecodeGraph g;
+  if (!build_decode_graph(g, [&](cudaStream_t s) { enqueue_decode_step(S, s); })) {
+    printf("graph capture FAILED (see CUDA error above)\n"); return 1;
+  }
+  cudaStream_t    cap  = g.stream;              // K6-owned capture/replay stream
+  cudaGraphExec_t exec = g.exec;
+  printf("\ncaptured graph: %zu nodes instantiated.\n", decode_graph_nodes(g));
 
   cudaEvent_t ev0, ev1; CK(cudaEventCreate(&ev0)); CK(cudaEventCreate(&ev1));
 
@@ -510,8 +507,7 @@ int main(int argc, char** argv) {
          delta_us / total_launches, total_launches);
 
   // ---- cleanup (best-effort; OS reclaims on exit) ----
-  CK(cudaGraphExecDestroy(exec)); CK(cudaGraphDestroy(graph));
-  CK(cudaStreamDestroy(cap));
+  destroy_decode_graph(g);                      // frees exec, graph, and the K6 capture stream (cap)
   CK(cudaEventDestroy(ev0)); CK(cudaEventDestroy(ev1));
   printf("\n== done ==\n");
   return 0;

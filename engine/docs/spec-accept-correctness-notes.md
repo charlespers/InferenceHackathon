@@ -29,6 +29,13 @@ one forward over `[ctx_last, draft[0], …, draft[k-1]]` and take the logits emi
 `draft[pos-1]`** (and at `ctx_last` for `pos=0`) — i.e. the "predict-next" output one slot to the LEFT of
 `draft[pos]`. Do not read the output sitting at `draft[pos]`.
 
+> **STATUS UPDATE (LOOP-A):** Note 2 is now **FIXED at the engine level** — `Eagle3Engine::step`
+> overrides the full-accept bonus with a real target sample (`sample_bonus`), and the test
+> `decode_is_lossless_invariant_to_lambda_and_verify_depth` proves `decode()` output is exact-lossless
+> given a correct target. Note 1 remains a **native-verify contract requirement** (the default mock
+> `forward_batch` is still off-by-one; the native target must emit the correct layout — the test's
+> `RampTarget` demonstrates it).
+
 ## Note 2 — the bonus token on a FULL-accept round is a stand-in (can duplicate)
 
 When all `k` positions accept, `accept.rs` (lines ~104–114) sets

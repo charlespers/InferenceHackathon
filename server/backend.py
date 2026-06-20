@@ -27,7 +27,7 @@ class VLLMBackend(Backend):
 
     def stream(self, req: ChatRequest, topo: dict) -> Iterator[dict]:
         payload = json.dumps({
-            "model": "/alloc/data/Qwen3-235B-A22B",
+            "model": os.environ.get("VLLM_MODEL", "qwen3-235b-fp8"),  # vLLM's served id (see /v1/models)
             "messages": [{"role": m.role, "content": m.content} for m in req.messages],
             "temperature": req.temperature,
             "max_tokens": req.max_tokens,

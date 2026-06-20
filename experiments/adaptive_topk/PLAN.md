@@ -254,3 +254,133 @@ skipping all unselected experts entirely. Tradeoff:
 **Recommendation:** ship the `custom_routing_function` (regime A) first — lowest
 risk, no kernel changes — measure with the A/B, and only build the custom B=1
 loop if the fused path's padding/graph overhead is shown to swallow the saving.
+
+---
+
+## CUDA-graph viability
+
+**Verdict (the make-or-break question): the routing fn DOES run per decode step
+under CUDA graphs, but the fused EP `-1` skip is NOT guaranteed to convert into a
+wall-clock win at B=1 — the byte read drops, the grid does not.** Use the fused
+plugin for the FP8 + graphs A/B first; if the measured speedup is swallowed by
+fixed kernel overhead, switch to the `custom_forward_fallback.py` B=1 expert loop.
+Reasoning below (all from vLLM ~v0.10.x source).
+
+### (a) Does our Python `custom_routing_function` run per decode step under graphs? — YES
+
+`FusedMoE.forward` does not call `forward_impl` directly. It dispatches through a
+**registered custom op**:
+
+```python
+# vllm/model_executor/layers/fused_moe/layer.py
+return torch.ops.vllm.moe_forward(hidden_states, router_logits, self.layer_name)[...]
+
+def moe_forward(hidden_states, router_logits, layer_name):
+    self = get_forward_context().no_compile_layers[layer_name]
+    return self.forward_impl(hidden_states, router_logits)   # -> select_experts -> custom_routing_function
+
+direct_register_custom_op(
+    op_name="moe_forward", op_func=moe_forward,
+    fake_impl=moe_forward_fake, ...)              # fake_impl => OPAQUE to Dynamo
+```
+
+Two consequences that together answer (a):
+
+1. **Dynamo treats `moe_forward` as opaque.** Because it is a custom op with a
+   `fake_impl`, `torch.compile`/Dynamo does not trace into `forward_impl` /
+   `select_experts` / `custom_routing_function`. The FX graph keeps a single
+   `moe_forward` node; at runtime the *real* Python body runs eagerly **every
+   call**. So our `torch.softmax` / `torch.topk` / boolean-mask / advanced-index
+   logic is never frozen or constant-folded — it executes each decode step,
+   reading fresh router logits. Data-dependent `.nonzero()` / masked assignment do
+   NOT crash compilation either, precisely because they sit behind the opaque op.
+
+2. **Routing is OUTSIDE the captured graph region.** vLLM's default piecewise
+   mode splits the graph only at attention ops:
+   `splitting_ops` defaults to `_attention_ops =
+   ["vllm.unified_attention", "vllm.unified_attention_with_output",
+   "vllm.mamba_mixer2"]` (`vllm/config/compilation.py`,
+   `set_splitting_ops_for_v1`). `moe_forward` is **not** a splitting op, but it is
+   a custom op the compiler cannot see through, so the MoE body (router + kernel)
+   executes via the eager custom-op call regardless of piecewise vs full capture.
+   The routing function is effectively *outside* the replay-frozen region.
+
+   → **The router runs live every step and emits fewer distinct experts as
+   intended. Graph capture does not bypass it.** (a) is a clean PASS.
+
+### (b) Does `moe_align_block_size` pad the grid so skipped experts don't reduce wall-clock? — LARGELY YES (this is the real limiter)
+
+```python
+# vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+max_num_m_blocks = cdiv(max_num_tokens_padded, block_size)
+```
+
+`EM` / the grid is sized from a **fixed** capacity, not from the count of distinct
+experts that actually appear. Dropping experts to `-1` does **not** shrink the
+grid. The Triton kernel still launches over the padded block set; for a `-1`
+block it hits `if off_experts == -1: write_zeros; return` — it **skips the HBM
+weight load and the GEMM** (the expensive part, the whole point), but it does NOT
+remove the block iteration / launch / align scaffolding. So:
+
+- **Byte read: genuinely lower** (skipped experts' gate/up/down never loaded).
+- **Grid / launch / align overhead: unchanged.**
+
+At **B=1 (M=1)** the grid is already tiny (numel = top_k = 8), so the absolute
+overhead is small — but so is the absolute saving, and there is no guarantee the
+saved bytes dominate the fixed per-layer kernel floor. This is exactly why the
+weight-bound (FP8 + graphs) regime is required: only there are expert-weight
+bytes a large enough fraction of per-layer time for the skipped load to outrun
+the fixed overhead.
+
+### (c) Does capture succeed with data-dependent `topk_ids` (the -1 positions vary per token)? — YES
+
+The varying `-1` positions live **inside** the opaque `moe_forward` op and the
+non-captured eager region, not in the FX graph. CUDA-graph capture records fixed
+*tensor addresses and kernel launch sequence*, not data values; the Triton MoE
+launch sequence at B=1 is shape-stable (always `[1, 8]` `topk_ids`), and the
+per-step `-1` pattern only changes tensor *contents*, which graph replay re-reads
+from the same persistent buffers. **No graph-break, no re-capture per token.**
+Capture succeeds.
+
+### Net verdict
+
+| Question | Answer |
+|----------|--------|
+| Router runs per step under graphs? | **Yes** (opaque custom op → eager body each call) |
+| Routing inside frozen captured region? | **No** — outside; not bypassed |
+| Skipped `-1` experts reduce HBM bytes? | **Yes** — load + GEMM early-returned |
+| Skipped experts shrink the grid / fixed overhead? | **No** — `EM` padded to fixed capacity |
+| Capture succeeds with varying `-1` positions? | **Yes** — data lives in eager region |
+| **Fused-skip realizes a real latency win under graphs?** | **Plausible but NOT guaranteed — measure.** Byte saving is real; wall-clock win depends on byte-time dominating fixed kernel/align floor, which only holds in the weight-bound FP8 regime. |
+
+**Decision for the next A/B:** run the **fused-skip plugin** (`vllm_adaptive_moe`)
+in the weight-bound config below — it is lower risk and supports quantized
+experts. Use `stats_snapshot()` to confirm `reduced_fraction`/`avg_k`, then
+compare measured decode tok/s to the §5 ceiling. **If measured ≪ predicted**
+(i.e. EM padding + fixed kernel floor ate the saving), switch arm 1 to the
+**custom-forward fallback** (`custom_forward_fallback.py`), which bypasses the
+fused kernel and loads *exactly* k experts at B=1 — note that reference loop
+currently handles **unquantized** expert weights, so for an FP8 layer either run
+it on a bf16 build or extend `_expert_mlp` to dequant first.
+
+### Recommended FP8 + CUDA-graphs launch command (next A/B)
+
+CUDA graphs ON = simply **omit `--enforce-eager`** (graphs are the default).
+
+```bash
+# Arm 1 (adaptive, fused-skip) — weight-bound: FP8 + CUDA graphs ON
+ADAPTIVE_TOPK_ENABLE=1 ADAPTIVE_TOPK_K=4 ADAPTIVE_TOPK_THRESH=0.9 \
+ADAPTIVE_TOPK_DEBUG=1 VLLM_PLUGINS=adaptive_topk \
+vllm serve /alloc/data/Qwen3-235B-A22B \
+  --quantization fp8 \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --max-num-seqs 1 \
+  --no-enable-prefix-caching \
+  --port 8000
+# (Do NOT pass --enforce-eager. Baseline arm 0: same line with ADAPTIVE_TOPK_ENABLE=0.)
+```
+
+If/when falling back to the custom B=1 loop, swap the plugin only:
+`VLLM_PLUGINS=adaptive_topk_fallback` (same env knobs).

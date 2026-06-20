@@ -73,6 +73,7 @@ class Cfg:
     decode_only = _env_flag("STALE_TP_DECODE_ONLY", True)
     period = int(os.environ.get("STALE_TP_PERIOD", "188"))
     collectives_per_layer = int(os.environ.get("STALE_TP_COLLECTIVES_PER_LAYER", "2"))
+    world = int(os.environ.get("STALE_TP_WORLD", "8"))  # TP size; predicted = local x world
     debug = int(os.environ.get("STALE_TP_DEBUG", "0"))
     # Optional control file: JSON {"enable","K","mode","policy","decode_only"} re-read
     # at the start of each forward pass, so ONE vLLM launch can sweep K/policy (edit
@@ -92,6 +93,7 @@ REAL = "real"            # did the true all-reduce
 REAL_FALLBACK = "real_fallback"  # wanted to substitute but had no cache yet
 STALE = "stale"          # reused a cached real reduced value (proxy policy)
 LOCAL = "local"          # returned the un-reduced local partial (local policy)
+PREDICTED = "predicted"  # estimate the sum from THIS layer's local partial x world_size
 EXACT = "exact"          # disabled / refresh / prefill -> true reduce, no caching role
 
 
@@ -107,6 +109,7 @@ class StaleScheduler:
         self.decode_only = cfg.decode_only
         self.period = max(1, cfg.period)
         self.cpl = max(1, cfg.collectives_per_layer)
+        self.world = getattr(cfg, "world", 8)
         self.debug = cfg.debug
         self.ctl_path = getattr(cfg, "ctl", "") or getattr(cfg, "ctl_path", "")
         self._ctl_mtime = 0.0
@@ -203,6 +206,8 @@ class StaleScheduler:
         # non-refresh: substitute
         if self.policy == "local":
             return LOCAL, local_value      # local partial always matches shape
+        if self.policy == "predicted":
+            return PREDICTED, local_value  # wrapper scales by world_size (cheap sum estimate)
         cached = self._last_by_slot.get(slot)
         if cached is None or cached[0] != shape:   # no cache / shape mismatch -> real
             return self._real(real_reduce, self._last_by_slot, slot, shape, is_prefill, REAL_FALLBACK)
@@ -215,6 +220,8 @@ class StaleScheduler:
             return self._real(real_reduce, self._cache_by_idx, idx, shape, is_prefill, kind)
         if self.policy == "local":
             return LOCAL, local_value
+        if self.policy == "predicted":
+            return PREDICTED, local_value
         cached = self._cache_by_idx.get(idx)
         if cached is None or cached[0] != shape:
             return self._real(real_reduce, self._cache_by_idx, idx, shape, is_prefill, REAL_FALLBACK)
@@ -283,6 +290,14 @@ def install():
             token_count=token_count,
             shape=shape,
         )
+        if kind == PREDICTED:
+            # cheapest sum estimate from local info: E[sum] = world_size * E[partial].
+            # Right expected magnitude, but local DIRECTION (missing the other ranks'
+            # contributions) -- the info-barrier test.
+            try:
+                return value * sched.world
+            except Exception:
+                return orig(input_)
         if kind in (STALE, LOCAL):
             return value.clone() if hasattr(value, "clone") else value
         return value

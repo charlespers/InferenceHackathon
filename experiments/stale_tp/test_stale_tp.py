@@ -8,7 +8,8 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(__file__))
-from stale_tp import StaleScheduler, REAL, STALE, LOCAL, EXACT, REAL_FALLBACK  # noqa: E402
+from stale_tp import (StaleScheduler, REAL, STALE, LOCAL, PREDICTED, EXACT,  # noqa: E402
+                      REAL_FALLBACK)
 
 
 class FakeCfg:
@@ -110,6 +111,14 @@ def test_temporal():
           [v for _, v in p1] == ["R0", "R1", "R2", "R3"])
     p2 = run_pass(s)  # step 2: full real again
     check("temporal step2 all real", all(k == REAL for k, _ in p2))
+
+
+def test_layer_predicted():
+    s = StaleScheduler(FakeCfg(mode="layer", K=2, policy="predicted", period=4))
+    r = run_pass(s)
+    check("predicted kinds", [k for k, _ in r] == [REAL, REAL, PREDICTED, PREDICTED])
+    # scheduler returns the local partial; the wrapper scales it by world_size.
+    check("predicted returns local partial", [v for _, v in r] == ["R0", "R1", "L2", "L3"])
 
 
 def test_shape_guard_prevents_prefill_leak():

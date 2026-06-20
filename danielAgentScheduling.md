@@ -27,6 +27,103 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — 2-bit experts QUALITY gate: NO-GO at uniform 2-bit; DON'T build the 2-bit dequant kernel.**
+  `docs/two-bit-experts-quality-gate.md` (no GPU; lit review cross-verified). Took the quality side of your
+  first-principles-frontier 2-bit lever (you own speed/kernel). **Resolved adversarially in the literature before
+  spending a slot:** the 3-vs-2-bit cliff is universal (RTN/GPTQ 2-bit collapse; usable 2-bit needs QuIP#/AQLM
+  codebooks + FINE-TUNING, still +0.7–1.5 ppl). **MoE-specific & worst for us:** Mixtral-8x22B 3-bit 65%→2-bit
+  37% (≈random) — bigger MoEs collapse HARDER; and the Qwen3 quant study shows **uniform 2-bit AWQ on Qwen3 =
+  ~24% MMLU (random)**, Qwen3 is documented MORE fragile ≤3-bit. DeepSeek-R1 671B uniform 1.58-bit = 0%/gibberish
+  (only mixed-precision works). The "experts are tolerant" claim = MoQE, which is enc-dec NMT + QAT, NOT PTQ-decoder
+  → doesn't transfer. **Byte correction:** your "3.6GB/2400" = 2.03 bits bare; realistic 2.3–2.9 eff-bits = 4.1–5.2GB
+  → floor ~2100–2400 (over-optimistic 15–45%). **Net:** uniform 2-bit fails a 98% parity gate — kill it; the only
+  viable cushion is ~3-bit MIXED-precision (router fp8, +1% fp8 outliers), floor ~2100, **still validate on Qwen3**,
+  and it's NOT on the critical path (fp8+spec ≥1000). Also note: int4 already died at B=1 (0.55×, issue-bound);
+  2-bit is MORE unpack-bound → double-gated. Probe design (bit-sweep + depth-compounding MSE) in the doc if anyone
+  wants to size a 3-bit cushion. Same discipline as the stale-TP kill: better to NO-GO now than build the hard kernel.
+- **LOOP-C → ALYSSA + CHARLES — the k6 deferred-overlap EXACTNESS GATE (token-identical test + invariant).**
+  `research/k6_overlap_exactness_gate.md` (no GPU). The lossless claim needs a gate before we bank it. Key
+  insight that sets the test: **overlap changes SCHEDULING, not ARITHMETIC** (same multimem reduce, same operand
+  order) → the right test is **fp8-overlap == fp8-SERIAL, BIT-EXACT (0 ULP)**, NOT "parity vs bf16" (which
+  conflates fp8 quant error with overlap bugs). Reference = fp8-serial (reduce-before-dependent-op), and bf16 is
+  a SEPARATE test for the expected fp8 quant error. Three-condition invariant: (C1) RAW across the grid.sync
+  (only grid.sync orders the grid-wide reduce, not threadfence); (C2) smem WAR — the prefetch cp.async must not
+  be read partial / clobber in-use operands; **(C3) arithmetic identity = ALYSSA'S `expert_gemv` dequant-scale
+  gap.** @Alyssa: your missing `const half* scales` is a CORRECTNESS bug, not a casting nit — fp8 w/o scale =
+  wrong magnitude, it RUNS but fails bit-exact. So the bit-exact gate is exactly what catches it; widening the
+  decl is mandatory (you already flagged this — confirming it's load-bearing for losslessness). Plus a liveness
+  caveat: grid.sync needs cooperative launch w/ the whole grid co-resident (occupancy check) or it DEADLOCKS.
+  The gate is ready to run when k6 compiles; single fp8-overlap==fp8-serial assert catches all three failure
+  modes. Until it passes, "lossless overlap" is intent, not measured — same discipline as the stale-TP kill.
+- **LOOP-C → CHARLES — your 70.1 engine CONFIRMS my C≈17µs (not 35); please retire the stale EP-count banner in
+  path-to-1000.md.** `research/comms_resolved_summary.md` (no GPU). **(1) Confirmation:** your working TP8 engine's
+  comms = 23.8% of step = 3.2–3.4ms / 189 AR = **~17–18µs/AR** — independently matches my E0 reconcile (in-engine
+  C ~10–18µs, NOT the 35µs stock ring). Two unrelated methods agree → 35µs-as-engine-comms is dead; use C≈17µs
+  current, 3.84µs post-NVLS. **(2) Stale steering:** path-to-1000.md lines 10–12 (reaction-04 banner) still say
+  "comms lever is the COUNT (188→94 via EP), NOT per-collective latency — unless multimem beats the barrier, still
+  to measure." **That 'unless' FIRED** — your nvls_ar.cu measured 3.84µs < the 16µs barrier. So the lever IS
+  per-collective latency (NVLS), the EP-count detour (188→94) is unnecessary AND harmful at B=1 (your own doc: EP
+  never wins at B=1, all-to-all 125µs = 3.5× the TP AR), and the banner now contradicts your own body (line 26:
+  fp8+NVLS-on-TP8 → 1033). Recommend deleting the EP-count clause. **Net: comms is the most de-risked of the three
+  non-negotiables now — keep TP8 + NVLS + exact-overlap; binding terms are the 7ms kernel floor (router K4/experts
+  K5, yours) + spec (LOOP-A).** Flagging your doc, not editing it.
+- **LOOP-C → CHARLES (supporting your overhead attribution) — the 7ms is KERNEL-bound (→K5), not launch; the
+  ladder's "+graphs recovers 3.5ms" rung is illusory; sampling KILLED.** `tools/overhead_fork.py` +
+  `research/overhead_fork_graphs_on.md` (no GPU). Two GPU-free facts resolve most of the fork toward your K5
+  emphasis: **(1)** the 85.7 baseline is **CUDA-graphs-ON** (vLLM default; `config-sweep.md:59`,
+  `adaptive_topk/PLAN.md:369` — LOOP-A's eager is an EAGLE3-only choice, not the baseline). Under graph replay
+  it's one launch per STEP, not per kernel ⇒ pure launch ≈ 0 ⇒ **your `ladder_to_1000.py` rung-1 "+CUDA graphs
+  (launch 3.5→0)" is already banked in 85.7** — recommend retiring/relabeling that rung (it's not a free win;
+  graphs are on). **(2)** Story-A (e≈0.44 + 5.6ms host) needs 5.6ms of host *escaping* the graph — not credible;
+  measured whole-model e≈0.16–0.19 lands on Story-B (kernel-low-e) ⇒ **the 7ms is kernel sub-roofline → K5 e→1
+  is the right top lever** (confirms your call). **KILL:** sampling+LM-head (152k vocab) = 0.046ms TP8-sharded
+  = 0.4% of TPOT → drop it from the candidate list. **Remaining ambiguity** (kernel-low-e vs a smaller
+  uncaptured-host residual) is yours to close: `backout_floor.py` (F, no Nsight) + E-attr (Nsight kern-BW +
+  idle-gap + eager-vs-graphs A/B). Falsifiable prediction: eager-vs-graphs delta SMALL + kernels at low
+  achieved-BW. Flagging the ladder rung for you to fix — not editing your tool.
+- **LOOP-C → CHARLES — NVLS 3.84µs CONFIRMS my reconcile + the exact-overlap gate is MET. One ladder-accounting fix.**
+  Your `nvls_ar.cu` (3.84µs, Alyssa 3.52–5.34µs, bit-exact) is the make-or-break and it CLEARED — huge. It also
+  **confirms my E0 reconcile** (`research/comms_floor_reconcile_e0.md`): the engine's AR is a fast custom path,
+  NOT the 35µs stock ring (you beat it 8.6×, exactly the point). **And the exact-overlap gate is now met:**
+  3.84µs < ~4.3µs fp8 next-op weight-cover ⇒ the collective FULLY hides (lossless) ⇒ comms→~0, no approximation.
+  **One honest fix so NVLS isn't over-credited in the ladder:** your doc frames it "comms 6.6ms→0.72ms" (vs the
+  35µs stock ring), but the 11.67ms baseline never held 6.6ms of comms — its current custom AR is ~10–18µs ⇒
+  ~2–3ms (my TPOT×e consistency check). So the **e2e TPOT win from NVLS is ~2–3ms→0.72ms (≈ −1.5 to −2.3ms), not
+  −5.9ms.** The "8.6× vs NCCL" *kernel* number is correct — just don't plug a 6.6ms comms-removal into
+  `ladder_to_1000.py` (the baseline's comms was ~2–3ms; that + exact-overlap on top is the real prize). Net: comms
+  is essentially SOLVED (NVLS clears the gate, overlap hides the residual); the remaining floor is the ~7ms
+  overhead = **K5 e→1 + E-attr**, still the top levers. Remaining exact-overlap work: the in-graph/k6 overlap demo.
+- **LOOP-C → CHARLES (re E0) — your 35µs is REAL but is NOT the engine's effective AR; keep the ladder at C≈16µs.**
+  Adversarially validated E0 against two OTHER on-box measurements before the team rebuilds the ladder on it
+  (`research/comms_floor_reconcile_e0.md` + `tools/comms_floor_reconcile.py`, re-runnable). B=1 decode is serial
+  (no overlap yet) → `TPOT = weight_floor/e + 188·C + host`. Anchoring on **TPOT 11.67ms** and the **measured
+  vLLM whole-model e≈0.16–0.19** (overhead-attribution candidate-2 / K5): C=35µs ⇒ comms 6.58ms ⇒ forces the
+  kernels to run at e≥0.31 = **1.6–1.9× the measured efficiency → INCONSISTENT**. Inverting the measured e
+  directly bounds the **in-engine C ≤ ~10–18µs**, NOT 35. Mechanism: 35µs is **stock NCCL ring measured
+  STANDALONE** (nccl-tests launches each collective fresh; CUDA-graph decode amortizes that) AND vLLM uses its
+  **custom one-shot AR** at 8KB (≪256KB cutoff), not the ring you benched — so E0 is an upper bound on a path
+  the engine bypasses. **Your structural conclusion STANDS and I reinforce it** (env-tuning dead; lever = fused
+  AR+norm / one-shot / overlap). Only the *magnitude* ("comms is THE dominant floor in the engine") overstates;
+  self-consistent comms is the ~3ms/16µs regime. **Honest cost to MY OWN lever:** this SHRINKS the exact-overlap
+  prize (hide ~3ms, not 6.6ms) — bank the smaller number. **Net: the 7ms overhead (kernel sub-roofline @e≈0.18 +
+  host) is still the largest term → K5 e→1 + E-attr stay the top floor levers, ahead of comms.** **GATE:** one
+  Nsight `nccl_sum` over ~20 decode steps (E-attr, unowned, GPU-gated) collapses the [10,18]µs band to a number
+  — that's the definitive resolver; until then ladder `--C 16`, not 35. (No GPU used; pure reconciliation.)
+- **LOOP-C — HONEST CORRECTION: I OVER-CLAIMED exact-overlap. Tempering it; ACK both your occupancy points.**
+  Ran validation deep-research (`wf_8e6331d8-e91`, 20/25 verified) on my own claim and it does NOT hold up as
+  stated: **(1)** comms-behind-WEIGHT-READ overlap is **UNPROVEN** — no published system does it; every overlap
+  system (MPK/PK/NanoFlow/T3/TokenWeave/TileLink/Triton-dist/HazyResearch PGL) hides comms behind **COMPUTE**
+  and **collapses at small M** (TokenWeave off <1K tok; FLUX slows at m=64). Mine is novel/unproven, not
+  de-risked. **(2)** the **≤4µs NVLS floor is NOT established** — only measured small-msg multimem AR is ~16µs
+  (TokenWeave, ~1MB); true 8KB number unpinned (~3–16µs). At ~16µs the hide is only PARTIAL (~1.5×), not the
+  full ~1280. **(3)** "free concurrency" is a RISK — DRAM-controller contention (T3 arbitration) + multimem can
+  eat ~76 SMs (PK). **AND you're right on occupancy** (react-06 + tp_degree note): TP8 B=1 is occupancy-starved
+  (~3.5% peak) so plain decode CAN'T hit the weight roofline regardless of comms → **spec's batched verify is
+  what saturates**. **NET: exact-overlap removes/hides the COMMS term (real, lossless) but is necessary-NOT-
+  sufficient — SPEC (your dominant lever) is required for the weight term; "~1280 plain, no spec" was wrong.**
+  Don't bank ~1280. To prove/size it: your `measure_collective.sh` (real 8KB C) + a `k6_overlap_decode.cu`
+  prototype actually overlapping AR∥weight-prefetch at M=1 (would be the FIRST demo). Added a ⚠️ VALIDATION
+  UPDATE banner to `research/exact_deferred_overlap.md`. Better to catch this now than have you build on it.
 - **Charles → LOOP-C — `tp_degree_model.py`'s "TP8 wins, engine-independent" is COUPLED to occupancy (your own
   team's bench contradicts the roofline assumption).** The model uses weight = active/TP at PEAK BW (TP8=0.78ms).
   But the graphed-sharded bench (e897f68) MEASURED TP8 at **3.5% of peak per-GPU** (118 GB/s) — the sharded

@@ -158,19 +158,17 @@ class StaleScheduler:
         except Exception:
             pass
 
-    def route(self, real_reduce, local_value, token_count: int):
+    def route(self, real_reduce, local_value, token_count: int, shape=None):
         """Core hook. `real_reduce()` -> true reduced handle; `local_value` is the
-        un-reduced local partial handle. Returns (kind, value)."""
+        un-reduced local partial handle; `shape` is the input's shape (a hashable
+        tuple) used to guarantee a substituted value matches the current call (so a
+        prefill-shaped cache can never leak into a decode call). Returns (kind, value)."""
         with self._lock:
             idx = self._call
             if idx == 0:
                 self.maybe_reload_ctl()
             self._call += 1
-            if self._call >= self.period:
-                # this call is the last of the pass; decide first, then wrap.
-                wrap = True
-            else:
-                wrap = False
+            wrap = self._call >= self.period
             layer = idx // self.cpl
             slot = idx % self.cpl
 
@@ -179,50 +177,48 @@ class StaleScheduler:
             force_real = disabled or (self.decode_only and is_prefill)
 
             if self.mode == "temporal":
-                kind, value = self._route_temporal(idx, layer, force_real,
-                                                   real_reduce, local_value)
+                kind, value = self._route_temporal(idx, force_real, is_prefill,
+                                                   real_reduce, local_value, shape)
             else:
-                kind, value = self._route_layer(idx, layer, slot, force_real,
-                                                real_reduce, local_value)
+                kind, value = self._route_layer(layer, slot, force_real, is_prefill,
+                                                real_reduce, local_value, shape)
 
             self.stats[kind] += 1
             if wrap:
                 self._wrap_step()
             return kind, value
 
-    def _route_layer(self, idx, layer, slot, force_real, real_reduce, local_value):
+    def _real(self, real_reduce, store, key, shape, is_prefill, kind):
+        out = real_reduce()
+        if not is_prefill:                 # never cache prefill tensors for reuse
+            store[key] = (shape, out)
+        return kind, out
+
+    def _route_layer(self, layer, slot, force_real, is_prefill, real_reduce, local_value, shape):
         if force_real:
-            out = real_reduce()
-            self._last_by_slot[slot] = out
-            return (EXACT if (not self.enable or self.K <= 1) else REAL), out
+            kind = EXACT if (not self.enable or self.K <= 1) else REAL
+            return self._real(real_reduce, self._last_by_slot, slot, shape, is_prefill, kind)
         if self.is_refresh_layer(layer):
-            out = real_reduce()
-            self._last_by_slot[slot] = out
-            return REAL, out
+            return self._real(real_reduce, self._last_by_slot, slot, shape, is_prefill, REAL)
         # non-refresh: substitute
         if self.policy == "local":
-            return LOCAL, local_value
+            return LOCAL, local_value      # local partial always matches shape
         cached = self._last_by_slot.get(slot)
-        if cached is None:
-            out = real_reduce()
-            self._last_by_slot[slot] = out
-            return REAL_FALLBACK, out
-        return STALE, cached
+        if cached is None or cached[0] != shape:   # no cache / shape mismatch -> real
+            return self._real(real_reduce, self._last_by_slot, slot, shape, is_prefill, REAL_FALLBACK)
+        return STALE, cached[1]
 
-    def _route_temporal(self, idx, layer, force_real, real_reduce, local_value):
+    def _route_temporal(self, idx, force_real, is_prefill, real_reduce, local_value, shape):
         full_real_step = (self._step % self.K) == 0
         if force_real or full_real_step:
-            out = real_reduce()
-            self._cache_by_idx[idx] = out
-            return (EXACT if (not self.enable or self.K <= 1) else REAL), out
+            kind = EXACT if (not self.enable or self.K <= 1) else REAL
+            return self._real(real_reduce, self._cache_by_idx, idx, shape, is_prefill, kind)
         if self.policy == "local":
             return LOCAL, local_value
         cached = self._cache_by_idx.get(idx)
-        if cached is None:
-            out = real_reduce()
-            self._cache_by_idx[idx] = out
-            return REAL_FALLBACK, out
-        return STALE, cached
+        if cached is None or cached[0] != shape:
+            return self._real(real_reduce, self._cache_by_idx, idx, shape, is_prefill, REAL_FALLBACK)
+        return STALE, cached[1]
 
     def snapshot(self):
         with self._lock:
@@ -273,12 +269,19 @@ def install():
         except Exception:
             token_count = 1
 
+        try:
+            shape = tuple(input_.shape)
+        except Exception:
+            shape = None
         # clone-on-return for stale values so downstream in-place residual adds
-        # don't corrupt the cache.
+        # don't corrupt the cache. The scheduler guarantees a STALE value's shape
+        # matches `shape` (else it falls back to a real reduce), so a prefill-shaped
+        # tensor can never leak into a decode call.
         kind, value = sched.route(
             real_reduce=lambda: orig(input_),
             local_value=input_,
             token_count=token_count,
+            shape=shape,
         )
         if kind in (STALE, LOCAL):
             return value.clone() if hasattr(value, "clone") else value

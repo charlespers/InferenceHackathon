@@ -1158,7 +1158,10 @@ static int run_correctness_check(std::vector<RankState>& R) {
 
 // =================================================================================================
 // main() — one process, 8 GPUs, NCCL.  Measures the REAL TP=8 B=1 decode latency + AR overhead.
+// Define DSTP8_NO_MAIN before #include-ing this file to reuse RankState/alloc_rank/tp8_k1_launch/
+// tp8_k2_launch/tp8_k3_launch as a library (same convention as K5_NO_MAIN for k5_experts.cu).
 // =================================================================================================
+#ifndef DSTP8_NO_MAIN
 int main(int argc, char** argv) {
   const int    ctx_len = (argc > 1) ? atoi(argv[1]) : 4096;
   const int    IT      = (argc > 2) ? atoi(argv[2]) : 200;
@@ -1321,3 +1324,4 @@ int main(int argc, char** argv) {
   CK(cudaEventDestroy(ev0)); CK(cudaEventDestroy(ev1));
   return 0;
 }
+#endif // DSTP8_NO_MAIN

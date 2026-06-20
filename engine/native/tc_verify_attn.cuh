@@ -98,10 +98,13 @@ static __global__ void merge(const __half* Oc,const float* mxc,const float* smc,
 static inline int verify_attn(cublasHandle_t cb,
     const __half* Q, const __half* K, const __half* V,
     const __half* draftK, const __half* draftV, const int* parent,
-    int ctx, int M, int MMAX,
+    int ctx, int M, int MMAX, int n_heads,
     __half* S, __half* Oc, __half* Od, float* mxc, float* smc, float* mxd, float* smd,
     __half* out, cudaStream_t stream=0){
-  const int H=N_Q_HEADS, d=HEAD_DIM; const float scale=1.f/sqrtf((float)d), zero=0.f, one=1.f;
+  // n_heads = Q heads this call covers. In-engine: Q_HEADS_RANK (=8 at TP8), NOT N_Q_HEADS. K/V are the
+  // (replicated) cache for the kv head(s) those Q heads map to; here each of the H heads has its own K/V
+  // slab [ctx x HEAD_DIM] (GQA broadcast = caller duplicates the kv-head slab across its Q heads).
+  const int H=n_heads, d=HEAD_DIM; const float scale=1.f/sqrtf((float)d), zero=0.f, one=1.f;
   cublasSetStream(cb, stream);
   // (A) context: S[ctx x M] = scale * K^T(ctx x d) * Q(d x M)
   if(cublasGemmStridedBatchedEx(cb,CUBLAS_OP_T,CUBLAS_OP_N, ctx,M,d, &scale,

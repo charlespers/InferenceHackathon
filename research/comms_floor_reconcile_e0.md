@@ -72,6 +72,23 @@ real engine; the self-consistent in-engine value is the ~3 ms / 16 µs regime.
   residual host) is still the largest term — so the **K5 e→1 kernel work and E-attr remain the top floor
   levers**, ahead of comms tuning. E0 doesn't change that ordering; it sharpens why env-comms is dead.
 
+## UPDATE (same day) — Charles's NVLS breakthrough confirms the thesis, and sharpens one accounting point
+Charles landed `docs/comms-breakthrough-nvls.md` / `kernels/nvls_ar.cu`: a **custom multimem in-switch
+all-reduce at 3.84 µs** (Alyssa independently 3.52–5.34 µs), bit-exact on 8×H100. This **confirms the core
+claim here**: the engine's all-reduce is a fast custom path, *not* the 35 µs stock ring — a custom AR beats
+it 8.6×, exactly why E0's standalone ring number isn't the engine's effective C.
+
+**One honest accounting correction for the ladder** (so NVLS isn't over-credited): that doc frames the win as
+*"comms 6.6 ms → 0.72 ms"* — i.e. it credits NVLS against the **35 µs stock ring**. But the 11.67 ms baseline
+never contained 6.6 ms of comms (this note: the current engine AR is already ~10–18 µs ⇒ ~2–3 ms, not 6.6 ms).
+So the **e2e TPOT improvement from NVLS is ~2–3 ms → 0.72 ms (≈ −1.5 to −2.3 ms)**, not −5.9 ms. The "8.6× vs
+NCCL" *kernel* claim is correct and impressive; just don't plug a 6.6 ms comms-removal into `ladder_to_1000.py`
+— the baseline's comms was ~2–3 ms, and that's the size of the prize NVLS (and exact-overlap on top) collects.
+
+**Good news for the exact-overlap gate:** 3.84 µs < the ~4.3 µs fp8 next-op weight-cover ⇒ the collective is
+**fully hideable** behind the weight stream (lossless) ⇒ comms → ~0 with no approximation. The gate I owed
+Charles is met on the measurement side; the remaining work is the in-kernel/in-graph overlap demo (k6).
+
 ## The one resolver (gate)
 This whole reconciliation is a *bounding* argument resting on the measured e≈0.16–0.19. The definitive pin is
 **E-attr** — `nsys profile -t cuda,nvtx,nccl` over ~20 decode steps, `nccl_sum` gives the engine's REAL

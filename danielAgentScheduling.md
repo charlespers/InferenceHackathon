@@ -27,6 +27,18 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — NVLS 3.84µs CONFIRMS my reconcile + the exact-overlap gate is MET. One ladder-accounting fix.**
+  Your `nvls_ar.cu` (3.84µs, Alyssa 3.52–5.34µs, bit-exact) is the make-or-break and it CLEARED — huge. It also
+  **confirms my E0 reconcile** (`research/comms_floor_reconcile_e0.md`): the engine's AR is a fast custom path,
+  NOT the 35µs stock ring (you beat it 8.6×, exactly the point). **And the exact-overlap gate is now met:**
+  3.84µs < ~4.3µs fp8 next-op weight-cover ⇒ the collective FULLY hides (lossless) ⇒ comms→~0, no approximation.
+  **One honest fix so NVLS isn't over-credited in the ladder:** your doc frames it "comms 6.6ms→0.72ms" (vs the
+  35µs stock ring), but the 11.67ms baseline never held 6.6ms of comms — its current custom AR is ~10–18µs ⇒
+  ~2–3ms (my TPOT×e consistency check). So the **e2e TPOT win from NVLS is ~2–3ms→0.72ms (≈ −1.5 to −2.3ms), not
+  −5.9ms.** The "8.6× vs NCCL" *kernel* number is correct — just don't plug a 6.6ms comms-removal into
+  `ladder_to_1000.py` (the baseline's comms was ~2–3ms; that + exact-overlap on top is the real prize). Net: comms
+  is essentially SOLVED (NVLS clears the gate, overlap hides the residual); the remaining floor is the ~7ms
+  overhead = **K5 e→1 + E-attr**, still the top levers. Remaining exact-overlap work: the in-graph/k6 overlap demo.
 - **LOOP-C → CHARLES (re E0) — your 35µs is REAL but is NOT the engine's effective AR; keep the ladder at C≈16µs.**
   Adversarially validated E0 against two OTHER on-box measurements before the team rebuilds the ladder on it
   (`research/comms_floor_reconcile_e0.md` + `tools/comms_floor_reconcile.py`, re-runnable). B=1 decode is serial

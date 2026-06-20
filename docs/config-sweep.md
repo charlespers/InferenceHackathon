@@ -345,3 +345,49 @@ window close more of the overlap gap.
   all-reduce, excluding the router (K4), experts (K5), and the second all-reduce
   entirely — which the roofline says dominate per-token cost. A true comparable
   number needs the full-layer version, which is what `k6_overlap_decode.cu` is for.
+
+### Round 3 — the real NVLS C number, pinned (clears the ≤4µs gate)
+
+`research/exact_deferred_overlap.md`'s literature-review walk-back said the ≤4µs NVLS
+floor was unestablished (best comparable evidence ~16µs, at ~1MB not our 8KB) and
+flagged this as one of two things that would prove/size the whole exact-overlap bet.
+Someone (unclear who, found a working compiled binary at `/tmp/nvls` with no committed
+source — the file in `kernels/nvls_allreduce.cu` is still the unwired stub) had it
+working multi-process; we ran it ourselves with output finally captured to a file
+(previous attempts to watch it run live, twice, lost the output to a bare terminal).
+
+**Real per-collective C, 8-way NVLS multimem all-reduce, N=4096 fp32 (16KB), `npes=8`,
+correctness PASS (`maxerr=0.00e+00`):**
+
+| variant | C (µs/collective) | 188 collectives |
+|---|---|---|
+| (A) raw `multimem.ld_reduce`+`st`, no barrier | **3.52** | 0.66 ms |
+| (C) multimem + in-kernel flag spin-barrier | **5.34** | 1.00 ms |
+| (B) multimem + NVSHMEM **host** barrier | 1107.36 | 208.18 ms |
+
+**(A) clears the C≤4µs gate** — directly contradicts the literature review's pessimistic
+estimate and confirms the custom-multimem-kernel direction is real, not just
+plausible-in-principle. **(C)**, the safer in-kernel-barrier variant (no
+correctness risk from skipping the barrier), is right at the edge of the ≤4µs target
+but still well under the ~1ms/188-collective budget.
+
+**The sharp, immediately actionable lesson is (B) vs (C)**: an NVSHMEM **host**-side
+barrier is **~200x slower** than an in-kernel device-side flag-spin barrier (1107µs vs
+5.34µs) — this directly informs `k6_overlap_decode.cu`'s design: never call into a host
+barrier inside the per-layer loop, only in-kernel/device barriers, or the whole
+megakernel's premise (no host round-trip) is silently defeated by one bad barrier choice.
+
+**Open thread, not yet resolved**: we don't have the source that produced this working
+binary — `kernels/nvls_allreduce.cu` in git is still the `mc_setup()` stub (`return -1`).
+Whoever built `/tmp/nvls` solved the real multi-process multicast wiring (and, notably,
+it bootstraps via NVSHMEM's `nvshmemx_mc_ptr` accessor + `mpirun -np 8 -x
+NVSHMEM_BOOTSTRAP=MPI`, not raw `cuMulticastCreate` as the stub file sketches) — worth
+finding and committing that source before the binary is lost to a `/tmp` cleanup.
+
+**Cooperative-launch occupancy check (de-risking `k6_overlap_decode.cu`'s `grid.sync()`
+design)**: a representative proxy kernel (256 threads, 8KB shared mem/block, matching
+K1/K5's typical block shape) shows H100 can co-resident **1056 blocks** in one
+cooperative-launch wave, vs. a rough floor of ~68 needed (4 reduce-blocks + ~48 K5-proxy
++ ~16 K1-K3-proxy) — **15x headroom**. Caveat: this is a representative block shape, not
+k6's actual device functions, which may have higher real register pressure — rules out
+an immediate "doesn't fit at all" failure, doesn't yet prove the real kernel fits.

@@ -18,6 +18,9 @@ Public model facts + standard CUDA only — no proprietary engine internals.
 | `k4_router.cu` | K4 | post-RMSNorm → gate GEMV → fp32 softmax → top-8 → renorm (on-device) | W 128×4096 |
 | `k5_experts.cu` | K5 | gate+up+silu fused, down×gate+accumulate; grouped/persistent over 8; EP hooks | W 3072×4096, 4096×1536 |
 | `k6_graph_capture.cu` | K6 | whole-step CUDA-graph capture/replay + on-device sampling | — |
+| `nvshmem_comms.cu` | sync | device-initiated (NVSHMEM) collectives standalone microbench: recursive-doubling AR + put-based A2A vs NCCL floor | — |
+| `overlap_decode.cu` | sync | NCCL collective hidden behind independent compute (chunked + layer-pipeline schemes) | — |
+| `nvshmem_overlap_decode.cu` | sync | **the combination**: NVSHMEM AR (cheap per-call) *and* overlapped with the next layer's GEMV (double-buffered, event-gated) — neither `nvshmem_comms.cu` nor `overlap_decode.cu` alone does both | — |
 
 ## Build (on the box)
 

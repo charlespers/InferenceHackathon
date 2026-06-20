@@ -41,9 +41,12 @@ PROMPTS = [
 ]
 
 
+_MODEL_ID = "qwen3-235b-a22b"
+
+
 def stream_request(base: str, prompt: str, max_tokens: int, user: str | None = None) -> dict:
     payload = json.dumps({
-        "model": "qwen3-235b-a22b",
+        "model": _MODEL_ID,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": True,
@@ -114,7 +117,11 @@ def main():
     ap.add_argument("--tokens", type=int, default=100, help="max tokens per response")
     ap.add_argument("--out", default=None, help="optional JSON output file")
     ap.add_argument("--user", default=None, help="your name — shown in /api/tasks during the run")
+    ap.add_argument("--model", default=None, help="override model ID sent to the server")
     args = ap.parse_args()
+    if args.model:
+        global _MODEL_ID
+        _MODEL_ID = args.model
 
     prompts = (PROMPTS * ((args.n // len(PROMPTS)) + 1))[:args.n]
     user = args.user or "benchmark"

@@ -40,6 +40,8 @@ PYTHONPATH=src python -m inferutil.bench export --name fp8ep --format csv --out 
   quant beats weight quant); config sweep ranks quant variants and shows the bottleneck *moving*
   as you apply levers (e.g. after int4, comms becomes dominant).
 - `run` also writes a reproducibility `*.manifest.json` (host, git commit, model hash, hardware).
+- `--peak-bw-gbs <measured>` (on `run`/`sweep`) overrides the spec-sheet HBM bandwidth with a
+  measured number (e.g. from `kernels/k5_microbench`) so MBU + the floor use the real ceiling.
 - Design rationale: `docs/superpowers/specs/2026-06-19-rigorous-benching-design.md`.
 
 ## Loop (use it the moment the engine is up)

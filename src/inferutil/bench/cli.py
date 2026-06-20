@@ -8,6 +8,7 @@ import socket
 from datetime import datetime
 
 import sys
+from dataclasses import replace
 
 from ..model import QWEN3_235B
 from ..hardware import GPUS, Cluster
@@ -41,8 +42,19 @@ def _cluster_from_env(rec: RunRecord) -> Cluster:
     return Cluster(gpu=GPUS[gpu], n_gpus=rec.env.get("n_gpus") or 8)
 
 
+def _measured_cluster(cluster: Cluster, peak_bw_gbs) -> Cluster:
+    """Replace the spec-sheet HBM bandwidth with a measured GB/s (e.g. from
+    kernels/k5_microbench) so MBU and the floor use the real ceiling, not the
+    datasheet — Conifer-style 'measure, don't trust the spec'."""
+    if not peak_bw_gbs:
+        return cluster
+    return Cluster(gpu=replace(cluster.gpu, hbm_bw=peak_bw_gbs * 1e9),
+                   n_gpus=cluster.n_gpus)
+
+
 def _cmd_run(args) -> None:
-    cluster = Cluster(gpu=GPUS[args.gpu], n_gpus=args.n_gpus)
+    cluster = _measured_cluster(Cluster(gpu=GPUS[args.gpu], n_gpus=args.n_gpus),
+                                args.peak_bw_gbs)
     config = _build_config(args)
     engine = MockEngine(QWEN3_235B, cluster, efficiency=args.efficiency,
                         jitter=args.jitter, seed=config.seed)
@@ -65,8 +77,10 @@ def _cmd_run(args) -> None:
                             "driver_version": driver_version},
                        result=result)
     path = write_run(record, args.results_dir)
+    peak_bw_measured = args.peak_bw_gbs * 1e9 if args.peak_bw_gbs else None
     manifest = build_manifest(QWEN3_235B, cluster, config, cli=" ".join(sys.argv),
-                              runid=runid, driver_version=driver_version)
+                              runid=runid, driver_version=driver_version,
+                              peak_bw_measured=peak_bw_measured)
     mpath = os.path.join(args.results_dir, config.name, runid + ".manifest.json")
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -120,7 +134,8 @@ def _cmd_diagnose(args) -> None:
 
 
 def _cmd_sweep(args) -> None:
-    cluster = Cluster(gpu=GPUS[args.gpu], n_gpus=args.n_gpus)
+    cluster = _measured_cluster(Cluster(gpu=GPUS[args.gpu], n_gpus=args.n_gpus),
+                                args.peak_bw_gbs)
     config = BenchConfig(name="sweep", plan=args.plan, dtype_bytes=args.dtype,
                          kv_dtype_bytes=args.kv_dtype, tp=args.tp, ep=args.ep,
                          prompt_tokens=args.prompt, decode_tokens=args.decode)
@@ -179,6 +194,9 @@ def main(argv=None) -> None:
     r.add_argument("--efficiency", type=float, default=1.0,
                    help="MockEngine BW efficiency (1.0 = analytical floor)")
     r.add_argument("--jitter", type=float, default=0.0)
+    r.add_argument("--peak-bw-gbs", type=float, default=None,
+                   help="measured HBM GB/s per GPU (e.g. from k5_microbench); "
+                        "overrides the spec sheet for MBU + floor")
     r.add_argument("--json", action="store_true")
     r.set_defaults(func=_cmd_run)
 
@@ -219,6 +237,8 @@ def main(argv=None) -> None:
     sw.add_argument("--depths", default=None,
                     help="comma list e.g. 512,4096,32768; omit for a quant-grid config sweep")
     sw.add_argument("--gpu-hr", type=float, default=3.0, help="$/GPU-hr for $/Mtok")
+    sw.add_argument("--peak-bw-gbs", type=float, default=None,
+                    help="measured HBM GB/s per GPU; overrides the spec sheet")
     sw.set_defaults(func=_cmd_sweep)
 
     ep = sub.add_parser("export", help="export stored runs to csv/jsonl")

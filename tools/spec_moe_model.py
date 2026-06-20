@@ -25,12 +25,15 @@ ROUTED_BYTE_SHARE = 0.66   # routed experts' share of decode bytes (Charles)
 
 
 def expected_accepted(alpha: float, k: int, n: int) -> float:
-    """jminding: E[accepted/round], N independent drafters, tree verify.
-    p_hit = 1-(1-alpha)^N per position; geometric over k positions."""
+    """Tokens EMITTED per round (the spec throughput numerator), N independent drafters, tree verify.
+    p_hit = 1-(1-alpha)^N per position. Leviathan: emitted = (1-p^{k+1})/(1-p) — INCLUDES the always-
+    emitted bonus token (the target's resampled token at the first mismatch). The old (1-p^k)/(1-p)
+    omitted the bonus and understated speedup by ~p^k (37% at k=1, ~3-6% at k=5-8) — bug caught by
+    Charles' Monte-Carlo (validate_routing_model.py, 2026-06-20)."""
     p = 1.0 - (1.0 - alpha) ** n
     if p >= 1.0:
-        return float(k)
-    return (1.0 - p ** k) / (1.0 - p)
+        return float(k + 1)
+    return (1.0 - p ** (k + 1)) / (1.0 - p)
 
 
 def union_naive(positions: int) -> float:

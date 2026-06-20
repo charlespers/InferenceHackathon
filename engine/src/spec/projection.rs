@@ -123,6 +123,35 @@ impl RoundCostModel {
         Self { head_eager_cost: head, draft_graph_cost: draft_graph_cost.max(0.0) }
     }
 
+    /// Inverse of [`predict_speedup`] in the graphs regime: given a MEASURED speedup `measured_s`,
+    /// back-solve the verify expert union the run must have read. This reads out how union-bound the
+    /// box actually was — i.e. how much headroom route-aware verification (shrinking the union toward
+    /// the floor of 8) has left. Returns `None` when the floor makes the verify union-invariant
+    /// (`floor_fraction` ≈ 1: verify_cost ≈ 1 for all unions, so S carries no union signal) or when
+    /// the implied verify cost is non-physical (≤0). The result is clamped to the physical minimum 8.
+    pub fn back_solve_graphs_union(
+        &self,
+        measured: &MeasuredAccept,
+        depth: usize,
+        measured_s: f32,
+        floor_fraction: f32,
+    ) -> Option<f32> {
+        let f = floor_fraction.clamp(0.0, 1.0);
+        if (1.0 - f) < 1e-3 {
+            return None; // floor-saturated: verify_cost ≈ 1 ∀ union, no union signal in S
+        }
+        let em = emitted(&measured.accept_probs(depth));
+        let round_cost = em / measured_s.max(1e-3);
+        let verify = round_cost - self.draft_graph_cost; // implied verify cost in step-units
+        if verify <= 0.0 {
+            return None; // measured S too high to be explained by any verify ≥ 0
+        }
+        // verify = f + (1-f)·(0.34 + 0.66·union/8)  ⇒  invert for union.
+        let weight_units = (verify - f) / (1.0 - f);
+        let union = 8.0 * (weight_units - 0.34) / 0.66;
+        Some(union.max(8.0))
+    }
+
     /// Predicted speedup S = emitted / round_cost for a round of `depth` drafted tokens whose verify
     /// reads `union` distinct experts, at floor fraction `floor_fraction`, in the given regime.
     pub fn predict_speedup(
@@ -228,6 +257,23 @@ mod tests {
         let s_eager = model.predict_speedup(&m, DEPTH, union, F_EAGER, false);
         let s_graphs = model.predict_speedup(&m, DEPTH, union, F_GRAPHS, true);
         assert!(s_graphs > s_eager, "graphs S={s_graphs} > eager S={s_eager} for the same chain");
+    }
+
+    #[test]
+    fn back_solve_union_is_the_inverse_of_predict_speedup() {
+        // Round-trip: predict S at a known union, then back-solve it from that S — should recover the
+        // union (the readout I run the moment the measured graphs S lands).
+        let m = measured();
+        let model = RoundCostModel::pinned_from_eager(&m, DEPTH, 24, F_EAGER, 1.0, 0.2);
+        for &u in &[8.0f32, 12.0, 20.0, 40.0] {
+            let s = model.predict_speedup(&m, DEPTH, u as u32, F_GRAPHS, true);
+            let back = model.back_solve_graphs_union(&m, DEPTH, s, F_GRAPHS).unwrap();
+            assert!((back - u).abs() < 0.5, "back-solved union {back} ≈ true {u} (S={s})");
+        }
+        // Floor-saturated (F≈1) carries no union signal → None.
+        assert!(model.back_solve_graphs_union(&m, DEPTH, 1.5, 1.0).is_none());
+        // An impossibly-high S (verify cost would be ≤0) → None, not a bogus union.
+        assert!(model.back_solve_graphs_union(&m, DEPTH, 100.0, F_GRAPHS).is_none());
     }
 
     #[test]

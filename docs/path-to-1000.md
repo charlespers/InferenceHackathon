@@ -4,6 +4,16 @@
 physics, exactly what is *required* — and shows that most of what the team has been measuring (fp8 alone,
 env-comms, spec alone) **cannot get there**; a specific, narrow combination can.
 
+> **⚠️ UPDATED by measured data (`results-reaction-04.md`, the squeeze round).** Two corrections to the analysis
+> below: **(1) per-collective comms is BARRIER-bound (~16 µs = one 8-GPU NVLink barrier), not latency/launch-bound**
+> — naive in-kernel/recursive-doubling does NOT beat it (3 barriers = 51 µs, worse than NCCL's 16 µs). So the
+> comms lever is the **COUNT** (188 TP → ~94 via EP 1-barrier/layer) + **batched spec amortization**, NOT
+> per-collective latency — *unless* the **multimem in-switch reduce** (one switch op, `nvls_allreduce.cu`) beats
+> the barrier, which is still the make-or-break to measure (`measure_collective.sh`). **(2) int4 is RULED OUT at
+> B=1** (0.58× fp8, unpack-ALU-bound) — the weight floor is fp8; ignore the int4-cushion sections below. **The
+> revised path: fp8 + EP(94 collectives) + batched spec → ~960–1177 even at the 16 µs barrier** (`ladder_to_1000.py
+> --C 16 --ncoll 94 --tau-mult 2.77`). Spec is the dominant lever. Read the sections below through this lens.
+
 ## Verdict (the three non-negotiables + the linchpin)
 A 1.0 ms token has room for only three things, and **all three are mandatory** — drop any one and 1000 is
 physically impossible:

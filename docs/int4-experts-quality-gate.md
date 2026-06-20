@@ -1,5 +1,11 @@
 # int4-experts — the 1000-tok/s cushion + its quality gate
 
+> **❌ SUPERSEDED / DEAD at B=1 (`results-reaction-04.md`).** The squeeze round MEASURED int4 (v3, LOP3 half2
+> unpack) at **0.58× fp8 — SLOWER** — the int4→half unpack is ALU-bound at B=1, so the half-the-bytes win never
+> materializes. **int4 is ruled out as a B=1 latency lever.** The weight floor is fp8 (0.78 ms). The comms-side
+> cushions (EP collective-count reduction, stale-TP) replace this. Kept for the record / for the *throughput*
+> regime where int4 still pays. Do **not** put int4 on the B=1 path.
+
 The lossless path to 1000 (fp8 + NVLS ≤ ~3 µs + small-spec → ~1060–1170, `ladder_to_1000.py`) is tight on the
 comms. **int4 experts is the cushion**: it cuts the weight 0.78 → 0.51 ms, which **relaxes the NVLS requirement
 from ≤3 µs to ≤4 µs** (int4-experts + NVLS@4µs + small-spec → ~953) and gives margin if e-tuning or spec

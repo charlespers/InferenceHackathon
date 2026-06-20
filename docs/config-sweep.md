@@ -214,3 +214,74 @@ Engine choice gates most of the rest of this list — CUDA graphs, fusion,
 and FP8-in-practice all need a real serving engine (vLLM or SGLang) up and
 running before they're testable. The naive-transformers and NCCL-microbench
 rows are the only ones we could measure without one.
+
+## Kernel-level synchronization tests (`kernels/`, real on-box results)
+
+First real (not proxy) on-box numbers from Charles's K1-K6 kernel work, specifically
+the comms/compute-overlap and device-initiated-collective direction. Four files staged
+(`tools/run_sync_kernel_tests.sh`): `overlap_decode.cu`, `nvshmem_comms.cu`,
+`decode_step_tp8.cu`, and a new combination file we wrote, `nvshmem_overlap_decode.cu`
+(merges NVSHMEM's device-initiated AR with `overlap_decode.cu`'s double-buffered
+pipeline — neither source file did both). Re-run twice for confirmation; numbers below
+are consistent across runs.
+
+- **`overlap_decode.cu` — comms/compute overlap, real and reproducible.**
+  Correctness PASS (chunked all-reduce SUM check, max_abs=0.0). Measured:
+  - Serial (collective fully exposed): 70.3-71.6µs → ~74-76 tok/s comms-cap
+  - **Overlapped (collective || next-layer K1 QKV GEMV): 60.4-62.4µs → ~85-88 tok/s
+    comms-cap — a real ~16% improvement**, stable across reruns.
+  - Chunked (reduce-as-you-go, 4 chunks): 151-155µs — **worse** than monolithic
+    (89-91µs). Genuine negative result: splitting this tiny (16KB) message into
+    smaller pieces adds more sync overhead than it saves. Chunking only pays off
+    for larger messages, not B=1's tiny payloads.
+  - This PoC only overlaps a single QKV GEMV (a deliberate lower bound per the
+    file's own comments) — overlapping the full K1+K2+K3 attention prologue would
+    hide more of the same ~70µs collective.
+
+- **`decode_step_tp8.cu` — the real TP=8 94-layer pipeline, correctness-gated.**
+  Correctness PASS (cross-rank residual check, max|ref-shd| ~1e-7, tol 1e-2).
+  Measured: **189 NCCL all-reduces/token** (2/layer × 94 + 1 head), confirming the
+  model's collective count. **17.5-17.6µs/all-reduce** on a clean run (closely
+  matches our independent `nccl-tests` baseline of ~16µs — good cross-validation).
+  One run showed 83µs/all-reduce — a ~5x outlier almost certainly from GPU/NVLink
+  contention with concurrent failed NVSHMEM compiles running at the same time;
+  discard that number, trust the ~17.5µs one.
+  - **Important finding beyond comms**: the full real kernel chain currently runs
+    at only **~39.3 tok/s** (25.5ms/token) — far below vLLM's tuned 85.7 tok/s.
+    Comms (all-reduces) is only **13.0%** of that (3.31ms/token); the other 87%
+    (~22.2ms/token) is the K1-K5 kernel chain's own unoptimized compute (scalar
+    fp8 loads, `atomicAdd` instead of tree-reduce, sketch-level reductions —
+    exactly the gaps `kernels/README.md` already flags as `TODO(on-box)`).
+    **Synchronization optimization is necessary but not sufficient** — even with
+    a perfect collective, this kernel chain wouldn't beat vLLM yet; the GEMV/
+    router/expert kernels need their own tuning pass first.
+
+- **`nvshmem_comms.cu` + `nvshmem_overlap_decode.cu` — blocked, CUDA toolchain
+  version mismatch, not a code bug.**
+  The NVSHMEM wheel (`nvidia-nvshmem-cu13`) needs CUDA 13; the box's system `nvcc`
+  is CUDA 12.6 → `nvlink error: Uncompress failed / elfLink fatbinary error` (a
+  fatbinary-format mismatch between toolchains). Found a pip-distributed CUDA 13
+  `nvcc` on the box (`nvidia-cuda-nvcc==13.2.78`), but it's the compiler frontend
+  alone without its full matching header/runtime set → switching to it traded the
+  link error for `"CUDA compiler and CUDA toolkit headers are incompatible"`.
+  **Unresolved**: needs either a complete CUDA 13 pip toolkit install (matching
+  `nvidia-cuda-cccl`/runtime packages) or an NVSHMEM wheel built for CUDA 12.
+  Reverted the test script back to CUDA 12.6 `nvcc` (the simpler, understood
+  failure mode) so it's in a clean state for next time.
+
+### Bugs found and fixed while staging this (each a real env/script issue, not a kernel-logic issue)
+- Bare `nvcc` wasn't on `PATH` in the non-interactive slot-runner shell — fixed to
+  the full path.
+- `set -u` aborted on a completely-unset `$LD_LIBRARY_PATH` (not just empty) —
+  fixed with `${LD_LIBRARY_PATH:-}`.
+- `nvidia.nvshmem` is a data-only namespace package (no `__init__.py`) →
+  `nvidia.nvshmem.__file__` is `None`. The build instructions in `nvshmem_comms.cu`'s
+  own header comment use `os.path.dirname(__file__)`, which crashes — use
+  `nvidia.nvshmem.__path__[0]` instead. Fixed in our new combination file's header
+  and the test script; **the bug is still present in `nvshmem_comms.cu`'s own
+  header comment** (we didn't edit that file) — worth fixing upstream.
+- A fix applied directly on the box via `sed` got silently clobbered by a later
+  `scp` redeploy from an un-updated local copy — fixed at the source, not just
+  the deployed copy, after that bit twice.
+- `decode_step_tp8.cu`'s 5 `#include`d kernel files (`k1_attn_prologue.cu` through
+  `k5_experts.cu`) were never copied to the box alongside it — fixed.

@@ -4,7 +4,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from inferutil.optimize import (
     TPOT, MEASURED_BASELINE, MEASURED_BASELINE_TOK_S, corroborate_weight,
     optimize, apply_spec, plain_decode_ceiling, report, LEVERS,
-    plain_tok_s, min_overlap_for_1000, sensitivity_grid)
+    plain_tok_s, min_overlap_for_1000, sensitivity_grid,
+    best_spec_tree, floor_fraction)
 
 
 def test_baseline_reproduces_measured_tok_s():
@@ -100,6 +101,20 @@ def test_sensitivity_grid_monotone():
         assert vals == sorted(vals)
     col = [r["ov1.0"] for r in grid]
     assert col == sorted(col, reverse=True)         # more overhead -> fewer tok/s
+
+
+def test_spec_tree_sweep_ranked_and_realistic_tree_clears_1000():
+    final, _ = optimize()
+    top, rows = best_spec_tree(final)
+    # rows ranked by speedup descending; the realistic single-head W1xD2 is present
+    sps = [r.speedup for r in rows]
+    assert sps == sorted(sps, reverse=True)
+    assert any((r.draft_len, r.n_drafters) == (2, 1) for r in rows)
+    # the realistic buildable tree (W1xD2) clears 1000 on its own
+    realistic = apply_spec(final, draft_len=2, n_drafters=1)
+    assert realistic.spec_tok_s >= 1000.0
+    # F is structurally floor-ish here (overhead residual + non-expert weight)
+    assert 0.4 < floor_fraction(final) < 0.8
 
 
 def test_report_renders():

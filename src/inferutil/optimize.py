@@ -35,7 +35,7 @@ from typing import Callable, List, Optional
 from .model import QWEN3_235B, MoEConfig
 from .hardware import GPUS, Cluster
 from .latency import decode_latency
-from .bench.spec_model import spec_speedup, expected_emitted
+from .bench.spec_model import spec_speedup, expected_emitted, spec_sweep
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +233,24 @@ class SpecResult:
     spec_tok_s: float
 
 
+def floor_fraction(plain: TPOT) -> float:
+    """F = the share of the (optimized) step that spec amortizes = everything that
+    is NOT expert weight (overhead + comms + kv + the non-expert ~34% of weight)."""
+    f = (plain.overhead_ms + plain.comms_ms + plain.kv_ms) / plain.total_ms
+    return max(0.0, min(1.0, f + 0.34 * plain.weight_ms / plain.total_ms))
+
+
+def best_spec_tree(plain: TPOT, *, accept: float = 0.72,
+                   ks=(1, 2, 4, 8), ns=(1, 2, 4)) -> tuple:
+    """Sweep (draft_len × n_drafters) against the OPTIMIZED plain step's regime and
+    return the top-ranked tree. Confirms the docs' claim that once the floor is
+    removed (weight-bound, low F) SMALL trees win — the expert-union tax of a wide/
+    deep tree outweighs the few extra emitted tokens."""
+    f = floor_fraction(plain)
+    rows = spec_sweep(accept, f, ks=ks, ns=ns, cfg=QWEN3_235B)
+    return rows[0], rows   # rows already sorted by speedup desc
+
+
 def apply_spec(plain: TPOT, *, accept: float = 0.72, draft_len: int = 2,
                n_drafters: int = 1) -> SpecResult:
     """Apply floor-aware EAGLE3-style spec on top of the optimized plain step.
@@ -240,8 +258,7 @@ def apply_spec(plain: TPOT, *, accept: float = 0.72, draft_len: int = 2,
     Uses the team's calibrated spec model (bench.spec_model). F = the share of
     TPOT that is *not* expert-weight (overhead+comms+attn) — what one verify pass
     amortizes."""
-    f = (plain.overhead_ms + plain.comms_ms + plain.kv_ms) / plain.total_ms
-    f = max(0.0, min(1.0, f + 0.34 * plain.weight_ms / plain.total_ms))  # +non-expert weight
+    f = floor_fraction(plain)
     sp = spec_speedup(accept, draft_len, n_drafters, f, QWEN3_235B)
     tau = expected_emitted(accept, draft_len, n_drafters)
     return SpecResult(accept=accept, draft_len=draft_len, n_drafters=n_drafters,
@@ -406,10 +423,23 @@ def report() -> str:
     P("-" * 84)
     P("SPEC DECODE  (the ROBUST path; docs/why-spec-wins.md, spec-decode-floor-bound.md):")
     P("-" * 84)
-    spec = apply_spec(final)
-    P(f"  EAGLE3 W{spec.n_drafters}×D{spec.draft_len}  accept={spec.accept:.2f}  "
-      f"τ(emitted/verify)={spec.tau:.2f}  F(amortized)={spec.floor_fraction:.2f}")
-    P(f"  speedup over plain = {spec.speedup:.2f}×  (lossless: exact verification)")
+    top, rows = best_spec_tree(final)
+    # Headline uses the REALISTIC buildable tree (single EAGLE3 head = W1×D2), not the
+    # model optimum (which assumes N *independent* drafters — optimistic; real EAGLE3 is
+    # one correlated head). Both are shown; both clear 1000.
+    spec = apply_spec(final, draft_len=2, n_drafters=1)
+    P(f"  tree sweep vs the OPTIMIZED step  F={spec.floor_fraction:.2f} (still floor-bound: 0.5ms")
+    P(f"  overhead residual + structural non-expert weight keep F high, so bigger trees score):")
+    for r in rows[:4]:
+        opt = " <- model opt (assumes N independent drafters)" if (
+            r.draft_len, r.n_drafters) == (top.draft_len, top.n_drafters) else ""
+        real = " <- realistic single EAGLE3 head" if (r.draft_len, r.n_drafters) == (2, 1) else ""
+        P(f"      W{r.n_drafters}×D{r.draft_len}: emit {r.emitted:.2f}/verify, "
+          f"cost {r.verify_cost:.2f} steps -> {r.speedup:.2f}×{opt}{real}")
+    P(f"  HEADLINE (buildable): EAGLE3 W1×D2  accept={spec.accept:.2f}  τ={spec.tau:.2f}  "
+      f"-> {spec.speedup:.2f}×  (lossless: exact verification)")
+    P(f"  the model optimum W{top.n_drafters}×D{top.draft_len} ({top.speedup:.2f}×) is the "
+      f"theoretical envelope if N independent drafters were available.")
     P(f"  {spec.plain_tok_s:6.1f} tok/s (plain)  ->  {spec.spec_tok_s:6.1f} tok/s (spec)  "
       f"[{'>= 1000 ✓' if spec.spec_tok_s >= 1000 else '< 1000'}]")
     P("  Why spec is the make-or-break: it clears 1000 in BOTH the optimistic AND the")

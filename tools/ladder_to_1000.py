@@ -38,10 +38,28 @@ for label, tpot, tk, note in rungs:
     flag = "  <<< 1000+" if tk >= 1000 else ""
     print(f"{label:46} {tpot:8.2f} {tk:7.0f}{flag}   {note}")
 
-print("\nAlternatives at rung 4 (the comms make-or-break):")
-for label, c in (("NVLS @3us", 188*3/1e3), ("NVLS @4us", 188*4/1e3),
-                 ("stale-TP hides comms (LOOP-C, quality-gated)", 0.0)):
-    tpot, tk = tput(0.0, c, 0.78, kv, 1.35)
-    print(f"  rung5 with {label:46} -> {tk:5.0f} tok/s")
-print("\nLossy cushion if comms/spec slip: int4 experts (weight 0.78->0.51) or depth-reduction (cuts weight AND comms).")
-print("Make-or-break = rung 4 (NVLS C). Banked-now = rung... none yet; rung 0+big-tree-spec (~300) is the cheap first ship.")
+# ---- LIVE diagnostic: plug in the real measurements as they land ----
+import argparse
+ap = argparse.ArgumentParser(description="plug measured C/e/tau -> projected 1000-path tok/s + gap")
+ap.add_argument("--C", type=float, default=2.0, help="measured per-collective NVLS latency (us); make-or-break")
+ap.add_argument("--e", type=float, default=1.0, help="measured fp8-K5 kernel efficiency (0.46 today -> target ~0.85)")
+ap.add_argument("--tau-mult", type=float, default=1.35, help="measured small-tree spec multiplier at F=0")
+ap.add_argument("--weight", choices=["fp8", "int4exp"], default="fp8", help="int4exp = int4 experts + fp8 rest (cushion)")
+ap.add_argument("--host-ms", type=float, default=0.0, help="residual host/overhead after graphs+fast-path (E-attr)")
+ap.add_argument("--stale-tp", action="store_true", help="LOOP-C stale-TP hides comms (quality-gated) -> comms=0")
+a = ap.parse_args()
+w = (0.78 if a.weight == "fp8" else 0.51) / max(a.e, 0.05)   # weight read at measured efficiency
+c = 0.0 if a.stale_tp else 188 * a.C / 1e3
+tpot, tk = tput(a.host_ms, c, w, kv, a.tau_mult)
+print(f"\n=== LIVE (C={a.C}us e={a.e} tau×{a.tau_mult} weight={a.weight}"
+      f"{' +stale-TP' if a.stale_tp else ''} host={a.host_ms}ms) ===")
+print(f"  weight {w:.2f} + comms {c:.2f} + host {a.host_ms:.2f}  / spec {a.tau_mult}  = {tpot:.2f} ms -> {tk:.0f} tok/s"
+      f"  {'>>> 1000 CLEARED' if tk>=1000 else f'(gap {1000-tk:.0f})'}")
+if tk < 1000:
+    gap = 1000 - tk
+    print(f"  next lever for the {gap:.0f} gap:", end=" ")
+    if a.C > 3 and not a.stale_tp: print("comms still high -> push NVLS C down, or --stale-tp, or --weight int4exp.")
+    elif a.e < 0.8: print("kernel under roofline -> tune fp8-K5 e (cp.async, k5-tuning-roadmap).")
+    elif a.tau_mult < 1.3: print("spec under-delivering -> check draft_tp=8 / small tree / accept-rate.")
+    else: print("close -> --weight int4exp (cushion) or --stale-tp to hide the last comms.")
+print("\nMake-or-break = the NVLS C (run bench/measure_collective.sh first). Cheap first ship: spec+prefix ~300.")

@@ -2,6 +2,12 @@
 from __future__ import annotations
 
 from .store import RunRecord
+from .attribution import diagnose
+from .cost import rental_usd_per_mtok, energy_metrics
+
+
+def _pct(x) -> str:
+    return f"{x*100:.1f}%" if x is not None else "—"
 
 
 def is_significant(mean_a: float, std_a: float, mean_b: float, std_b: float) -> bool:
@@ -26,6 +32,7 @@ def format_result(record: RunRecord) -> str:
         f"  decode       : {r.decode_tok_per_s:8.1f} tok/s"
         + (f" ±{r.decode_tok_per_s_std:.1f} (n={r.n_repeats})" if r.n_repeats > 1 else "")
         + f"   (TPOT p50 {r.tpot_p50_s*1e3:.2f} / p95 {r.tpot_p95_s*1e3:.2f} ms)",
+        f"  E2E (total)  : {r.total_s*ms:8.2f} ms",
         "  -- bandwidth / roofline --",
         f"  bytes/token  : {r.bytes_per_token/1e9:8.2f} GB",
         f"  achieved BW  : {r.achieved_hbm_bw/1e12:8.2f} TB/s "
@@ -33,6 +40,36 @@ def format_result(record: RunRecord) -> str:
         f"  vs floor     : {r.decode_tok_per_s:8.1f} / "
         f"{r.analytical_floor_tok_per_s:.1f} tok/s = "
         f"{r.pct_of_floor*100:.1f}% of floor",
+    ]
+    eff = r.efficiency
+    if eff is not None:
+        ai = f"{eff.ai_decode:.2f}" if eff.ai_decode is not None else "—"
+        ai_p = f"{eff.ai_prefill:.0f}" if eff.ai_prefill is not None else "—"
+        ridge = f"{eff.roofline_ridge:.0f}" if eff.roofline_ridge is not None else "—"
+        lines += [
+            "  -- efficiency (roofline) --",
+            f"  MFU          : prefill {_pct(eff.mfu_prefill)} / decode {_pct(eff.mfu_decode)}",
+            f"  MBU (decode) : {_pct(eff.mbu_decode)}   (KV byte share {_pct(eff.kv_byte_share)})",
+            f"  AI decode    : {ai} FLOP/B   ridge {ridge}  -> {eff.regime_decode}",
+            f"  AI prefill   : {ai_p} FLOP/B   -> {eff.regime_prefill}",
+        ]
+    n_gpus = record.env.get("n_gpus") or 8
+    rental = rental_usd_per_mtok(r.decode_tok_per_s, n_gpus)
+    cost_lines = ["  -- cost --"]
+    cost_lines.append(f"  rental       : ${rental:.1f}/Mtok  (@$3/GPU-hr x{n_gpus})"
+                      if rental is not None else "  rental       : —")
+    if t.available:
+        em = energy_metrics(r.decode_tok_per_s, t.power_w_mean)
+        cost_lines.append(
+            f"  energy       : {em['tok_s_per_watt']:.2f} tok/s/W, "
+            f"${em['usd_per_mtok_energy']:.2f}/Mtok, {em['kwh_per_mtok']:.2f} kWh/Mtok")
+    lines += cost_lines
+    b = diagnose(r)
+    lines += [
+        "  -- bottleneck --",
+        f"  dominant     : {b.dominant_term} ({b.share*100:.0f}% of time, "
+        f"conf {b.confidence*100:.0f}%)",
+        f"  -> {b.note}",
     ]
     mb = r.measured_breakdown
     if mb is not None:
@@ -55,6 +92,133 @@ def format_result(record: RunRecord) -> str:
         ]
     else:
         lines.append("  -- device telemetry unavailable --")
+    return "\n".join(lines)
+
+
+def format_sweep(points, *, n_gpus: int = 8, usd_per_gpu_hr: float = 3.0,
+                 title: str = "SWEEP") -> str:
+    """Ranked sweep table: tok/s, TPOT, MBU, KV share, $/Mtok, and bottleneck."""
+    lines = [
+        f"== {title} ==",
+        f"  {'label':<14}{'ctx':>8}{'tok/s':>9}{'TPOT':>8}{'MBU':>7}"
+        f"{'KVshr':>7}{'$/Mtok':>8}  bottleneck",
+    ]
+    for p in points:
+        cost = rental_usd_per_mtok(p.decode_tok_s, n_gpus, usd_per_gpu_hr=usd_per_gpu_hr)
+        cost_s = f"{cost:.1f}" if cost is not None else "—"
+        lines.append(
+            f"  {p.label:<14}{p.seq_len:>8}{p.decode_tok_s:>9.1f}{p.tpot_ms:>8.2f}"
+            f"{_pct(p.mbu_decode):>7}{_pct(p.kv_byte_share):>7}{cost_s:>8}  "
+            f"{p.dominant_term} -> {p.hint}")
+    return "\n".join(lines)
+
+
+def format_spec_sweep(rows, feasibility: dict, *, base_tok_s=None) -> str:
+    """Speculative-decode sizing table: E[accepted], speedup, verify tokens, and
+    whether the drafter count fits in HBM headroom. Marks the best feasible row."""
+    max_drafters = feasibility.get("max_drafters", 0)
+    feasible = [r for r in rows if r.n_drafters <= max_drafters]
+    best = max(feasible, key=lambda r: r.speedup) if feasible else None
+    lines = [
+        "== SPEC-DECODE SWEEP ==",
+        f"  HBM headroom: {feasibility.get('hbm_headroom_gb')} GB "
+        f"(target {feasibility.get('target_weight_gb')} GB, "
+        f"fp8={feasibility.get('use_fp8_target')})  -> fits <= {max_drafters} drafters",
+        f"  {'drafters':>9}{'alpha':>7}{'k':>4}{'E[acc]':>8}{'speedup':>9}"
+        f"{'verify_tok':>11}{'fits':>6}",
+    ]
+    for r in rows:
+        fits = "yes" if r.n_drafters <= max_drafters else "no"
+        star = "  *best" if (best and r is best) else ""
+        tok = f"  -> {base_tok_s * r.speedup:.0f} tok/s" if base_tok_s else ""
+        lines.append(
+            f"  {r.n_drafters:>9}{r.alpha:>7.2f}{r.k:>4}{r.e_acc:>8.2f}"
+            f"{r.speedup:>8.2f}x{r.verify_tokens:>11}{fits:>6}{star}{tok}")
+    if best:
+        lines.append(f"  -> best feasible: {best.n_drafters} drafters x k={best.k} "
+                     f"=> {best.speedup:.2f}x")
+    return "\n".join(lines)
+
+
+_EFFORT_RANK = {"S": 0, "M": 1, "L": 2}
+
+
+def format_plan(record: RunRecord, bottleneck, levers, best_point=None) -> str:
+    """One-shot decision artifact: current state -> bottleneck -> biggest wins ->
+    suggested order (cheap wins first) -> best reachable config."""
+    r, c = record.result, record.config
+    mbu = _pct(r.efficiency.mbu_decode) if r.efficiency else "—"
+    lines = [
+        f"== PLAN: {c.name}  plan={c.plan} w{c.dtype_bytes}b kv{c.kv_dtype_bytes}b "
+        f"tp={c.tp} ep={c.ep} ctx={c.seq_len} ==",
+        f"  current      : {r.decode_tok_per_s:.1f} tok/s   MBU {mbu}   {bottleneck.regime}",
+        f"  bottleneck   : {bottleneck.dominant_term} ({bottleneck.share*100:.0f}%) "
+        f"-> {bottleneck.note}",
+    ]
+    if levers:
+        lines.append("  -- biggest wins (by predicted speedup) --")
+        for lv in levers:
+            lines.append(f"    {lv.speedup:>5.2f}x  [{lv.effort}]  {lv.name:<20} "
+                         f"-> {lv.predicted_tok_s:.0f} tok/s")
+        order = sorted(levers, key=lambda lv: (_EFFORT_RANK.get(lv.effort, 9), -lv.speedup))
+        lines.append("  -- suggested order (cheap, high-impact first) --")
+        for i, lv in enumerate(order, 1):
+            lines.append(f"    {i}. {lv.name} [{lv.effort}]  (+{(lv.speedup-1)*100:.0f}%)")
+    if best_point is not None:
+        lines.append("  -- best reachable config (quant x layout, analytical) --")
+        lines.append(f"    {best_point.label}: {best_point.decode_tok_s:.0f} tok/s "
+                     f"({best_point.regime}, bottleneck {best_point.dominant_term})")
+    return "\n".join(lines)
+
+
+def format_spec_floor(rows, feasibility: dict, *, accept: float, floor: float,
+                      base_tok_s=None) -> str:
+    """Floor-aware spec-decode sizing table (bench.spec_model): emitted/verify/speedup
+    per (k, N), HBM-feasibility, best feasible. F high → big trees win; F→0 → small."""
+    max_drafters = feasibility.get("max_drafters", 0)
+    feasible = [r for r in rows if r.n_drafters <= max_drafters]
+    best = max(feasible, key=lambda r: r.speedup) if feasible else None
+    lines = [
+        f"== SPEC-DECODE SIZING (floor-aware)  accept={accept:.2f}  F={floor:.2f} ==",
+        f"  HBM headroom: {feasibility.get('hbm_headroom_gb')} GB "
+        f"(fp8 target={feasibility.get('use_fp8_target')}) -> fits <= {max_drafters} drafters",
+        f"  {'k':>3}{'N':>3}{'emitted':>9}{'verifyX':>9}{'speedup':>9}{'fits':>6}",
+    ]
+    for r in rows:
+        fits = "yes" if r.n_drafters <= max_drafters else "no"
+        star = "  *best" if (best and r is best) else ""
+        tok = f"  -> {base_tok_s * r.speedup:.0f} tok/s" if base_tok_s else ""
+        lines.append(f"  {r.draft_len:>3}{r.n_drafters:>3}{r.emitted:>9.2f}"
+                     f"{r.verify_cost:>8.2f}x{r.speedup:>8.2f}x{fits:>6}{star}{tok}")
+    if best:
+        lines.append(f"  -> best feasible: k={best.draft_len} N={best.n_drafters} "
+                     f"=> {best.speedup:.2f}x")
+    lines.append("  (floor-aware: F high -> big trees win; F->0 -> small trees win. "
+                 "Gate go/no-go on realized tok/s.)")
+    return "\n".join(lines)
+
+
+def format_diagnosis(record: RunRecord, levers=None) -> str:
+    """Bottleneck diagnosis + ranked next-lever recommendations for one run."""
+    b = diagnose(record.result)
+    ai = f"{b.ai_decode:.2f}" if b.ai_decode is not None else "—"
+    ridge = f"{b.ridge:.0f}" if b.ridge is not None else "—"
+    lines = [
+        f"== DIAGNOSIS: {record.config.name}  [{record.runid}] ==",
+        f"  regime       : {b.regime}  (AI {ai} vs ridge {ridge} FLOP/B)",
+        f"  dominant     : {b.dominant_term}  ({b.share*100:.0f}% of per-token time)",
+        f"  runner-up    : {b.second_term}  ({b.second_share*100:.0f}%)  "
+        f"confidence {b.confidence*100:.0f}%",
+        f"  headroom     : {b.headroom_to_floor*100:.0f}% below analytical floor",
+        f"  -> {b.note}",
+    ]
+    if levers:
+        lines.append("  -- ranked next levers (predicted) --")
+        lines.append(f"  {'lever':<22}{'tok/s':>10}{'speedup':>9}{'effort':>8}")
+        for lv in levers:
+            lines.append(f"  {lv.name:<22}{lv.predicted_tok_s:>10.1f}"
+                         f"{lv.speedup:>8.2f}x{lv.effort:>8}")
+            lines.append(f"      {lv.rationale}")
     return "\n".join(lines)
 
 

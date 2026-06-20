@@ -22,7 +22,13 @@ export async function* parseSSE(stream: ReadableStream<Uint8Array>): AsyncGenera
 
 export async function* streamChat(
   base: string,
-  body: { model: string; messages: ChatMessage[]; temperature: number; max_tokens: number },
+  body: {
+    model: string;
+    messages: ChatMessage[];
+    temperature: number;
+    max_tokens: number;
+    engine?: string;
+  },
   signal: AbortSignal,
 ): AsyncGenerator<any> {
   const res = await fetch(`${base}/v1/chat/completions`, {

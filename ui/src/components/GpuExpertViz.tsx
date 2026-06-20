@@ -96,6 +96,11 @@ export function GpuExpertViz({
   const hot = recentGpus(telemetry);
   const last = telemetry[telemetry.length - 1];
 
+  // Busiest-rank imbalance = max/mean expert load across GPUs. The EP→TP finding: at B=1, EP routes 8 experts
+  // unevenly (~2.6× busiest gates the step); TP8 column-shards every expert → ~1.0× (docs/ep-placement-for-b1.md).
+  const totalHits = hits.reduce((a, b) => a + b, 0);
+  const imbalance = totalHits > 0 ? maxHits / (totalHits / numGpus) : 1;
+
   const fallbackGpus: GpuInfo[] = Array.from({ length: numGpus }, (_, i) => ({
     id: i,
     name: `H100-${i}`,
@@ -110,6 +115,14 @@ export function GpuExpertViz({
     <div className="border border-neutral-800 rounded-lg p-3 flex-1 min-h-0 flex flex-col">
       <div className="flex justify-between text-xs text-neutral-400 mb-2">
         <span>GPU status · expert routing</span>
+        {totalHits > 0 && (
+          <span
+            className={imbalance > 1.5 ? "text-amber-400" : "text-emerald-400/80"}
+            title="busiest GPU expert-load ÷ mean. EP routes unevenly at B=1 (~2.6×); TP8 flattens to ~1.0×."
+          >
+            busiest {imbalance.toFixed(1)}× {imbalance > 1.5 ? "· EP-style imbalance" : "· balanced"}
+          </span>
+        )}
         {!topology && (
           <span className="text-amber-500/70">topology unavailable — fallback</span>
         )}

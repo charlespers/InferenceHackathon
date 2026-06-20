@@ -44,12 +44,14 @@ def format_result(record: RunRecord) -> str:
     eff = r.efficiency
     if eff is not None:
         ai = f"{eff.ai_decode:.2f}" if eff.ai_decode is not None else "—"
+        ai_p = f"{eff.ai_prefill:.0f}" if eff.ai_prefill is not None else "—"
         ridge = f"{eff.roofline_ridge:.0f}" if eff.roofline_ridge is not None else "—"
         lines += [
             "  -- efficiency (roofline) --",
             f"  MFU          : prefill {_pct(eff.mfu_prefill)} / decode {_pct(eff.mfu_decode)}",
             f"  MBU (decode) : {_pct(eff.mbu_decode)}   (KV byte share {_pct(eff.kv_byte_share)})",
             f"  AI decode    : {ai} FLOP/B   ridge {ridge}  -> {eff.regime_decode}",
+            f"  AI prefill   : {ai_p} FLOP/B   -> {eff.regime_prefill}",
         ]
     n_gpus = record.env.get("n_gpus") or 8
     rental = rental_usd_per_mtok(r.decode_tok_per_s, n_gpus)

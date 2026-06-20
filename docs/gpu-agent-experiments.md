@@ -177,7 +177,9 @@ Record: decode tok/s vs E1 (no-spec), `spec_accept_rate`/τ. **Go/no-go is REALI
 **UPDATE — promoted to a top-2 lever (run NOW): while floor-bound, spec amortizes the dominant FLOOR.** The
 verify is one batched forward that pays the per-step floor (188 all-reduces + launch) **once**, amortized over
 τ → **≈τ× (~2× at τ=2 on the current bf16-TP8)**. The MoE verify-tax adds only to the 14% weight term, so it
-**barely bites now** → **try k=4–6** (not 2–3) and **gate on realized tok/s**. As the floor falls (comms
+**barely bites now** → **try BIG trees (k=8, even N=2 drafters)** — `tools/spec_floor_model.py` projects naive
+k=8 N=2 → ~3.17× at the measured floor (F=0.86), reversing `spec_moe_model.py`'s weight-bound "big trees lose."
+**Gate on realized tok/s.** As the floor falls (comms
 tuning + kernel work → weight-bound), the tax returns → **shrink k→2–3** (make it adaptive on `RoundStats`).
 Full reasoning: **`docs/spec-decode-floor-bound.md`** (supersedes the weight-bound k≤3 in `spec-decode-moe-tax.md`
 *for the floor-bound regime*). n-gram is free-draft (ideal); prose needs self-spec (E9) / MTP.

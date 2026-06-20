@@ -46,6 +46,21 @@ They **stack** — cut the floor *and* divide it over τ.
 - **Caveat:** n-gram only fires on repetitive/structured text; for general prose, self-spec (`E9`) or a
   trained MTP head — but those have a draft cost, so they amortize the floor less cleanly than free n-gram.
 
+## Quantified vs the team's `spec_moe_model.py` (`tools/spec_floor_model.py`)
+Their model uses `verify_cost = 0.34 + 0.66·(union/8)` — the **weight-units** cost (floor=0). Adding the
+floor fraction F (`verify_cost = F + (1−F)·weight_units`) and sweeping F:
+
+| regime | best naive cfg | best route-aware | their conclusion |
+|---|---|---|---|
+| F=0.00 (weight-bound = their model) | k=2 → 1.05× | k=2 → 1.60× | "naive big trees lose, need route-awareness" ✓ |
+| F=0.50 (floor half-fixed) | k=8 N=2 → 1.45× | → 1.99× | big trees start winning |
+| **F=0.86 (MEASURED, today)** | **k=8 N=2 → 3.17×** | → 3.80× | **naive big trees WIN ~3×; route-awareness is a bonus** |
+
+So their "naive big trees lose" is the **weight-bound** conclusion. **In the measured floor-bound reality,
+naive k=8 (even multi-drafter N=2) wins ~3×** — the union tax is on the 14% weight, not the 86% floor.
+Route-awareness (their lever) and small-k (the moe-tax lever) both become important **only as the floor is
+fixed** (F→0). Optimal k is **regime-adaptive: big now, shrink as the floor falls.**
+
 ## One line
 In a floor-bound regime, **spec decode ≈ τ× because the verify pays the dominant floor once** — it jumps from
 "last lever" to a top-2 lever, and the MoE verify-tax (a weight-term effect) is negligible until the floor is

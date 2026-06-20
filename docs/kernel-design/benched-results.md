@@ -49,3 +49,13 @@ vLLM fp8/EP8 **65.8 tok/s**, bf16/TP8 **85.7**, naive transformers 3.5. fp8 roof
 4. **int4 experts** with a half2-FMA unpack (current unpack is ALU-bound, loses to fp8).
 
 **Real wins this session:** the kernels (K5 58% MBU, lm_head 55%, prefill 15.5% TC, K1 12×/K2 6×) and a quantified comms wall. The end-to-end 1000 is an integration + toolchain effort beyond this window.
+
+## Squeeze round (bottleneck attack — measured, mostly negative, but decisive)
+| lever | result | verdict |
+|---|---|---|
+| **In-kernel NVSHMEM all-reduce** (persistent kernel, no per-collective launch) | **51.75 µs vs 55.10 µs host** = **1.06×** | comms is **barrier-bound, not launch-bound** — in-kernel does NOT break the wall. Floor ≈ 17 µs/collective = one 8-GPU NVLink `barrier_all`. |
+| **int4-v3 half2-FMA unpack** | 168 µs = **0.58× fp8** (PASS) | still unpack-ALU-bound on the half2 path; **int4 ruled out** at B=1. |
+| **spec verify-in-one-pass** | forward scales ~linearly with draft rows (192→850 µs/layer for M=1→5) | the bench **didn't batch the weight read** — a modeling bug, not a refutation. Real batched verify is flat → spec amortizes (team's EAGLE3 measures ~3.8×). Needs a correctly-batched verify kernel. |
+| **megakernel decode** | cg::grid.sync + collective_launch combo unverified + a Q-layout bug | risky/broken — not benched. |
+
+**Refined path to 700 (post-squeeze):** comms can't go below ~17 µs/collective (barrier), so the levers are (1) **EP all-to-all** (17 µs, 1 barrier) not TP recdouble (51 µs, 3 barriers); (2) **halve collectives** 188→94 (1/layer); (3) **correctly-batched speculative decode** (÷~2.77–3.8 — the dominant multiplier, owned by the team's EAGLE3). Arithmetic: 94 × 17 µs = 1.6 ms comms ÷ 2.77 (spec) + ~0.5 ms compute ≈ **1.1 ms → ~900 tok/s** — reachable, but gated on the EP-sharded decode running end-to-end + the batched verify. Neither int4 nor in-kernel-launch-elision is on the path; spec + EP + fewer collectives is.

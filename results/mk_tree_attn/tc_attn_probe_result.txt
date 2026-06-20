@@ -72,3 +72,13 @@ ctx=8192:  M=1 127.80us M=8 133.86(1.05x)  M=16 144.43(1.13x)   rel=0.46% PASS
    tree.rs (lossless tree accept) + build_from_source (head->tree) + this flat tree-masked TC verify attn =
    the complete tree-spec path with a flat verify. NEXT (engine drop-in): fp8 KV (dequant-on-load) + per-node
    RoPE pos_id (from tree_attn.h) + wire into Charles's decode loop; M=1 plain decode keeps warp-shuffle k2.
+
+=== FP8 KV (Charles's cache dtype) tc_verify_fp8.cu/tcv8 — accuracy + flatness CONFIRMED ===
+fp8 e4m3 context KV + per-channel scale, dequant-on-load. Validated vs fp32-of-fp8:
+ctx=4096: rel=0.44% PASS, FLAT 1.02x@M=16 (abs M=1..16: 293/292/295/300us)
+ctx=8192: rel=0.49% PASS, FLAT 1.03x@M=16 (abs M=1..16: 558/559/563/573us)
+=> fp8 KV is ACCURATE (<0.5%) and FLAT in M. HONEST CAVEAT on the ABSOLUTE: 293us (vs 81us fp16) is dominated
+   by my proxy's non-fused dequant-MATERIALIZATION (reads 33.5M fp8, writes 67MB fp16 EVERY call). The real
+   engine path does NOT materialize: use cuBLASLt NATIVE fp8 GEMM (no dequant pass) or load fp8 inline like
+   mk_tree_attn_fp8's k2_load4. So the representative fp8 cost ~ the fp16 number (81us@M=8) or LESS (half HBM
+   on the KV read). The dequant proxy only validates accuracy+flatness, not the absolute. NEXT: native-fp8 GEMM.

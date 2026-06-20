@@ -182,10 +182,13 @@ k=8 N=2 → ~3.17× at the measured floor (F=0.86), reversing `spec_moe_model.py
 **Gate on realized tok/s.** As the floor falls (comms
 tuning + kernel work → weight-bound), the tax returns → **shrink k→2–3** (make it adaptive on `RoundStats`).
 Full reasoning: **`docs/spec-decode-floor-bound.md`** + `tools/spec_floor_model.py`. **Best draft (general
-text):** the off-the-shelf **`lmsys/Qwen3-235B-A22B-EAGLE3`** head (τ~3–3.5, lossless — `research/depth_reduction.md`):
-`--speculative-config '{"method":"eagle3","model":"lmsys/Qwen3-235B-A22B-EAGLE3","num_speculative_tokens":6}'`.
-n-gram (free, zero-setup) for repetitive prompts; EAGLE3 for prose. My floor-aware model + their depth_reduction
-both project **~3× in the floor-bound regime** — this is the single biggest immediate decode lever.
+text), per `experiments/eagle3/INTEGRATION.md`:** use the **converted** head (raw `lmsys/...` is SGLang-format),
+and **EAGLE3 needs vLLM 0.10.2+** (box has 0.10.1 → upgrade, or use n-gram):
+`--speculative-config '{"method":"eagle3","model":"nm-testing/Qwen3-235B-A22B-EAGLE3-converted-speculators-lmsys","num_speculative_tokens":5,"draft_tensor_parallel_size":1}'`.
+**n-gram (free, zero-setup, works on 0.10.1) for repetitive prompts — the immediate test (run_bench5);** EAGLE3
+for prose. **Prediction:** EAGLE3's published ~1.9× is a weight-bound number; on THIS floor-bound engine (86%
+floor) it should **over-deliver toward its accept length (~τ ≈ 2.5–3×)** — the amortized floor is larger here
+(`spec-decode-floor-bound.md`). The single biggest immediate decode lever.
 
 ### E7 — INT4/AWQ expert weights (biggest byte win; gated on a checkpoint)
 First resolve the blocker: does an AWQ/GPTQ-INT4 `Qwen3-235B-A22B` checkpoint exist on HF for vLLM?

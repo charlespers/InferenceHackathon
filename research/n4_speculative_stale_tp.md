@@ -196,15 +196,52 @@ Folds into the N1 megakernel + Charles's comms:
 
 ---
 
-## 6. Go/no-go results
-_(to be filled by Experiment 1)_
+## 6. Go/no-go results — ❌ NO-GO (measured 2026-06-20 10:24 UTC, bf16-TP8, 8×H100)
 
-**Prior probability (from the literature):** LOW that pure runtime-only stale TP is quality-neutral
-without retraining — Ladder-Residual's zero-shot conversion collapsed (56.11→41.65) until it retrained
-3B tokens. So the *expected* outcome of Experiment 1 is "needs retraining," in which case the
-de-risked path is **adopt Ladder-Residual on Qwen3's upper layers** (depth-1, proven at B=1/8×H100).
-The *upside* outcome — quality holds at K≥2 with no retrain — would be a genuine novel result. Either
-way the probe is cheap and decisive. Run it before committing kernel effort.
+**Verdict: runtime-only stale TP (no retraining) catastrophically destroys quality.** Greedy
+parity vs exact, 10 prompts, results in `results/stale_tp/`:
+
+| sweep point | mean_agreement | exact | output |
+|---|---|---|---|
+| exact (control) | — | — | correct (`def is_palindrome(s): return s == s[::-1]`) |
+| **lyr_proxy_k2** (core hypothesis) | **0.000** | 0.00 | gibberish from token 1 |
+| lyr_proxy_k4 | 0.032 | 0.00 | gibberish |
+| lyr_proxy_k8 | 0.003 | 0.00 | gibberish |
+| lyr_local_k2 (control, must degrade) | 0.023 | 0.00 | gibberish ✓ |
+| tmp_proxy_k2 (temporal) | 0.046 | 0.00 | gibberish |
+
+**Sanity gates all pass** (this is real, not an artifact): the fork patch reached all 8 TP workers
+(`VllmWorker TP0..7 [stale_tp] ctl reload`), `exact` reproduces correct output, and the `local`
+control degrades — so the hook genuinely perturbs the all-reduce. Even the **gentlest** setting
+(K=2, reuse the all-reduce result from 2 layers back) yields **0% agreement** — output is gibberish
+from the first decode token.
+
+**Predicted-proxy follow-up (Charles's GO candidate, measured 10:46 UTC).** Charles proposed that a
+*predicted* post-AR hidden (not a stale copy) could avoid the router flip. Tested the cheapest such
+predictor — `predicted = local_partial × world_size` (right expected magnitude, this layer's local
+direction): **also catastrophic.** `lyr_pred_k2 = 0.025`, `lyr_pred_k4 = 0.018` agreement — same
+ballpark as stale (0.000) and local (0.023). No crash; hook confirmed active on all 8 workers.
+**Mechanism:** scaling fixes magnitude but not *direction* — the local partial is missing 7/8 of the
+sum, so the router still flips. **This generalizes the kill: ANY predictor built from a single rank's
+local information cannot recover the cross-rank sum well enough** (it's an information barrier, not a
+tuning problem). DirectProxy predicts from *routing history* — same local/historical-info class — so
+it is very unlikely to clear a bar that right-magnitude prediction misses by ~40×.
+
+**Conclusion (complete kill):** the *no-retrain, runtime-substitution* form of stale-TP — in ALL tested
+variants (stale-reuse, local, temporal, predicted-from-local) — is **dead** for Qwen3-235B B=1 decode.
+This **confirms the literature prior** (Ladder-Residual / Kog DTP both need training). It does NOT
+refute stale-TP-with-retraining (Ladder works — 23.7%/30.8% at B=1/8×H100), but that requires
+~3B-token retraining → **out of hackathon scope.**
+
+**Why it fails (mechanism):** the substituted value is the all-reduce *output* (a delta added to the
+residual). Reusing a 2-layer-old delta as the current layer's delta is a large, wrong perturbation —
+unlike Ladder, which reroutes the *residual* (stale by 1) **and is trained to tolerate it**. At
+runtime, untrained, the residual stream does not change "slowly enough" at the all-reduce granularity.
+
+**Pivot (per DECISION.md NO-GO branch):** the surviving comms-floor levers are **lossless**:
+(1) *exact deferred-overlap* — overlap each layer's exact NVLS all-reduce with the next layer's
+weight-stream (no staleness, no quality risk; belongs in the megakernel); (2) Charles's **multimem
+one-shot** AR (cut the per-collective constant). Stale-TP is killed as a runtime lever.
 
 ## 7. Resolved questions (from research run `wf_07e8b2cc-0b1`)
 - ✅ No published K>1 periodic-sync drift-tolerant TP for B=1 decode — **N4c is novel**; Ladder-Residual

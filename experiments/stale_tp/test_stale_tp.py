@@ -112,6 +112,24 @@ def test_temporal():
     check("temporal step2 all real", all(k == REAL for k, _ in p2))
 
 
+def test_shape_guard_prevents_prefill_leak():
+    # The real bug that crashed vLLM: a prefill-shaped cached tensor leaking into a
+    # decode call (token-count mismatch). The shape guard must fall back to a REAL
+    # reduce instead of returning the wrong-shape cached value.
+    s = StaleScheduler(FakeCfg(mode="temporal", K=2, policy="proxy",
+                               decode_only=False, period=4))
+    for i in range(4):  # step 0: prefill-shaped, cached with shape (8,4096)
+        s.route((lambda i=i: f"P{i}"), f"L{i}", token_count=8, shape=(8, 4096))
+    out = []
+    for i in range(4):  # step 1: decode-shaped -> shapes mismatch -> must NOT reuse P*
+        k, v = s.route((lambda i=i: f"D{i}"), f"L{i}", token_count=1, shape=(1, 4096))
+        out.append((k, v))
+    check("shape mismatch -> real_fallback (no prefill leak)",
+          all(k == REAL_FALLBACK for k, _ in out))
+    check("returns fresh decode values, never the prefill tensor",
+          [v for _, v in out] == ["D0", "D1", "D2", "D3"])
+
+
 def test_stats_and_calibration():
     s = StaleScheduler(FakeCfg(mode="layer", K=2, period=4))
     run_pass(s)

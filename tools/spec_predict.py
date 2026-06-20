@@ -24,12 +24,10 @@ E, TOPK, NRANK = 128, 8, 8
 
 
 def expected_accepted(alpha, W, D):
-    # NOTE (validate_routing_model.py §4): this (1−p^D)/(1−p) form omits the always-emitted BONUS token; the
-    # rigorous tokens/round is (1−p^{D+1})/(1−p) (Leviathan), ~p^D higher (~3–6% at D=5–8, ~37% at D=1). Kept as-is
-    # for now to stay consistent with the team's spec_moe_model; reconcile to the +1 form together (flagged in
-    # danielAgentScheduling). Conclusions (big-tree/regime/EP/lookahead) are unaffected by the ~few-% shift.
+    # tokens EMITTED/round incl. the always-emitted bonus = (1−p^{D+1})/(1−p) (Leviathan; validate_routing_model
+    # §4). LOOP-A fixed spec_moe_model to match; this is the consistent +1 form. (Was (1−p^D)/(1−p), ~p^D low.)
     p = 1.0 - (1.0 - alpha) ** W
-    return float(D) if p >= 1.0 else (1.0 - p ** D) / (1.0 - p)
+    return float(D + 1) if p >= 1.0 else (1.0 - p ** (D + 1)) / (1.0 - p)
 
 
 def union(positions):

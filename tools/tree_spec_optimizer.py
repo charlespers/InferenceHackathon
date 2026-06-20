@@ -22,9 +22,9 @@ WIDTHS = [1, 2, 4, 8]
 DEPTHS = [2, 3, 4, 6, 8]
 
 
-def e_accepted(alpha, W, D):
+def e_accepted(alpha, W, D):                  # tokens emitted/round incl. bonus (+1 form, validate_routing_model §4)
     p = 1.0 - (1.0 - alpha) ** W
-    return float(D) if p >= 1.0 else (1.0 - p ** D) / (1.0 - p)
+    return float(D + 1) if p >= 1.0 else (1.0 - p ** (D + 1)) / (1.0 - p)
 
 
 def union(positions, overlap=0.0):

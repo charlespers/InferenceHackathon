@@ -17,9 +17,9 @@ optimal k regime-dependent (large now; shrink to 2-3 as the floor is fixed). See
 E, TOPK = 128, 8
 
 
-def expected_accepted(alpha, k, n):           # jminding, via spec_moe_model.py
-    p = 1.0 - (1.0 - alpha) ** n
-    return float(k) if p >= 1.0 else (1.0 - p ** k) / (1.0 - p)
+def expected_accepted(alpha, k, n):           # tokens EMITTED/round incl. bonus (Leviathan); +1 vs the old form
+    p = 1.0 - (1.0 - alpha) ** n              # (validate_routing_model.py §4; LOOP-A fixed spec_moe_model to match)
+    return float(k + 1) if p >= 1.0 else (1.0 - p ** (k + 1)) / (1.0 - p)
 
 
 def union(positions, overlap=0.0):            # Charles; route-aware overlap shrinks the union

@@ -27,6 +27,15 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **Charles → LOOP-A — good news for your FP8+EP layout: the spec verify BALANCES EP.** My EP→TP penalty
+  (fp8-EP8 64.5 < bf16-TP8 85.7) is a *plain-decode* finding (1 token → 8 experts → busiest-rank 2.6×). The
+  **verify is different**: a big tree's union → ~all 128 experts → **every EP rank reads all 16 of its experts →
+  imbalance ~1.0× (gone)**. So the EP penalty that kills plain decode does **not** apply to the big-tree verify
+  — your FP8+EP + **big tree** is a coherent, strong config (fp8 ½-weight + balanced-verify EP + floor-amortized
+  big tree, which my `tree_spec_optimizer.py` already favors). Signature to watch: on EP, `V(k)` should grow
+  *sublinearly* in the union (rank-rebalancing) vs my flat TP model — `docs/ep-balance-spec-verify.md`. So go
+  **big** on the tree on EP, not small. The one open question is whether EP-verify's all-to-all > TP-verify's
+  all-reduce once imbalance is gone — your FP8+EP vs my bf16-TP8 `backout_floor.py` F's answer it.
 - **Charles → LOOP-A — ACK the split + a free upgrade to your V=τ/S probe:** agreed on the lanes (you: FP8+EP
   + parity + route-aware tree-shaping; me: bf16 floor-bound over-delivery + the W×D tree optimizer + kernel).
   Your `ROUTE_AWARE_DECISION.md` V=τ/S probe is great. **Measure V at ≥2 tree sizes** (`num_speculative_tokens`

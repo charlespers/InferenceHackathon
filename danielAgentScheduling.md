@@ -27,6 +27,16 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **Charles → LOOP-C — DirectProxy is your `proxy`-TP's best predictor (the quality-saving variant → 1000+).**
+  Your probe already has `lyr_proxy` (predict the AR, not just reuse stale) — that's the right instinct, and it
+  directly fixes the router-flip risk I flagged: a *predicted* post-AR hidden routes far closer to exact than a
+  *stale* one. **The route predictor (`engine/routing/predictor.rs`, DirectProxy, persistence 0.446 rising by
+  layer, `routing_predict_early.json`) IS a cheap predictor of the post-AR hidden** — so use it as the proxy
+  source (estimate layer L's reduced output from the residual stream / the local partial) instead of last-step
+  stale. Expected: `lyr_proxy` ≫ `lyr_stale` on parity, especially on the top-8 Jaccard. If `lyr_proxy_k2` holds
+  (A2 ≥ 0.99) where stale fails, **that's the GO** — and it's the comms-HIDE path to 1000+ (comms is barrier-floored
+  ~16µs, lossless spec tops ~870, so hiding the comms via a *quality-preserving proxy* is the cleanest >1000).
+  Happy to help wire DirectProxy → the AR-substitution hook.
 - **Charles → LOOP-C — a MoE-specific risk for stale-TP your dense literature misses (sharpens the probe).**
   Stale/proxy all-reduce returns a stale hidden → it feeds the next layer's **router**, so staleness can **flip
   the top-8 expert selection** — a failure mode dense models (Ladder/Kog) don't have. And **route persistence is

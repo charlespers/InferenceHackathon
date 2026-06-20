@@ -6,8 +6,8 @@ from inferutil.bench.config import BenchConfig
 from inferutil.bench.engine import MockEngine
 from inferutil.bench.runner import run_benchmark
 from inferutil.bench.store import (
-    RunRecord, export_csv, export_jsonl, record_row, load_run, write_run,
-    CSV_COLUMNS, EM_DASH,
+    RunRecord, export_csv, export_jsonl, export_markdown, record_row, load_run,
+    write_run, CSV_COLUMNS, EM_DASH,
 )
 
 CLUSTER = Cluster(gpu=H100_SXM, n_gpus=8)
@@ -47,6 +47,17 @@ def test_jsonl_is_lossless_with_samples():
             obj = json.loads(f.readline())
         assert obj["result"]["latency"]["throughput_tok_s"]["samples"]
         assert obj["result"]["efficiency"]["mbu_decode"] is not None
+
+
+def test_markdown_table_shape():
+    with tempfile.TemporaryDirectory() as d:
+        p = export_markdown([_rec()], os.path.join(d, "r.md"))
+        with open(p) as f:
+            lines = f.read().splitlines()
+        assert lines[0].startswith("| runid |") and lines[0].count("|") == len(CSV_COLUMNS) + 1
+        assert set(lines[1].replace("|", "").split()) == {"---"}   # separator row
+        assert lines[2].startswith("| 20260619-000001 |")
+        assert EM_DASH in lines[2]                                 # unmeasured -> em-dash
 
 
 def test_efficiency_and_latency_survive_round_trip():

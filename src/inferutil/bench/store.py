@@ -142,6 +142,25 @@ def export_jsonl(records: list, path: str) -> str:
     return path
 
 
+def _md_cell(v) -> str:
+    if v is None:
+        return EM_DASH
+    if isinstance(v, float):
+        return f"{v:.4g}"      # compact, human-readable
+    return str(v)
+
+
+def export_markdown(records: list, path: str) -> str:
+    """Write runs as a GitHub-flavored Markdown table (shareable in PRs/docs)."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("| " + " | ".join(CSV_COLUMNS) + " |\n")
+        f.write("| " + " | ".join("---" for _ in CSV_COLUMNS) + " |\n")
+        for rec in records:
+            row = record_row(rec)
+            f.write("| " + " | ".join(_md_cell(row.get(c)) for c in CSV_COLUMNS) + " |\n")
+    return path
+
+
 def result_to_x_summary(record: RunRecord) -> dict:
     """Serialize to the console's x_summary shape (server/schemas.py vocabulary)."""
     r = record.result

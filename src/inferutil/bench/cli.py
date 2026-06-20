@@ -17,7 +17,8 @@ from .engine import MockEngine
 from .runner import run_benchmark
 from .telemetry import NvmlTelemetry, NullTelemetry
 from .store import (write_run, load_run, load_latest, load_all,
-                    result_to_x_summary, RunRecord, export_csv, export_jsonl)
+                    result_to_x_summary, RunRecord, export_csv, export_jsonl,
+                    export_markdown)
 from .report import (format_result, format_compare, format_diagnosis,
                      format_sweep, format_spec_sweep)
 from ..speculative import sweep as spec_sweep, memory_feasibility
@@ -172,10 +173,8 @@ def _cmd_export(args) -> None:
     records = load_all(args.name, args.results_dir)
     if not records:
         raise SystemExit(f"no runs for '{args.name}' in {args.results_dir}")
-    if args.format == "csv":
-        export_csv(records, args.out)
-    else:
-        export_jsonl(records, args.out)
+    writer = {"csv": export_csv, "jsonl": export_jsonl, "md": export_markdown}[args.format]
+    writer(records, args.out)
     print(f"exported {len(records)} run(s) -> {args.out}")
 
 
@@ -280,7 +279,7 @@ def main(argv=None) -> None:
 
     ep = sub.add_parser("export", help="export stored runs to csv/jsonl")
     ep.add_argument("--name", default="default")
-    ep.add_argument("--format", choices=["csv", "jsonl"], default="csv")
+    ep.add_argument("--format", choices=["csv", "jsonl", "md"], default="csv")
     ep.add_argument("--out", required=True)
     ep.set_defaults(func=_cmd_export)
 

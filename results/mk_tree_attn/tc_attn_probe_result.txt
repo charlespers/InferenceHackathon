@@ -37,3 +37,14 @@ leading dim) fixes it. So even a NON-fused cuBLAS split achieves flat-in-M atten
 only improve absolutes. vs warp-shuffle k2b M=8=165us, TC-split=67us = ~2.5x faster AND flat.
 VALIDATED LEVER: TC verify attention removes the K2 M-tax. Build it (fp8 KV + tree/causal mask + RoPE);
 M=1 plain decode keeps warp-shuffle (TC underfills there).
+
+--- DESIGN CONCLUSION (buildable decomposition of the spec-verify attention) ---
+The M=k verify attention splits cleanly into two terms:
+  (A) SHARED-CONTEXT attn: all M draft queries attend the committed KV [0,ctx). This is the DOMINANT cost
+      (ctx large) and is exactly the TC GEMM measured here -> FLAT in M (1.0x), no mask needed.
+  (B) DRAFT-SELF attn: each draft position attends the <=k preceding draft tokens in its chain/tree. This is
+      a tiny M x M (k<=16) masked attention -> negligible cost; carries the tree/causal mask + per-node RoPE.
+=> The M-tax disappears because (A) is TC-flat and (B) is O(M^2)-tiny. The engine verify = cuBLAS/mma TC for
+   (A) + a small masked kernel for (B) (my mk_tree_attn handles the masked/tree part). Does NOT require a
+   fully-fused monolithic FA kernel to remove the tax. Open Q to Charles: does his verify already separate
+   context vs draft-self, and does his engine call cuBLASLt/FA (TC) for the context attn or the warp k2?

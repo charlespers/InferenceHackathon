@@ -30,7 +30,10 @@ Existing: `experts[]`, `t_ms`, `spec{proposed,accepted}`. Add `bytes_moved{weigh
    sees it's ~95% overhead, not bytes. Color the dominant slice.
 2. **Regime chip** — `floor-bound` (→ "fix the floor: spec + comms + kernels") vs `weight-bound` (→ "now
    quant/route-aware pays"). The single most useful "what do I do next" signal (`interpretation-playbook.md`).
-3. **Spec panel** — live `accept_rate` + `τ` + `realized_speedup`, with a **red flag when realized < 1.0**
+3. **Spec panel** — live `accept_rate` + `τ` + `realized_speedup`. **Wiring (the field is currently hardcoded
+   0.0 in `VLLMBackend`):** `server/spec_metrics.py` → `cumulative_accept(fetch_metrics(VLLM_URL))` after the
+   stream (after-only = no TTFT hit) gives the real `{accept_rate, tau}` from vLLM's `/metrics`. With a **red
+   flag when realized < 1.0**
    (the MoE verify-tax trap, `spec-decode-moe-tax.md`) and the tree shape. Accept-rate is *the* knob a user
    watches — it varies with temperature + content (`spec-in-production.md`).
 4. **Ladder gauge** — current vs cheap-wins (~508) vs +kernels (~750) vs ceiling (~2000), so the headroom is

@@ -1,8 +1,15 @@
 # B=1 optimization atlas — every lever, status, and the one execution sequence
 
 The complete map of the converged team effort (my docs + `research/` + `tools/`). Status: ✅measured ·
-📊projected · 🧪experiment-ready · 🔬research. Current: **bf16-TP8 85.7 tok/s / 777ms TTFT / 2271ms@128tok**;
-proven-cheap target **~290 tok/s / ~10ms cached / ~450ms** (`single-user-latency-budget.md`).
+📊projected · 🧪experiment-ready · 🔬research. Current: **bf16-TP8 85.7 tok/s / 777ms TTFT / 2271ms@128tok**.
+
+## 🎯 NORTH STAR: 1000 tok/s (`path-to-1000.md`, `ladder_to_1000.py`, `megakernel-build-plan.md`)
+The quantitative ladder (`ladder_to_1000.py`): **86 → graphs 122 → fast-path 150 → fp8-K5-at-e→1 260 →
+NVLS@2µs 816 → small-tree spec 1101.** 1000 needs **TWO isolation-testable, graph-captured kernels** (not a new
+engine): **(1) fp8 K5 at e→1** (weight at roofline) and **(2) the NVLS all-reduce ≤~4µs** (`nvls_allreduce.cu`,
+the make-or-break — measure C with `measure_collective.sh`). Plus CUDA graphs + a scheduler-free loop + small-tree
+spec. **Comms is the crux** — make it fast (NVLS) or hide it (LOOP-C stale-TP → ~1588). Lossy cushion if it slips:
+int4 experts / depth. **Cheap first ship (~300, lossless): spec + prefix-cache on bf16-TP8 (the 09:45 rung).**
 
 ## The decode-step decomposition (the spine — `overhead-attribution.md`)
 TPOT 11.67ms = **overhead ~7.0ms (60%) · comms ~3.0ms (26%) · weight ~1.6ms (14%)**. Floor-bound: weight

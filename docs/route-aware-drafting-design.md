@@ -5,11 +5,17 @@ wider trees become net-positive on the MoE — "the unclaimed lever." It quantif
 +20–60% in weight-bound) but doesn't design *how* to make a drafter route-aware. This is that mechanism,
 connecting the spec engine (`engine/spec/`) to the route predictor (`engine/routing/predictor.rs`).
 
-## When it matters (set expectations first)
-Per `tools/tree_spec_optimizer.py`: route-awareness is a **weight-bound lever** — at the measured floor-bound
-F=0.86 the union tax is on the 14% weight, so big naive trees already win (~3.5×) and route-awareness adds
-little. **It activates as E0b/K5 push us toward weight-bound (F→0)**, where it lifts the best tree ~20–60% and
-unlocks wider trees. So: build it, but ship plain big-tree spec first; turn this on when the floor is down.
+## When it matters (set expectations first) — REFINED for the 1000 path
+Per `tools/tree_spec_optimizer.py`: route-awareness is moot for **plain decode** at the floor-bound F=0.86 (union
+tax on the 14% weight). **But its real home is the BIG-TREE SPEC VERIFY on the 1000-path engine** (graphs +
+fast-path + fp8-K5, comms-bound): there the verify reads the union of a *big* tree, and the union **dominates**
+— `verify_cost_check.py`: a W4×D8 tree (M=32) reads union≈112 experts = **7.66 ms ≫ the 3.0 ms comms**. So
+shrinking that union is first-order *there*. Net (after the acceptance trade-off, since biasing for overlap costs
+some τ): route-aware drafting lifts the big-tree verify ~**15%** on the comms-bound engine (e.g. ~757 → ~870 toward
+1000) — a real contributor to closing the lossless gap, **not** the "second-order, defer it" of the plain-decode
+floor-bound analysis. **So for the 1000 big tree: route-awareness is on the critical path** (it makes the high-τ
+wide tree *affordable* by keeping its union from exploding). LOOP-A's route-aware tree-shaping is first-order for
+the 1000 verify, even though it was second-order for plain floor-bound decode. (Plain decode: still defer it.)
 
 ## The mechanism
 The drafter normally extends the tree by the **highest-probability** next tokens. Route-aware drafting

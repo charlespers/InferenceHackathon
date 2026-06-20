@@ -98,6 +98,9 @@ def decode_latency(
     tp: int | None = None,         # attention tensor-parallel degree
     ep: int | None = None,         # expert-parallel degree
     ideal_routing: bool = False,   # ignore expert imbalance (placement-perfect)
+    measured_max_experts: float | None = None,  # busiest-GPU expert count from a
+                                   # real trace (overrides the theoretical E[max]);
+                                   # lets a placement/prefetch result drive the model
 ) -> DecodeBreakdown:
     gpu: GPU = cluster.gpu
     n = cluster.n_gpus
@@ -126,8 +129,12 @@ def decode_latency(
         comms = 2 * cfg.n_layers * gpu.collective_latency_s
     elif plan in ("ep", "hybrid"):
         # attention tensor-parallel across tp GPUs; experts expert-parallel.
-        max_experts = (cfg.top_k / ep) if ideal_routing \
-            else expected_max_experts_per_gpu(cfg.top_k, ep)
+        if measured_max_experts is not None:
+            max_experts = measured_max_experts
+        elif ideal_routing:
+            max_experts = cfg.top_k / ep
+        else:
+            max_experts = expected_max_experts_per_gpu(cfg.top_k, ep)
         imbalance = max_experts / (cfg.top_k / ep)
         per_gpu_attn = attn_bytes / tp
         per_gpu_expert = max_experts * cfg.one_expert_params * dtype_bytes

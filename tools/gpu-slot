@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# gpu-slot — enforce the team's 15-min testing slots (see SCHEDULE.md).
+#
+# Per hour, UTC:
+#   :00-:15 jaymin    :15-:30 alyssa    :30-:45 charles    :45-:00 djamoils
+#
+# One box clock (UTC) means everyone agrees whose slot it is. The guard refuses
+# to start a GPU job unless it is YOUR slot AND the GPUs are actually free, and
+# `run` auto-stops your job 30s before the slot boundary so it can't overrun.
+#
+# Usage:
+#   gpu-slot now                         # who owns the slot, time left, GPU usage
+#   gpu-slot guard <name>                # exit 0 only if your slot + GPUs free
+#   gpu-slot wait  <name>                # block until your slot opens
+#   gpu-slot run   <name> -- <cmd...>    # run cmd only in your slot, auto-killed at slot end
+set -uo pipefail
+
+FREE_MIB="${GPU_SLOT_FREE_MIB:-8000}"   # GPUs considered "free" if total used < this
+
+owner_for_minute() {  # $1 = minute 0-59
+  local m=$1
+  if   [ "$m" -lt 15 ]; then echo jaymin
+  elif [ "$m" -lt 30 ]; then echo alyssa
+  elif [ "$m" -lt 45 ]; then echo charles
+  else                       echo djamoils
+  fi
+}
+
+slot_range() {  # $1 = name
+  case "$1" in
+    jaymin)  echo ":00-:15" ;;
+    alyssa)  echo ":15-:30" ;;
+    charles) echo ":30-:45" ;;
+    djamoils) echo ":45-:00" ;;
+    *)       echo "(unknown name '$1' — expected jaymin|alyssa|charles|djamoils)" ;;
+  esac
+}
+
+cur_min() { date -u +%-M; }
+
+secs_to_slot_end() {  # seconds until the end of the current 15-min block
+  local m s into
+  m=$(cur_min); s=$(date -u +%-S)
+  into=$(( (m % 15) * 60 + s ))
+  echo $(( 15 * 60 - into ))
+}
+
+gpu_used_mib() {
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+    | awk '{s+=$1} END{print s+0}'
+}
+
+guard() {  # $1 = name ; exit 0 only if it's their slot AND gpus free
+  local name="${1:-}" owner used
+  [ -n "$name" ] || { echo "guard: need a name" >&2; return 2; }
+  owner=$(owner_for_minute "$(cur_min)")
+  if [ "$name" != "$owner" ]; then
+    echo "DENY: it's ${owner}'s slot ($(slot_range "$owner")). Your slot (${name}) is $(slot_range "$name")." >&2
+    return 10
+  fi
+  used=$(gpu_used_mib)
+  if [ "$used" -ge "$FREE_MIB" ]; then
+    echo "DENY: your slot, but GPUs busy (${used} MiB used >= ${FREE_MIB}). Someone may be overrunning:" >&2
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader >&2 2>/dev/null || true
+    return 11
+  fi
+  echo "OK: ${name} slot, GPUs free (${used} MiB), $(secs_to_slot_end)s remaining." >&2
+  return 0
+}
+
+case "${1:-now}" in
+  now|status)
+    owner=$(owner_for_minute "$(cur_min)")
+    echo "UTC $(date -u +%H:%M:%S) | slot owner: ${owner} ($(slot_range "$owner")) | $(secs_to_slot_end)s left | GPU used $(gpu_used_mib) MiB"
+    ;;
+  guard)
+    shift; guard "${1:-}"
+    ;;
+  wait)
+    shift; name="${1:-}"
+    [ -n "$name" ] || { echo "wait: need a name" >&2; exit 2; }
+    until guard "$name" >/dev/null 2>&1; do sleep 10; done
+    echo "${name}: slot open"
+    ;;
+  run)
+    shift; name="${1:-}"; shift || true
+    [ "${1:-}" = "--" ] && shift
+    [ -n "$name" ] && [ "$#" -gt 0 ] || { echo "usage: gpu-slot run <name> -- <cmd...>" >&2; exit 2; }
+    guard "$name" || exit $?
+    budget=$(secs_to_slot_end)
+    budget=$(( budget > 45 ? budget - 30 : budget ))   # leave 30s teardown margin
+    echo "RUN (auto-stop in ${budget}s at slot end): $*" >&2
+    exec timeout --signal=TERM --kill-after=15 "${budget}s" "$@"
+    ;;
+  *)
+    echo "usage: gpu-slot {now|guard <name>|wait <name>|run <name> -- <cmd>}" >&2
+    exit 2
+    ;;
+esac

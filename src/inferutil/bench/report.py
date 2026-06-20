@@ -140,6 +140,37 @@ def format_spec_sweep(rows, feasibility: dict, *, base_tok_s=None) -> str:
     return "\n".join(lines)
 
 
+_EFFORT_RANK = {"S": 0, "M": 1, "L": 2}
+
+
+def format_plan(record: RunRecord, bottleneck, levers, best_point=None) -> str:
+    """One-shot decision artifact: current state -> bottleneck -> biggest wins ->
+    suggested order (cheap wins first) -> best reachable config."""
+    r, c = record.result, record.config
+    mbu = _pct(r.efficiency.mbu_decode) if r.efficiency else "—"
+    lines = [
+        f"== PLAN: {c.name}  plan={c.plan} w{c.dtype_bytes}b kv{c.kv_dtype_bytes}b "
+        f"tp={c.tp} ep={c.ep} ctx={c.seq_len} ==",
+        f"  current      : {r.decode_tok_per_s:.1f} tok/s   MBU {mbu}   {bottleneck.regime}",
+        f"  bottleneck   : {bottleneck.dominant_term} ({bottleneck.share*100:.0f}%) "
+        f"-> {bottleneck.note}",
+    ]
+    if levers:
+        lines.append("  -- biggest wins (by predicted speedup) --")
+        for lv in levers:
+            lines.append(f"    {lv.speedup:>5.2f}x  [{lv.effort}]  {lv.name:<20} "
+                         f"-> {lv.predicted_tok_s:.0f} tok/s")
+        order = sorted(levers, key=lambda lv: (_EFFORT_RANK.get(lv.effort, 9), -lv.speedup))
+        lines.append("  -- suggested order (cheap, high-impact first) --")
+        for i, lv in enumerate(order, 1):
+            lines.append(f"    {i}. {lv.name} [{lv.effort}]  (+{(lv.speedup-1)*100:.0f}%)")
+    if best_point is not None:
+        lines.append("  -- best reachable config (quant x layout, analytical) --")
+        lines.append(f"    {best_point.label}: {best_point.decode_tok_s:.0f} tok/s "
+                     f"({best_point.regime}, bottleneck {best_point.dominant_term})")
+    return "\n".join(lines)
+
+
 def format_diagnosis(record: RunRecord, levers=None) -> str:
     """Bottleneck diagnosis + ranked next-lever recommendations for one run."""
     b = diagnose(record.result)

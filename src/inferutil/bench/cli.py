@@ -20,7 +20,7 @@ from .store import (write_run, load_run, load_latest, load_all,
                     result_to_x_summary, RunRecord, export_csv, export_jsonl,
                     export_markdown)
 from .report import (format_result, format_compare, format_diagnosis,
-                     format_sweep, format_spec_sweep)
+                     format_sweep, format_spec_sweep, format_plan)
 from ..speculative import sweep as spec_sweep, memory_feasibility
 from .attribution import diagnose
 from .levers import recommend
@@ -143,6 +143,24 @@ def _cmd_diagnose(args) -> None:
     print(format_diagnosis(rec, levers))
 
 
+def _cmd_plan(args) -> None:
+    cluster = _measured_cluster(Cluster(gpu=GPUS[args.gpu], n_gpus=args.n_gpus),
+                                args.peak_bw_gbs)
+    config = BenchConfig(name="plan", plan=args.plan, dtype_bytes=args.dtype,
+                         kv_dtype_bytes=args.kv_dtype, tp=args.tp, ep=args.ep,
+                         prompt_tokens=args.prompt, decode_tokens=args.decode, repeats=1)
+    # Analytical floor result for this config (efficiency=1.0 -> at the floor).
+    eng = MockEngine(QWEN3_235B, cluster, efficiency=1.0, jitter=0.0)
+    result = run_benchmark(eng, config, QWEN3_235B, cluster)
+    rec = RunRecord(runid="analytical", config=config,
+                    env={"gpu": cluster.gpu.name, "n_gpus": cluster.n_gpus},
+                    result=result)
+    b = diagnose(result)
+    levers = recommend(QWEN3_235B, cluster, config, bottleneck=b)
+    best = config_sweep(QWEN3_235B, cluster, full_grid(config, cluster.n_gpus))[0]
+    print(format_plan(rec, b, levers, best))
+
+
 def _cmd_sweep(args) -> None:
     cluster = _measured_cluster(Cluster(gpu=GPUS[args.gpu], n_gpus=args.n_gpus),
                                 args.peak_bw_gbs)
@@ -247,6 +265,21 @@ def main(argv=None) -> None:
     dp.add_argument("--min-speedup", type=float, default=1.02,
                     help="drop levers predicting less than this speedup")
     dp.set_defaults(func=_cmd_diagnose)
+
+    pl = sub.add_parser("plan",
+                        help="one-shot decision plan: bottleneck + ranked wins + best config (no GPU)")
+    pl.add_argument("--gpu", default="H100-SXM-80GB", choices=list(GPUS))
+    pl.add_argument("--n-gpus", type=int, default=8)
+    pl.add_argument("--plan", default="hybrid", choices=["tp", "ep", "hybrid"])
+    pl.add_argument("--dtype", type=float, default=1.0, help="2=bf16, 1=fp8, 0.5=int4")
+    pl.add_argument("--kv-dtype", type=int, default=2, choices=[1, 2])
+    pl.add_argument("--tp", type=int, default=2)
+    pl.add_argument("--ep", type=int, default=8)
+    pl.add_argument("--prompt", type=int, default=512)
+    pl.add_argument("--decode", type=int, default=128)
+    pl.add_argument("--peak-bw-gbs", type=float, default=None,
+                    help="measured HBM GB/s per GPU; overrides the spec sheet")
+    pl.set_defaults(func=_cmd_plan)
 
     sw = sub.add_parser("sweep",
                         help="analytical depth/config sweep (no GPU required)")

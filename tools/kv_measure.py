@@ -102,7 +102,7 @@ def main():
 
     print(json.dumps(med, indent=2))
     print(
-        f"\n[{a.label}] ctx≈{med['prompt_tokens']} | TTFT {med['ttft_ms']:.1f} ms | "
+        f"\n[{a.label}] ctx~{med['prompt_tokens']} | TTFT {med['ttft_ms']:.1f} ms | "
         f"TPOT {med['tpot_ms']:.2f} ms | decode {med['decode_tok_s']:.1f} tok/s",
         file=sys.stderr,
     )

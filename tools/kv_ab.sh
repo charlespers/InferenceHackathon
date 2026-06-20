@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # KV-cache FP8 A/B — runs ONE kv-cache-dtype's full ctx sweep + quality capture,
-# sized to fit a single 15-min GPU slot (model load ~135s + sweep). Run twice
-# across slots: `kv_ab.sh auto` then `kv_ab.sh fp8`, then compare offline.
+# sized to fit a single 15-min GPU slot. Run twice across slots:
+# `kv_ab.sh auto` then `kv_ab.sh fp8`, then compare offline.
 #
-#   bash tools/kv_ab.sh {auto|fp8} [PORT]
+#   [REPO=/alloc/data/kvquant] bash tools/kv_ab.sh {auto|fp8} [PORT]
 #
-# Non-interference: serializes on GPU free memory (waits if MIN free < 65 GB),
-# uses port 8088, never touches the adaptive-topk loop's port 8077 / paths.
+# Coordination (see SCHEDULE.md / tools/gpu-slot):
+#  - djamoils owns :45-:00 UTC. Refuses to launch outside that window.
+#  - Mutual-exclusion vs the sibling djamoils loop via the >65GB-free gate AND an
+#    advisory lock (/alloc/data/djamoils.lock) so we can SEE each other, not just
+#    infer from GPU occupancy. Uses port 8088 (sibling uses 8077/8001).
+#  - Hard slot-end deadline: tears the server down ~30s before :00 so it can never
+#    overrun into Jaymin's :00 slot. Skips remaining ctx points if time is short
+#    (logged, never silently dropped).
 set -u
 KV="${1:?usage: kv_ab.sh {auto|fp8} [port]}"
 PORT="${2:-8088}"
@@ -15,17 +21,48 @@ MODEL="Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"   # FP8 weights (HF-cached)
 SERVED=qwen3
 OUT="$REPO/results/kv_fp8/$KV"
 LOG=/root/vllm_kv_${KV}.log
+LOCK=/alloc/data/djamoils.lock
+GUARD_MARGIN=30   # stop this many seconds before the slot boundary
 mkdir -p "$OUT"
 
-# --- GPU gate: do not launch if the box is in use by the other loop ---
+now_min() { date -u +%-M; }
+now_sec() { date -u +%-S; }
+# seconds until the end of djamoils' slot (:00). If we're at :45-:59, that's the
+# top of the next hour; the deadline subtracts GUARD_MARGIN.
+secs_to_slot_end() { local m s; m=$(now_min); s=$(now_sec); echo $(( (60 - m) * 60 - s )); }
+
+cleanup() {
+  kill -9 -"${VPID:-0}" 2>/dev/null
+  pkill -9 -f "served-model-name $SERVED" 2>/dev/null
+  [ -f "$LOCK" ] && grep -q "kv=$KV" "$LOCK" 2>/dev/null && rm -f "$LOCK"
+}
+trap cleanup EXIT INT TERM
+
+# --- slot ownership: only run in djamoils' :45-:00 window ---
+M=$(now_min)
+if [ "$M" -lt 45 ]; then
+  echo "DENY: not djamoils' slot (UTC :$M; slot is :45-:00). Not launching." ; exit 2
+fi
+BUDGET=$(( $(secs_to_slot_end) - GUARD_MARGIN ))
+echo "=== kv=$KV slot OK, ${BUDGET}s budget to deadline $(date -u +%H:%M:%S)UTC ==="
+if [ "$BUDGET" -lt 180 ]; then
+  echo "DENY: only ${BUDGET}s left in slot — not enough to load+measure. Wait for next slot." ; exit 2
+fi
+
+# --- advisory lock: let the sibling djamoils loop see us (best-effort) ---
+if [ -f "$LOCK" ] && ! grep -q "kv=$KV" "$LOCK" 2>/dev/null; then
+  echo "DENY: sibling djamoils job holds the lock:" ; cat "$LOCK" ; exit 3
+fi
+echo "kv=$KV pid=$$ port=$PORT since=$(date -u +%H:%M:%S)UTC purpose=kv-fp8-sweep" > "$LOCK"
+
+# --- GPU gate: do not launch if the box is in use (TOCTOU-narrowed by the lock) ---
 minfree=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)
-echo "=== kv=$KV : MIN GPU free=${minfree} MiB $(date -u +%H:%M:%S)UTC ==="
+echo "=== kv=$KV : MIN GPU free=${minfree} MiB ==="
 if [ "${minfree:-0}" -lt 65000 ]; then
   echo "GPUs busy (min free ${minfree} < 65000 MiB) — NOT launching. Retry next slot." ; exit 3
 fi
 
 # --- launch vLLM: FP8 weights + EP + CUDA graphs (no --enforce-eager) ---
-# baseline kv=auto (fp16/bf16 KV) vs kv=fp8 (e4m3, default scales). B=1.
 pkill -9 -f "served-model-name $SERVED" 2>/dev/null; sleep 2
 setsid python3 -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" --served-model-name "$SERVED" \
@@ -36,29 +73,44 @@ setsid python3 -m vllm.entrypoints.openai.api_server \
   > "$LOG" 2>&1 < /dev/null &
 VPID=$!
 
+# --- watchdog: hard-kill at the slot deadline no matter what ---
+( sleep "$BUDGET"; echo "=== DEADLINE reached — killing vLLM to vacate slot ===" >> "$LOG"; cleanup ) &
+WPID=$!
+
 ready=0
-for i in $(seq 1 96); do   # up to 8 min for load
+for i in $(seq 1 96); do   # up to 8 min for load (watchdog bounds it to slot end)
   curl -s -m 4 "http://localhost:$PORT/v1/models" 2>/dev/null | grep -q "$SERVED" \
     && { ready=1; echo "=== READY ~$((i*5))s $(date -u +%H:%M:%S)UTC ==="; break; }
   sleep 5
 done
 if [ "$ready" -ne 1 ]; then
-  echo "=== kv=$KV did NOT come up — tail log: ==="; tail -25 "$LOG"
-  kill -9 -"$VPID" 2>/dev/null; pkill -9 -f "served-model-name $SERVED" 2>/dev/null; exit 1
+  echo "=== kv=$KV did NOT come up — tail log: ==="; tail -25 "$LOG"; exit 1
 fi
+grep -iE "flashattention|FlashAttn|FA3|attention backend|backend" "$LOG" | tail -3 || true
 
-# --- ctx sweep: the FP8-KV win grows with context length ---
+# --- ctx sweep: the FP8-KV win grows with context length. Deadline-aware. ---
 for ctx in 128 2048 8192 32768; do
-  echo "--- kv=$KV ctx=$ctx ---"
+  left=$(( $(secs_to_slot_end) - GUARD_MARGIN ))
+  need=$(( ctx >= 32768 ? 100 : 45 ))   # rough per-point budget
+  if [ "$left" -lt "$need" ]; then
+    echo "SKIP ctx=$ctx — only ${left}s left (<${need}s). Logged, not silently dropped." | tee -a "$OUT/SKIPPED.txt"
+    continue
+  fi
+  echo "--- kv=$KV ctx=$ctx (${left}s left) ---"
   python3 "$REPO/tools/kv_measure.py" --base "http://localhost:$PORT" --model "$SERVED" \
     --ctx "$ctx" --decode 128 --warmup 2 --repeat 3 --label "kv=$KV ctx=$ctx" \
     --json-out "$OUT/ctx_${ctx}.json"
 done
 
 # --- quality capture (greedy; compared offline vs the other dtype) ---
-echo "--- kv=$KV quality capture ---"
-python3 "$REPO/tools/kv_quality.py" capture --base "http://localhost:$PORT" \
-  --model "$SERVED" --out "$OUT/quality.json"
+left=$(( $(secs_to_slot_end) - GUARD_MARGIN ))
+if [ "$left" -gt 120 ]; then
+  echo "--- kv=$KV quality capture (${left}s left) ---"
+  python3 "$REPO/tools/kv_quality.py" capture --base "http://localhost:$PORT" \
+    --model "$SERVED" --out "$OUT/quality.json"
+else
+  echo "SKIP quality capture — only ${left}s left. Run in a later slot." | tee -a "$OUT/SKIPPED.txt"
+fi
 
 echo "=== kv=$KV DONE $(date -u +%H:%M:%S)UTC — results in $OUT ==="
-kill -9 -"$VPID" 2>/dev/null; pkill -9 -f "served-model-name $SERVED" 2>/dev/null
+kill "$WPID" 2>/dev/null   # cancel watchdog; trap cleanup tears down the server

@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 from ..model import MoEConfig
 from ..hardware import Cluster
 from ..latency import decode_latency
+from .prefill import prefill_latency
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,8 @@ class MockEngine:
         self.quality_offset = quality_offset
         self._floor_s = 0.0
         self._shares = (0.0, 0.0, 0.0, 0.0)
+        self._dtype_bytes = 2
+        self._kv_dtype_bytes = 2
         self._index = 0
         self._rng = random.Random(seed)
 
@@ -78,6 +81,8 @@ class MockEngine:
             kv_dtype_bytes=kv_dtype_bytes, seq_len=seq_len, tp=tp, ep=ep)
         self._floor_s = bd.total_s
         self._shares = (bd.weight_read_s, bd.kv_read_s, bd.comms_s, bd.compute_s)
+        self._dtype_bytes = dtype_bytes
+        self._kv_dtype_bytes = kv_dtype_bytes
         self._index = 0
         self._rng = random.Random(self.seed)
 
@@ -89,9 +94,12 @@ class MockEngine:
 
     def prefill(self, token_ids) -> PrefillResult:
         n = len(token_ids)
-        # Crude prefill model (compute-bound; refined when ConiferEngine lands):
-        # ~one floor-step of weight reads per prompt token.
-        return PrefillResult(n_prompt_tokens=n, seconds=self._floor_s * n,
+        # Batched prefill roofline (compute vs full-weight-read), inflated by the
+        # same kernel-efficiency knob as decode for consistency.
+        floor = prefill_latency(self.cfg, self.cluster, dtype_bytes=self._dtype_bytes,
+                                kv_dtype_bytes=self._kv_dtype_bytes, prompt_tokens=n)
+        seconds = floor / self.efficiency if self.efficiency else floor
+        return PrefillResult(n_prompt_tokens=n, seconds=seconds,
                              first_token_seconds=self._step_seconds())
 
     def decode_step(self) -> DecodeStep:

@@ -27,6 +27,19 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — flat-K2 (2905218) is THE make-or-break now; it's my occupancy disease applied to SPEC,
+  and 294 < my own 840-1090 flag (I was optimistic too).** Validated. **(1) Unification:** "spec doesn't ride
+  free" (forward scales T16/T1=2.3, honest e2e 107/294) is the **SAME occupancy starvation** as plain decode —
+  K2 attention is occupancy-bound, so it **can't flatten in M**; the GEMM panels flatten (one weight read serves
+  M queries) but attention doesn't (each verify query needs its own work on an idle-but-SERIAL GPU). So my
+  whole_engine_mbu_ceiling thesis now explains the spec shortfall too: same disease, two symptoms. **(2) The
+  fix premise is SOUND but UNVALIDATED:** `k2_batched_decode.cu` spends the M queries on the **idle** SMs (B=1
+  runs at ~8-30% MBU → ~70-90% idle → room to absorb M=8-16 queries ~free → us(M=8)≈us(M=1)). But the current
+  mk_tree_attn still SCALES (M=8≈4× M=1, 3f6b829 w-sweep) → flat-K2 is necessary and **not yet demonstrated**.
+  **(3) Honest 1000 status:** measured **294, NOT 840-1000** — 1000 hinges on flat-K2 working + cuBLASLt MBU>0.45
+  + trained EAGLE3 head ("zero-slack but open"). My earlier "1000 marginal 840-1090" was itself optimistic; the
+  measured floor is 294 until flat-K2 lands. **Flat-K2 is the #1 thing to validate on the next slot** — if
+  us(M=8)≈us(M=1) it restores the free-ride; if it still scales, 1000 is out of reach this round. (No GPU.)
 - **LOOP-C → CHARLES — your latency-floor verdict (3d0cd4c) CONFIRMS my corrected stance + sharpens 1000 to
   MARGINAL; and it tempers my own K2 claim.** Validated. **(1) Confirms:** the floor IS the occupancy/glue
   serial chain (K2 1872 + glue 2566 + comms 1776µs = **6.2ms serial, "fusable not freely overlappable"**),

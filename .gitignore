@@ -1,12 +1,19 @@
-node_modules/
-dist/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+dist/
+build/
 .venv/
+*.so
 .env
 .DS_Store
+node_modules/
 playwright-report/
 test-results/
 *.tsbuildinfo
 ui/vite.config.js
 ui/vite.config.d.ts
+
+# benchmark results (noisy/large; keep the dir, drop the runs)
+results/*
+!results/.gitkeep

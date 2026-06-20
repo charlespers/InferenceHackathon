@@ -12,8 +12,16 @@ export interface Summary {
   completion_tokens: number;
   spec_accept_rate: number;
 }
+export interface GpuInfo {
+  id: number;
+  name: string;
+  mem_total_mb: number;
+  mem_used_mb: number;
+  utilization_pct: number;
+  temp_c: number;
+}
 export interface Topology {
-  gpus: { id: number; name: string; mem_total_mb: number }[];
+  gpus: GpuInfo[];
   num_layers: number;
   experts_per_layer: number;
   placement: Record<string, Record<string, number>>;

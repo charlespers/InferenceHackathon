@@ -1,0 +1,25 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# cudarc: safe Rust bindings to CUDA.
+# Pin a specific version once conifer's cudarc version is known.
+cudarc = { version = "0.16", features = ["cuda-12060", "nccl"], optional = true }
+
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Async runtime for server + concurrent draft execution.
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[features]
+default = []
+# Enable when building on a machine with CUDA.
+cuda = ["dep:cudarc"]
+
+[dev-dependencies]
+approx = "0.5"

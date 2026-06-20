@@ -1,0 +1,14 @@
+[project]
+name = "inferutil"
+version = "0.0.1"
+description = "Latency-oriented multi-GPU MoE inference utilities (Qwen3-235B-A22B on 8xH100)"
+requires-python = ">=3.10"
+dependencies = []  # phase 0 is pure stdlib by design (runs without torch/GPU)
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["inferutil"]

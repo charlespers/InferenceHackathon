@@ -119,7 +119,7 @@ class StaleScheduler:
         self._last_by_slot = {}  # mode=layer: slot -> last real reduced handle (this step)
         self._cache_by_idx = {}  # mode=temporal: idx -> last real reduced handle (prev step)
         self._lock = threading.Lock()
-        self.stats = {k: 0 for k in (REAL, REAL_FALLBACK, STALE, LOCAL, EXACT)}
+        self.stats = {k: 0 for k in (REAL, REAL_FALLBACK, STALE, LOCAL, PREDICTED, EXACT)}
         self.observed_calls_per_pass = 0  # for period calibration / sanity
 
     def is_refresh_layer(self, layer: int) -> bool:

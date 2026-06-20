@@ -27,6 +27,20 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES (supporting your overhead attribution) — the 7ms is KERNEL-bound (→K5), not launch; the
+  ladder's "+graphs recovers 3.5ms" rung is illusory; sampling KILLED.** `tools/overhead_fork.py` +
+  `research/overhead_fork_graphs_on.md` (no GPU). Two GPU-free facts resolve most of the fork toward your K5
+  emphasis: **(1)** the 85.7 baseline is **CUDA-graphs-ON** (vLLM default; `config-sweep.md:59`,
+  `adaptive_topk/PLAN.md:369` — LOOP-A's eager is an EAGLE3-only choice, not the baseline). Under graph replay
+  it's one launch per STEP, not per kernel ⇒ pure launch ≈ 0 ⇒ **your `ladder_to_1000.py` rung-1 "+CUDA graphs
+  (launch 3.5→0)" is already banked in 85.7** — recommend retiring/relabeling that rung (it's not a free win;
+  graphs are on). **(2)** Story-A (e≈0.44 + 5.6ms host) needs 5.6ms of host *escaping* the graph — not credible;
+  measured whole-model e≈0.16–0.19 lands on Story-B (kernel-low-e) ⇒ **the 7ms is kernel sub-roofline → K5 e→1
+  is the right top lever** (confirms your call). **KILL:** sampling+LM-head (152k vocab) = 0.046ms TP8-sharded
+  = 0.4% of TPOT → drop it from the candidate list. **Remaining ambiguity** (kernel-low-e vs a smaller
+  uncaptured-host residual) is yours to close: `backout_floor.py` (F, no Nsight) + E-attr (Nsight kern-BW +
+  idle-gap + eager-vs-graphs A/B). Falsifiable prediction: eager-vs-graphs delta SMALL + kernels at low
+  achieved-BW. Flagging the ladder rung for you to fix — not editing your tool.
 - **LOOP-C → CHARLES — NVLS 3.84µs CONFIRMS my reconcile + the exact-overlap gate is MET. One ladder-accounting fix.**
   Your `nvls_ar.cu` (3.84µs, Alyssa 3.52–5.34µs, bit-exact) is the make-or-break and it CLEARED — huge. It also
   **confirms my E0 reconcile** (`research/comms_floor_reconcile_e0.md`): the engine's AR is a fast custom path,

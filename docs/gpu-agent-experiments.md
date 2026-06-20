@@ -237,7 +237,19 @@ drop self-spec → rely on E6 n-gram (repetitive) + a trained MTP head (general)
      raw: TTFT=.. TPOT=.. tok/s=.. %roofline=.. dominant=..
      notes/anomalies: ... -->
 
-### 2026-06-20  Live :8000 (Conifer engine, spec ON) — B=1 baseline measured ⟵ floor-bound CONFIRMED on Conifer
+### 2026-06-20  ⚠️ CORRECTION — `:8000` is the repo MOCK, not a real GPU (entry below RETRACTED)
+> **Integrity retraction.** I mistook `:8000` for a real engine; it is the demo mock
+> (`server/mock_engine.py` "conifer" profile). Proof — the profile hard-codes the numbers I "measured":
+> `per_tok_ms=7.0` → `decode_tok_per_s=1000/7=142.9` (the exact "server tok/s"); `ttft_ms=42.0` (≈ my 47ms
+> incl. SSE overhead); accept pattern `3 if i%4 else 2` over proposed=4 → `176/256=0.6875→0.688` (the exact
+> "accept_rate"). They're **static across ctx and temperature** (I confirmed identical at temp 0.0/0.7) because
+> they are constants, and `main.py`'s SSE layer paces the 7ms → my wall-clock ~116 tok/s / 8.6ms TPOT.
+> **WITHDRAWN: the "floor-bound confirmed on Conifer" claim and all "real" numbers below — there is NO real-GPU
+> measurement here.** Real-box access (not localhost :8000) is still needed for E0/E-attr/E1. The analytical
+> work and the model-logic cross-check findings (next section) mostly stand on the team's OWN measured numbers;
+> see the correction there. _Original mock entry kept for the record:_
+
+### 2026-06-20  [RETRACTED — MOCK] Live :8000 (Conifer engine, spec ON) — B=1 baseline measured
 launch/config: localhost:8000, served `qwen3-235b-a22b`, **engine=Conifer** (per `x_summary.engine`),
 `x_summary.spec_enabled=true`, **spec_accept_rate=0.688**. Measured over the OpenAI `/v1/chat/completions`
 SSE seam with `bench/measure.py` (now reports percentiles + Student-t 95% CIs); ctx 128/512/2048,
@@ -276,52 +288,46 @@ notes/anomalies:
   `bench/roofline.py` reports MFU/MBU/ridge + the principled dominant term — so future Results-Log entries
   can be richer than TTFT/TPOT/tok-s alone.
 
-### Cross-check (GPU-agent model audit vs measured data) — 2026-06-20
-Multi-agent audit (6 model-auditors + adversarial verify, **13→8 confirmed**) of the `tools/` predictive
-models against the live :8000 measurement. All 8 are in `tools/`/`docs/` (flagging, **not editing** your files).
-Unifying theme: **the prediction tools over-state deployable tok/s (they apply floor/kernel efficiency as a
-whole-model factor), and they frame spec as not-yet-on — but the live engine is floor-bound AND already running
-spec (accept 0.688).** Where your own docs already note the issue, I say so.
+### Cross-check (GPU-agent model audit) — 2026-06-20  [CORRECTED]
+Multi-agent audit (6 model-auditors + adversarial verify, 13→8 confirmed) of the `tools/` predictive models.
 
-⏰ **TIME-SENSITIVE for the 08:45 EAGLE3 run:** the measured **116 tok/s is the spec-ON baseline.** Measure
-EAGLE3 as **incremental over 116** (re-tuning k/N), not vs a spec-off baseline — else the ~2× spec already
-realized gets double-counted. Gate on realized tok/s vs 116 (matches your route-aware measurement-gated note).
+> **⚠️ CORRECTION:** I originally fed this audit a "measured ground truth" (116 tok/s / accept 0.688 / flat-ctx)
+> that turned out to be the repo **MOCK** (`:8000`, see Results Log retraction), not real hardware. Re-scoping
+> honestly:
+> - **WITHDRAWN (mock-derived):** the "spec is already on (0.688), so the model double-counts" critique of
+>   `spec_floor_model.py`, AND the "measure EAGLE3 incremental vs 116" heads-up. For the REAL engine your docs
+>   call bf16-TP8 **85.7 tok/s GREEDY (spec OFF)** — so EAGLE3 is most likely **fresh headroom on a spec-off
+>   baseline**, the opposite of what I said. Treat EAGLE3 as a real multiplier; gate on realized tok/s vs your
+>   actual spec-off baseline, not vs any :8000 number.
+> - **STILL STAND** (rest on the team's OWN documented real numbers or on pure code-logic, not the mock):
 
-**HIGH — the reference tables the plan "keys off" are ~2–3× optimistic:**
+**HIGH — reference tables over-predict vs the team's *own* measured bf16-TP8 = 85.7 tok/s:**
 - `predict_matrix.py:34` / `predicted-tok-s-matrix.md` — "real @e=0.46" uses the **K5 kernel** efficiency as a
-  whole-model factor. Apples-to-apples bf16-TP8: predicts **178 vs measured 85.7** (2.08×); fp8-TP8 261 vs
-  measured 116 wall / 143 server. Measured whole-model e≈**0.20–0.25**, not 0.46. (Doc lines 9–10 already warn
-  0.46 is kernel-only & cite ~16% — the *table* just isn't regenerated to match.) → recalibrate E to ~0.2.
-- `project_latency.py:136` — "TP8 bf16 (baseline)" has **no efficiency derate** → 374 tok/s (vs measured 116),
-  and it's the denominator for every `speedup_vs_tp`. Apply `latency_budget`'s derate (that file already uses
-  eff=0.16) or label the table "ideal roofline, ratios only".
-- `spec_floor_model.py:46-54` — speedup is spec-ON-vs-OFF (plain step normalized to 1.0); takeaway "run spec
-  NOW ~2–3×". Spec is already on (model's α=0.7 ≈ measured 0.688) → that gain is already in 116. Reframe as
-  incremental re-tuning vs 116.
-- `spec_moe_model.py:51-52` — `verify_cost` hard-codes **F=0** (weight-bound); measured is **F≈0.86**
-  (floor-bound). With floor-aware `vc = F+(1-F)·weight_units` at F=0.86 the headline flips: "big trees lose /
-  N>1 bad" → k≈4–8 and **N=2 WIN**. (Your `spec-decode-floor-bound.md` already derives this rebuttal in prose;
-  the *tool* just hasn't been updated to carry F.)
-- `tree_spec_optimizer.py:35-48` — `verify_cost` has no per-depth term and `union` saturates → speedup is
-  monotone-increasing in depth → argmax **pins to the grid edge (D8)**. "wide AND deep win" is a grid-stop
-  artifact; add draft-gen cost (D sequential drafter passes) + an accept-length cap (~3–4 at this α) for a real
-  interior optimum.
+  whole-model factor; predicts bf16-TP8 **178 vs your measured 85.7** (2.08×). Doc lines 9–10 already warn 0.46
+  is kernel-only & cite ~16% — the *table* just isn't regenerated. → recalibrate E to ~0.2.
+- `project_latency.py:136` — "TP8 bf16 (baseline)" has **no efficiency derate** → 374 tok/s (vs your 85.7), and
+  it's the denominator for every `speedup_vs_tp`. Apply `latency_budget`'s derate (eff=0.16) or label ratios-only.
+- `spec_moe_model.py:51-52` — `verify_cost` hard-codes **F=0** (weight-bound); your docs say **F≈0.86**
+  (floor-bound, overhead 60%+comms 26%). Floor-aware `vc=F+(1-F)·weight_units` at F=0.86 flips the headline:
+  "big trees lose / N>1 bad" → k≈4–8 and **N=2 WIN**. Your `spec-decode-floor-bound.md` already derives this;
+  the *tool* just hasn't been updated to carry F.
+- `tree_spec_optimizer.py:35-48` — `verify_cost` has no per-depth term & `union` saturates → speedup monotone in
+  depth → argmax **pins to the grid edge (D8)**. Pure-logic artifact; add draft-gen cost (D sequential drafter
+  passes) + an accept-length cap for a real interior optimum.
 
-**MEDIUM:**
-- `spec_floor_model.py:20-22` — `expected_accepted = (1-p^k)/(1-p)` omits the **guaranteed bonus token**
-  (`engine/src/spec/accept.rs` always emits +1). Undercounts tokens/round 22%@k=2 / 8.7%@k=4; flips some F=0
-  go/no-go but NOT the measured-F=0.86 conclusion. Use `(1-p^(k+1))/(1-p)`.
+**MEDIUM (pure code-logic):**
+- `spec_floor_model.py:20-22` — `expected_accepted=(1-p^k)/(1-p)` omits the **guaranteed bonus token**
+  (`engine/src/spec/accept.rs` always emits +1). Undercounts tokens/round 22%@k=2 / 8.7%@k=4. Use `(1-p^(k+1))/(1-p)`.
 - `placement_b1.py:103` — printed `random≈1.88` is E[occupied-bin load], not E[max]. True random busiest =
-  **E[max]=2.60** (your `b1-latency-architecture.md` says 2.6); self-evident since the tool's own round-robin
-  row prints 2.94 > 1.88. Label-only — the computed `busiest()` values are correct.
+  **E[max]=2.60** (your `b1-latency-architecture.md` says 2.6); self-evident since the tool's round-robin row
+  prints 2.94 > 1.88. Label-only — `busiest()` values are correct.
 
 Per-finding evidence + verifier reasoning saved in the audit transcript; happy to PR any of these.
 
 **Tooling to operationalize the recalibration (shipped in the bench suite):**
-- `python -m inferutil.bench calibrate --measured-tok-s 116 --plan <p> --dtype <d> --tp <t> --ep <e>` backs
-  out the realized whole-model **e = measured / analytical-floor**. Live check (assuming fp8/EP8/ctx2112):
-  116 vs floor 322 → **e≈0.36 vs the latency.py floor** (which already includes comms), ~0.20 vs the pure-BW
-  ceiling. (Confirm Conifer's actual layout to pin it — open Q above.)
+- `python -m inferutil.bench calibrate --measured-tok-s 85.7 --plan tp --dtype 2 --tp 8 --ep 1` backs out the
+  realized whole-model **e = measured / analytical-floor** (use YOUR real measured tok/s — e.g. the bf16-TP8
+  85.7 — not any :8000 mock number).
 - `sweep`/`plan --efficiency <e>` now scale predicted tok/s + MBU + $/Mtok by e, so they show calibrated
   reality, not the floor — the suite no longer falls into the same over-prediction trap. e.g.
-  `sweep --plan ep --tp 8 --ep 8 --efficiency 0.2` → int4 ~89 tok/s (realistic) vs ~380 at the floor.
+  `sweep --efficiency 0.2` → realistic tok/s vs the optimistic floor.

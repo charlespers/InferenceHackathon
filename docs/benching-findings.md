@@ -78,29 +78,16 @@ drafters at fp8 target):
 
 ## Measured reality check
 
-### Live GPU — Conifer engine on `:8000` (2026-06-20, real)
+### ⚠️ CORRECTION — the ":8000" measurement was the repo MOCK, not a real GPU
 
-Measured the live server with the suite's `measure.py` (percentiles + 95% CIs) + `roofline.py`:
-
-| metric | value |
-|--------|-------|
-| decode | **116 tok/s** wall-clock / **143 tok/s** server-reported (`x_summary`) |
-| TPOT | 8.66 ms (tight, 95% CI ±~0.1 ms) |
-| TTFT | ~47 ms, **flat across prompt P=16→8192** (E-ttft length curve) |
-| spec | ON, accept_rate **0.688** |
-| roofline | **9.4%** (fp8 ceiling 1231) / **18.8%** (bf16 ceiling 616), dominant **`kernel_gap`** |
-
-Three things the real data confirms:
-1. **Floor-bound holds on the Conifer engine** (9–19% of roofline, overhead/launch-dominated) — and
-   *even with spec already on*. So the byte-levers (int4/KV/adaptive-topk) stay last until the floor drops,
-   exactly as the "floor is the game" thesis says. The #1 lever is the fast-path / `kernel_gap`.
-2. **Decode is flat across ctx 128→2048** → weights ≫ KV at these depths, precisely as the analytical
-   depth-sweep predicts (KV crossover only ~128k).
-3. **TTFT is flat ~47 ms from P=16 to P=8192** → Conifer's prefill is fixed-overhead/prefix-cache dominated,
-   NOT the 777 ms overhead-bound path vLLM showed. (2-repeat means; cold-vs-cached not fully separated —
-   mean>p50 hints a small cold premium.)
-
-Raw log + repro commands: `docs/gpu-agent-experiments.md` Results Log.
+An earlier version of this section reported a "live Conifer :8000" measurement (116 tok/s, accept 0.688, flat
+TTFT) as real. **It was the repo's demo mock** (`server/mock_engine.py` "conifer" profile, which hard-codes
+`per_tok_ms=7`→142.9 tok/s, `ttft_ms=42`, and the accept pattern `3 if i%4 else 2`→0.688 — all constants,
+bit-identical across ctx and temperature). **Retracted: there is no real-GPU measurement in this repo yet.**
+The analytical predictions above stand on their own; the team's *real* measured numbers live in their docs
+(bf16-TP8 **85.7 tok/s** greedy, floor-bound **F≈0.86**), and those are consistent with the floor-is-the-game
+thesis. Real-box validation (E0/E-attr/E1 in `docs/gpu-agent-experiments.md`) is still pending; full retraction
+in that file's Results Log.
 
 ### Earlier dev-box A/B (`results/ab_*.json`)
 

@@ -38,6 +38,13 @@ direct K5 territory (vLLM `fused_moe` ~0.16 vs the tuned 0.46).
 (eff 0.46) + tuned comms (6µs) → ~754 tok/s / 174 ms (~13×)** (`tools/latency_budget.py --spec-tau 3.5`).
 EAGLE3's accept length (~3.5) drives the bigger multiplier; that's why the team converged on it.
 
+**HEDGE — 3rd data round (`results-reaction-03.md`, Alyssa):** those used an **fp8 base + env-tunable comms**,
+both **measured false at B=1**: fp8 is ~19% *slower* than bf16 (dequant on the critical path; weight isn't the
+bottleneck), and NCCL env-tuning gives nothing. So the honest cheap stack is **bf16-TP8 + prefix-cache + spec
+→ ~325 tok/s** (85.7 × the corrected τ≈3.8); the path to ~750 is the **floor reduction** (K5 + *structural*
+in-kernel NVLS/megakernel), **not** fp8 or env flags. fp8 only earns its place inside the weight-heavy spec
+**verify** — open Q, settled by the 09:45 bf16-vs-FP8 EAGLE3 pair.
+
 ## The order that gets there (data-grounded, cheap-first)
 1. **Prefix caching** — free, ~50–100× TTFT for repeated/structured prompts. Ship now (`E-ttft`).
 2. **`E-attr`** — split the 7 ms floor; tells you whether comms (E0b) or kernels (K5) is the bigger decode win.

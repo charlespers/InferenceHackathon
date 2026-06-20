@@ -285,3 +285,63 @@ are consistent across runs.
   the deployed copy, after that bit twice.
 - `decode_step_tp8.cu`'s 5 `#include`d kernel files (`k1_attn_prologue.cu` through
   `k5_experts.cu`) were never copied to the box alongside it — fixed.
+
+### Round 2 — NVLS comms check + widened overlap window (post stale-TP-is-dead pivot)
+
+Context: the team killed stale/predicted-TP (measured NO-GO, router goes to gibberish
+on substituted activations) and pivoted to **exact deferred-overlap** — losslessly
+hide the AR behind the next op's independent HBM weight read (`research/exact_deferred_overlap.md`).
+This round tests two things feeding that pivot: (1) does NCCL's NVLS algorithm actually
+deliver a faster collective on this box, (2) does widening the hidden-behind compute
+window close more of the overlap gap.
+
+- **`bench/measure_collective.sh` — NCCL's NVLS algorithm shows NO improvement.**
+  All algorithms (default/RING/TREE/**NVLS**/NVLS+LL/CollnetDirect) land in the same
+  **~30-36µs** band at B=1 payload sizes (4-16KB); NVLS specifically measured
+  30.7-32.0µs across two runs, statistically indistinguishable from Ring/Tree. Per the
+  team's own decision framework (`docs/1000-experiments.md`), this points at *"a CUSTOM
+  multimem AR kernel is REQUIRED — NCCL can't get there at 8KB"* — i.e. `nvls_allreduce.cu`'s
+  raw-multicast approach, not `NCCL_ALGO=NVLS`, is the only path to a real C≤4µs.
+  **Open discrepancy, not yet reconciled**: this is ~2x our earlier `nccl-tests`
+  measurement today (~16-17µs), which used `-np 8 -g 1` (8 processes) vs this script's
+  `-g 8` (1 process, 8 GPUs) — methodology-dependent, needs a matched re-run before
+  trusting either number as final.
+- **`nvls_allreduce.cu` — confirmed NOT blocked by the NVSHMEM/CUDA-13 toolchain**
+  (it's raw CUDA driver multicast + `multimem` PTX, no NVSHMEM dependency). Builds
+  clean on the box's cu12.6 `nvcc`. Still a skeleton — `mc_setup()` stubs out
+  (`return -1`) and is single-process only; the real multi-process IPC wiring is
+  unwritten. Charles/LOOP-C has since extended this file's header (merged from `main`)
+  with the deferred-overlap integration plan; `k6_overlap_decode.cu` (new on `main`)
+  is the structural skeleton that consumes it.
+- **`overlap_decode_wide.cu` (new) — widening the hidden-behind compute window
+  ~2.5x'd the overlap benefit.** Added a `DSTP8_NO_MAIN` guard to `decode_step_tp8.cu`
+  (additive, mirrors the existing `K5_NO_MAIN` convention) so this file can reuse its
+  validated `RankState`/`alloc_rank`/`tp8_k1-k3_launch` instead of re-deriving buffer
+  layouts. Same double-buffered event-gated overlap scaffold as `overlap_decode.cu`,
+  but hides AR(L) behind the full K1+K2+K3 attention prologue of L+1, not a single GEMV.
+  - Clean run: SERIAL 19.689 ms/token (50.8 tok/s) → OVERLAPPED 12.902 ms/token
+    (77.5 tok/s) — **34.5% improvement**, vs. the original single-GEMV version's 13.8%.
+  - `nsys` profile of the original `overlap_decode.cu` confirms *why* the single-GEMV
+    version capped out so low: `ncclDevKernel_AllReduce` is **85.2%** of total GPU
+    kernel time; the GEMV (`ov_qkv_gemv`) + its chunking helper are only ~14.8%
+    combined — there's structurally too little compute to hide much of the AR behind
+    with just one GEMV. This directly explains the 13.8% → 34.5% jump from widening.
+  - **Caveat on what this number means**: like `decode_step_tp8.cu`'s own convention,
+    this is a *latency proxy* — every layer's K1 reads the same fixed/reused activation
+    buffer rather than the true just-AR'd residual, so it measures "can the hardware run
+    AR(L) and compute(L+1) concurrently" (yes), not "is it safe to do so in a real
+    serial decode where K1(L+1) needs AR(L)'s actual value." The team's
+    `exact_deferred_overlap.md` is more precise: only the next op's **weight read**
+    (HBM fetch) is truly independent of the AR's result; the **multiply** still needs
+    the reduced activation. `k6_overlap_decode.cu` (new on `main`, LOOP-C) implements
+    that distinction correctly via `grid.sync()` gating; our file does not, and
+    shouldn't be read as proof that the full-compute-overlap is correctness-safe.
+  - **A re-run got contaminated mid-flight** by a concurrent teammate job loading
+    (245-580GB GPU mem mid-run) — SERIAL came back at 171.9ms/token (5.8 tok/s, 8.7x
+    worse than the clean run) while OVERLAPPED stayed ~steady (73.7 tok/s). Discard
+    that run's "92.1% improvement" figure entirely; trust the clean run's 34.5%.
+- **Not directly comparable to `decode_step_tp8.cu`'s full-step number (~39.3 tok/s)
+  or the real 85.7 tok/s baseline**: `overlap_decode_wide.cu` only covers K1-K3 + one
+  all-reduce, excluding the router (K4), experts (K5), and the second all-reduce
+  entirely — which the roofline says dominate per-token cost. A true comparable
+  number needs the full-layer version, which is what `k6_overlap_decode.cu` is for.

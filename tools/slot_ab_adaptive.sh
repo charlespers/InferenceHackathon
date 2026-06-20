@@ -53,14 +53,25 @@ run_mode () {  # $1=label  $2=ENABLE
   kill $vpid 2>/dev/null; sleep 20  # release HBM before next launch
 }
 
-if [ "$freemb" -gt 65000 ]; then
+SCHED=/alloc/data/danielAgentScheduling.md
+# stale-lock cleanup (>20 min) then atomic acquire (coordinate with LOOP-B / kv-fp8)
+if [ -d /alloc/data/gpu.lock ] && [ -n "$(find /alloc/data/gpu.lock -mmin +20 2>/dev/null)" ]; then
+  rmdir /alloc/data/gpu.lock 2>/dev/null; fi
+if [ "$freemb" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
+  echo "LOOP-A $(date -u)" > /alloc/data/gpu.lock/holder
+  echo "- $(date -u) LOOP-A: acquired gpu.lock -> adaptive-topk A/B" >> "$SCHED" 2>/dev/null
+  echo "=== expert-chain microbench (kernel-level: does time scale with k?) ===" >> "$LOG"
+  python3 tools/moe_kernel_microbench.py --out /alloc/data/moe_kernel_microbench.json >> "$LOG" 2>&1
+  [ -f /alloc/data/moe_kernel_microbench.json ] && RESULTS+=(/alloc/data/moe_kernel_microbench.json)
   run_mode baseline 0
   echo "pip install -e adaptive_topk plugin ..." >> "$LOG"
   pip install -e experiments/adaptive_topk -q >> "$LOG" 2>&1
   [ $((10#$(date +%M))) -lt 56 ] && run_mode adaptive 1 \
     || echo "skip adaptive (out of slot time)" >> "$LOG"
+  rmdir /alloc/data/gpu.lock 2>/dev/null
+  echo "- $(date -u) LOOP-A: released gpu.lock (results in /alloc/data/ab_*.json)" >> "$SCHED" 2>/dev/null
 else
-  echo "GPUs busy (${freemb}MB free) -> cannot launch our vLLM; skipping A/B" >> "$LOG"
+  echo "GPUs busy (${freemb}MB free) or gpu.lock held by LOOP-B -> skipping A/B" >> "$LOG"
 fi
 
 # Quality gate: does adaptive (k=4) match baseline (k=8) greedy output?

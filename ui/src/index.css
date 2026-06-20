@@ -2,109 +2,83 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Conifer studio — light "paper" surface, TUI register. Ported design tokens. */
+/* Right-rail stats stay monospace; chat text uses system sans */
+* {
+  font-family: ui-monospace, "Cascadia Code", "SF Mono", Menlo, "Consolas", monospace;
+}
+.font-chat {
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+               "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+html { color-scheme: dark; }
+html.light { color-scheme: light; }
+
+/* Bar colors — CSS vars so they win over any Tailwind specificity */
 :root {
-  --studio-ground-hi: oklch(0.955 0.004 100);
-  --studio-ground-lo: oklch(0.84 0.006 96);
-  --studio-canvas: oklch(0.892 0.005 110);
-  --studio-paper: oklch(0.868 0.006 110);
-  --studio-sunk: oklch(0.906 0.004 110);
-  --studio-card: oklch(0.928 0.004 110);
-  --studio-card-hover: oklch(0.952 0.003 110);
-
-  --studio-ink: oklch(0.238 0.012 80);
-  --studio-ink-soft: oklch(0.388 0.016 80);
-  --studio-ink-mute: oklch(0.43 0.02 82);
-  --studio-ink-faint: oklch(0.55 0.022 84);
-
-  --studio-rule: oklch(0.782 0.006 110);
-  --studio-rule-strong: oklch(0.62 0.01 110);
-
-  /* Conifer brand evergreen — the hero engine + positive metrics. */
-  --conifer: oklch(0.46 0.085 152);
-  --conifer-soft: oklch(0.54 0.07 152);
-  /* vLLM baseline reads as quiet steel — the reference, not the villain. */
-  --baseline: oklch(0.5 0.035 245);
-  --studio-cyan: oklch(0.52 0.09 240);
-  --studio-warn: oklch(0.53 0.11 78);
-  --studio-fail: oklch(0.52 0.17 28);
-
-  --studio-shadow: 0 1px 2px oklch(0.3 0.02 150 / 0.04),
-    0 10px 30px -20px oklch(0.3 0.04 150 / 0.24);
-  --studio-shadow-lg: 0 2px 8px oklch(0.3 0.02 150 / 0.05),
-    0 30px 70px -32px oklch(0.3 0.05 150 / 0.32);
-  --studio-stripe-w: 2px;
+  --bar-track: #2a2a2a;
+  --bar-fill: #525252;
+  --bar-fill-accent: #10b981;
+}
+html.light {
+  --bar-track: #b8c4d0;
+  --bar-fill: #96a8b8;
+  --bar-fill-accent: #8498aa;
 }
 
-html,
-body,
-#root {
-  height: 100%;
+/* Prevent browser from adding a white default to textareas */
+textarea { background-color: transparent; }
+
+/* Guarantee text is visible in light mode regardless of Tailwind cascade */
+html.light textarea,
+html.light input[type="text"],
+html.light input[type="number"],
+html.light input:not([type]) {
+  color: #1c1a17;
 }
 
+/* Chat message text in light mode */
+html.light .font-chat {
+  color: #1c1a17;
+}
+
+/* All opacity-based black borders are invisible on cream — boost them */
+html.light [class*="border-black"] {
+  border-color: rgba(0, 0, 0, 0.20);
+}
+html.light [class*="border-neutral-3"] {
+  border-color: rgba(0, 0, 0, 0.18);
+}
+
+/* ── Dark mode ────────────────────────────────────────────────────────────
+   Cool-blue sweep from the top fading into near-black — mirrors the light
+   mode's warm sweep but inverted in tone.
+──────────────────────────────────────────────────────────────────────────── */
 body {
-  color: var(--studio-ink);
-  background-color: var(--studio-canvas);
-  /* Studio ground: a single soft radial, light pooled from below. No glow, no grid. */
-  background-image: radial-gradient(
-    140% 96% at 50% 118%,
-    var(--studio-ground-hi) 0%,
-    var(--studio-canvas) 46%,
-    var(--studio-ground-lo) 100%
+  @apply antialiased;
+  color: #c8c8c6;
+  background-color: #0d0d0b;
+  background-image: linear-gradient(
+    to bottom,
+    #111c2e 0%,
+    #0e1320 22%,
+    #0d0e0f 50%,
+    #0d0d0b 100%
   );
-  background-attachment: fixed;
-  font-family: "Inter Tight", ui-sans-serif, system-ui, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  font-feature-settings: "tnum" 1, "ss01" 1;
+  min-height: 100vh;
 }
 
-@layer components {
-  /* Square, hairline-framed paper card — the studio surface. */
-  .panel {
-    background: var(--studio-card);
-    border: 1px solid var(--studio-rule);
-    box-shadow: var(--studio-shadow);
-  }
-  .hair {
-    border-color: var(--studio-rule);
-  }
-  /* Mono micro-label, the studio's chrome voice. */
-  .micro {
-    font-family: "JetBrains Mono", ui-monospace, monospace;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
-    color: var(--studio-ink-mute);
-    font-weight: 500;
-  }
-  .metric-num {
-    font-family: "JetBrains Mono", ui-monospace, monospace;
-    font-variant-numeric: tabular-nums;
-  }
-}
-
-@layer utilities {
-  .text-balance {
-    text-wrap: balance;
-  }
-  /* Left-edge accent stripe used for callouts / the leading lane. */
-  .stripe {
-    border-inline-start-width: var(--studio-stripe-w);
-    border-inline-start-style: solid;
-  }
-}
-
-/* Quiet, square scrollbars. */
-*::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-*::-webkit-scrollbar-thumb {
-  background: var(--studio-rule);
-}
-*::-webkit-scrollbar-thumb:hover {
-  background: var(--studio-rule-strong);
-}
-*::-webkit-scrollbar-track {
-  background: transparent;
+/* ── Light mode ───────────────────────────────────────────────────────────
+   Full-page sweep: warm peach/amber at the top fading to cream.
+──────────────────────────────────────────────────────────────────────────── */
+html.light body {
+  color: #1c1a17;
+  background-color: #eaf0f8;
+  background-image: linear-gradient(
+    to bottom,
+    #b8cfe4 0%,
+    #ccdaea 28%,
+    #dae5f2 55%,
+    #eaf0f8 100%
+  );
 }

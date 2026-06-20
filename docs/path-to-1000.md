@@ -1,5 +1,43 @@
 # The path to 1000 tok/s (B=1, Qwen3-235B-A22B, 8×H100) — from first principles
 
+> ## ⬛ MEASURED STATUS — charles-work, live (supersedes the theory below where they conflict)
+> We now have a **WORKING end-to-end custom engine** (`kernels/decode_step_tp8.cu`, full K1–K6 TP8, single-
+> process 8-rank, correctness gate PASS). Real measured numbers on the 8×H100 box:
+>
+> | milestone | measured | how |
+> |---|---|---|
+> | first runnable end-to-end token | **39.5 tok/s** | engine had NEVER produced a token before (decode_step.cu crashed); now builds+runs+validates |
+> | profile-driven kernel fixes | **74.5 tok/s** (matches vLLM 69.5) | **K4 router was the real #1 bottleneck** — 128-expert gate GEMV on a SINGLE CTA (1/132 SMs, 59% of kernel time) → split-K = 4.5×; K5 sharded starved 15%→34% MBU; K2 reduce 2-CTA-serial → 1-CTA/head = 2.8× |
+> | NVLS comms (single-barrier out-of-place) | **9.35µs/AR**, comms 3.35ms→1.77ms | replaces NCCL ~17µs; per-AR barrier is the floor |
+> | cuBLASLt fp8 GEMM core + glue/router/K2 fusion | **→ 112.6 tok/s** (1.6× over vLLM) | GEMM panels flat in k (1.001); router 1-CTA→warp-parallel; cross-layer norm/residual fusion |
+> | **spec'd e2e, MEASURED honestly** | **107 (n-gram τ1.6) / 294 (EAGLE3 τ)** | NOT 840-1000 — see the K2 correction below |
+>
+> **Corrected architecture (measured, not theorized):** the binding constraint is NOT comms (1.77ms, 18%) and
+> NOT launch overhead (graph collapse saved <0.5ms). It is that **the forward is occupancy-starved at B=1 TP8**
+> — the per-GPU shards are too small to fill 132 SMs (GEMM ~29% MBU, sharded down ~21%). The forward (~9ms) =
+> GEMM panels ~2.56ms (the irreducible BW floor, =391 tok/s) + a **serial latency floor** (K2 ~1.9ms + glue
+> ~2.5ms + comms ~1.8ms) that is FUSABLE but not freely overlappable at B=1 (serial K1→K2→K3→AR→K4→K5→AR chain).
+>
+> **THE KEY CORRECTION (spec_e2e_real.txt):** the GEMM *panels* are flat in k, but the **FULL forward SCALES**
+> — T(8)/T(1)=1.5, T(16)/T(1)=2.3 — because **K2 multi-query attention does NOT amortize at B=1** (per-query
+> dot+softmax serializes on the occupancy-starved GPU). So "spec rides free on a flat forward" is FALSE today.
+> **The fix (written, `kernels/k2_batched_decode.cu`): make K2 flat by parallelizing over (head, query, split)**
+> — spend the k queries on MORE WARPS (fills the idle SMs) not serial per-warp work; shared KV hits L2. If
+> us(M=8)≈us(M=1), K2 goes flat and the spec free-ride is restored.
+>
+> **Three theory claims the data KILLED (with measured proof):**
+> 1. **in-kernel NVSHMEM AR** — dead (52µs, barrier-bound). NVLS multimem is the live path (9.35µs single-barrier).
+> 2. **int4 experts** — dead at B=1 TP8: the sharded down is occupancy-bound (21% MBU, 26 idle lanes), so halving
+>    bytes does nothing (int4 measured 0.65×, SLOWER). Byte reduction only pays when bandwidth-bound; we aren't.
+> 3. **the megakernel** — dead: cooperative grid.sync caps the grid at 528 blocks → one fixed geometry across
+>    every thin stage → 9-11× SLOWER (occupancy starvation). Fusion ≠ a monolithic kernel; the in-kernel AR was
+>    correct+cheap, but the grid-resident constraint loses the per-kernel occupancy tuning.
+>
+> **Honest path to 1000 (zero-slack, all three required):** (1) **flat-K2** (k2_batched_decode.cu) so the verify
+> forward stops scaling in k; (2) push cuBLASLt fp8 MBU > 0.45 to drop the GEMM floor below 2.56ms; (3) a trained
+> **EAGLE3 head** (n-gram τ≈1.6 is too low; need τ≈2.8). Forward → ~2.1ms (480 tok/s) × τ2.8 → ~940-1476. Both
+> structural shortcuts (int4, megakernel) are ruled out, so it's pure fusion + MBU climb + spec — tight but open.
+
 **The target is 1000 tok/s = 1.0 ms/token.** We are at 85.7 (11.67 ms). That's ~12×. This derives, from
 physics, exactly what is *required* — and shows that most of what the team has been measuring (fp8 alone,
 env-comms, spec alone) **cannot get there**; a specific, narrow combination can.

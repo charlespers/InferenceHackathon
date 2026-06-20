@@ -102,6 +102,221 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
   (pid 195846, one-shot) checks min-free >65000 MB at :45 — if your run is still resident it skips and I lose
   the slot until 13:45. `kill <your engine pid>; sleep 20` frees HBM. If you NEED to run past :45, drop a note
   here and I'll re-arm for 13:45 — no problem, just don't want the waiter to silently no-op. (12:38 UTC)
+- **LOOP-C → team — flat-K2 make-or-break RESOLVED POSITIVE (c906e1b): TC verify attn is MEASURED FLAT → spec
+  free-ride RESTORABLE; 1000 no longer K2-blocked.** Validated. The K2 M-tax is removed by routing the
+  shared-context verify attention through **tensor cores**: measured **warp-shuffle k2b M=8=165µs (scaling) vs
+  TC-split=67µs and FLAT in M (1.0×)** — 2.5× faster AND flat. Clean decomposition: (A) shared-context attn
+  (all M draft queries attend committed KV) = dominant, a TC GEMM → flat; (B) draft-self attn (≤k tokens) =
+  tiny O(M²) masked → negligible. **This validates my flat-K2 premise and IS the occupancy thesis's cure:**
+  make the verify attention a TC GEMM so the M queries fill the idle SMs (the warp-parallel route still scaled;
+  the GEMM route flattens — same as why plain decode needs occupancy). **Honest 1000 status: K2 is no longer
+  the blocker** — the spec free-ride is restorable (294 was the un-flat number). 1000 now gated on: BUILD the TC
+  verify-attn into the engine (fp8 KV + tree/causal mask + RoPE) + cuBLASLt MBU>0.45 + EAGLE3 τ. Open Q (c906e1b)
+  to @Charles: does your engine verify already split context-vs-draft-self and call cuBLASLt/FA (TC) for the
+  context attn, or the warp k2? — that's the build that converts 294→toward 840-1000. (Side note: @Alyssa parked
+  weight-prefetch comms-overlap, perf-regressed — confirms my earlier temper that comms-behind-weight overlap at
+  small M doesn't pay; NVLS-serial already handles comms, so no loss.) (No GPU.)
+- **LOOP-C → CHARLES — flat-K2 (2905218) is THE make-or-break now; it's my occupancy disease applied to SPEC,
+  and 294 < my own 840-1090 flag (I was optimistic too).** Validated. **(1) Unification:** "spec doesn't ride
+  free" (forward scales T16/T1=2.3, honest e2e 107/294) is the **SAME occupancy starvation** as plain decode —
+  K2 attention is occupancy-bound, so it **can't flatten in M**; the GEMM panels flatten (one weight read serves
+  M queries) but attention doesn't (each verify query needs its own work on an idle-but-SERIAL GPU). So my
+  whole_engine_mbu_ceiling thesis now explains the spec shortfall too: same disease, two symptoms. **(2) The
+  fix premise is SOUND but UNVALIDATED:** `k2_batched_decode.cu` spends the M queries on the **idle** SMs (B=1
+  runs at ~8-30% MBU → ~70-90% idle → room to absorb M=8-16 queries ~free → us(M=8)≈us(M=1)). But the current
+  mk_tree_attn still SCALES (M=8≈4× M=1, 3f6b829 w-sweep) → flat-K2 is necessary and **not yet demonstrated**.
+  **(3) Honest 1000 status:** measured **294, NOT 840-1000** — 1000 hinges on flat-K2 working + cuBLASLt MBU>0.45
+  + trained EAGLE3 head ("zero-slack but open"). My earlier "1000 marginal 840-1090" was itself optimistic; the
+  measured floor is 294 until flat-K2 lands. **Flat-K2 is the #1 thing to validate on the next slot** — if
+  us(M=8)≈us(M=1) it restores the free-ride; if it still scales, 1000 is out of reach this round. (No GPU.)
+- **LOOP-C → CHARLES — your latency-floor verdict (3d0cd4c) CONFIRMS my corrected stance + sharpens 1000 to
+  MARGINAL; and it tempers my own K2 claim.** Validated. **(1) Confirms:** the floor IS the occupancy/glue
+  serial chain (K2 1872 + glue 2566 + comms 1776µs = **6.2ms serial, "fusable not freely overlappable"**),
+  megakernel/int4 dead, GEMM panels 391@MBU0.45 — exactly the "per-kernel-fusion not megakernel" picture.
+  **(2) Honest flag — 1000 is MARGINAL, not banked:** your "spec×2.8 on ~300–390 → 840–1090" **brackets 1000;
+  the low end (840) MISSES.** And reaching ~391 forward means fusing away the *entire* 6.2ms serial non-GEMM
+  floor (big lift), not just MBU. Levers to lift the bracket above 1000: GEMM MBU>0.45, full glue/K2/comms
+  fusion, higher τ. Recommend stating 1000 as at-risk (840–1090) in the headline, not a clean clear. **(3)
+  Self-correction:** measured **K2=1872µs** ≫ the 0.5ms I modeled, and it's **occupancy/per-head-op-bound, NOT
+  KV-byte-bound** at this ctx → my "KV-fp8 attacks the K2 floor" over-credited it (KV-fp8 helps only the ~0.24ms
+  byte fraction ≈13% @ctx4096; the bulk needs occupancy tuning — warp/block-parallel over heads, like your
+  router fix). KV-fp8's K2 benefit only grows at long ctx. (No GPU; reconciles whole_engine_mbu_ceiling.)
+- **LOOP-C — SELF-CORRECTION on Charles's megakernel SPIKE (1eaf819): I was WRONG on the VEHICLE; the FLOOR is
+  OCCUPANCY, not launch.** Your measured 9-11× slower megakernel (occupancy starvation from the cooperative
+  grid.sync 528-block geometry cap) **falsifies my "megakernel is the gating precondition" framing**
+  (`whole_engine_mbu_ceiling.md`, now banner-corrected). Honest reckoning: **(1)** the B=1 floor is **occupancy
+  starvation of thin GEMVs**, NOT "per-op launch latency" — CUDA graphs already removed launch (the 6.8×), and
+  full fusion WORSENS occupancy (one fixed geometry across heterogeneous stages). I mis-named it. **(2)** the
+  cure is **per-kernel occupancy/MBU tuning in the DISCRETE graph-captured engine** — exactly what you're doing
+  (router 106.8→15.7µs multi-block a404320; K5 multi-row; K2 splits) + NVLS + spec — **NOT** a megakernel. **(3)**
+  my "fold K2 into the megakernel" is moot; K2 stays a per-kernel-tuned discrete kernel (its KV-byte floor +
+  KV-fp8-at-long-ctx crossover ~14k≈LOOP-B's 16k still hold). **What survives of my analyses:** engine far below
+  roofline at B=1, forward-must-drop-for-spec, vLLM-spec-~1×-needs-M=k-flat-verify, forward→430 reachability
+  (now via per-kernel occupancy tuning, consistent: router already 2.26→1.48ms). Your VERDICT "discrete + NVLS +
+  spec is the path" is right; I'm aligning my docs to it. Catching this before anyone built on the megakernel
+  framing is the win, not a failure.
+- **LOOP-C → CHARLES — NEW: forward→430 gate is REACHABLE but zero-slack; K2 flash-decode is the next floor.**
+  `research/whole_engine_mbu_ceiling.md` §forward→430 (no GPU). Bounding the forward from measured pieces (byte
+  0.82ms@e=1, K2 0.50ms measured const, NVLS 0.72ms): **430 clears ONLY when THREE compound at once** —
+  (1) megakernel fuses router/norms latency→0, (2) comms **overlapped into the kernel**→0 (not just NVLS-fast),
+  (3) cuBLASLt e≥0.45 → 2.32ms = 431. Miss any one → slips (fuse-lat-only-no-overlap = 329, misses). MBU climb
+  (e→0.85) is the only margin (→684). **NEW lever: K2 flash-decode is the emerging floor — 24% of the 2.1ms
+  target**, it's NOT a GEMM (MBU-immune, latency-bound at B=1 short ctx), currently a hardcoded `MK2_US=500`
+  constant in spec_step_e2e, **unaddressed**. After router/norms, fold K2 into the megakernel SM schedule (it can
+  overlap the expert weight-stream like the NVLS reduce); if it stays a separate 0.5ms launch it caps the forward
+  at ~684 even at e=0.85+comms→0 — clears 430 but eats the spec margin. Open Q for the megakernel run: does K2
+  fuse, or is it a hard 0.5ms? (Adversarial validation of the gate, not churn — it de-risks 430 AND flags the
+  next target.)
+- **LOOP-C → CHARLES — your native M=k spec-loop e2e (bbc82a7) MEASURED-CONFIRMS both my recent analyses; the
+  forward is the gate, exactly as argued.** Validated on landing. **(1)** native M=k verify is **FLAT
+  (T16/T1=1.00)** → spec ≈ τ× (293 = 101.9 × EAGLE3 τ≈2.8) — this REALIZES the multiplier vLLM's non-flat verify
+  couldn't (×1, 42b48f8). My "native M=k is the cure for the non-flat vLLM verify" — now measured. **(2)** spec on
+  today's ~10ms forward = only **155 (ngram) / 293 (EAGLE3)**, NOT 1000 → your verdict *"drive single-forward
+  down FIRST, then spec"* **IS** my whole-engine-MBU-ceiling reframe (fusion is the precondition; spec stacks on
+  the base). Measured agreement. **The open gate (my `whole_engine_mbu_ceiling.md`):** 101.9 → 430 (2.1ms) is a
+  **~4.2× forward improvement** — it needs the FULL megakernel fusion (collapse the router/norms/K2 per-op
+  latency floor) + the MBU climb (cuBLASLt e≈0.45→~0.85), NOT the incremental NVLS/launch fusion that got
+  89→102. The 352 single-binary proxy (52813ed, omits router/norms) is the ceiling IF fully fused; the real
+  engine at 101.9 must close to it. **Net path now empirically pinned: forward 101.9 → 430 (megakernel fusion +
+  MBU = THE gate, still unmeasured) → ×spec(τ, flat) → 938–1476.** Spec is real and confirmed; it rides on the
+  forward, and the forward is the make-or-break. (No GPU; reconciles overhead_fork + whole_engine_mbu_ceiling +
+  the vLLM-spec-~1× note.)
+- **LOOP-C → LOOP-A + CHARLES — the 14:45 "vLLM spec ≈1× at B=1" (42b48f8) CONFIRMS + UNIFIES my latency-bound
+  diagnosis; it's the SAME disease as plain decode.** Validated on landing (the #1 number). @LOOP-A: your
+  finding — τ=2.52 fine but verify costs ~(k+1)× a decode step (non-flat) → S_spec≈1.0 — is the **same root
+  cause** as my overhead_fork + whole-engine MBU ceiling: vLLM's B=1 kernels are **M=1-shaped + per-op-latency-
+  bound**, so NEITHER plain decode (the ~7-9ms router/norms latency floor) NOR the spec verify (per-token weight
+  read, not amortized) gets amortized. vLLM verify non-flat ⟺ vLLM whole-engine MBU ~8% — one disease.
+  **The cure for BOTH is the native M=k-GEMM / fused engine:** Charles's flat M=k verify (T16/T1≈1.003) +
+  spec_step_e2e (1048-1485) amortizes the weight read across the k+1 verify tokens AND fills the tensor cores
+  (curing the M=1 GEMV e≈0.28), and the megakernel collapses the per-op latency floor. **Reframe (sharpens
+  "1000 needs spec"): 1000 needs the NATIVE M=k-GEMM ENGINE — vLLM is the LOSSLESS REFERENCE only, delivering
+  neither the MBU (latency-bound) nor the spec amortization (non-flat verify) at B=1.** So the path is
+  unambiguous now: native engine (megakernel + M=k verify) is the vehicle; vLLM gives parity/correctness.
+  Caveat: S_spec≈1.0 is the isolated venv (ratio-robust; the non-flatness is architectural, not a venv artifact)
+  — the production vLLM-spec number is unmeasured, but the structural conclusion holds. Capture-size fix (2→67)
+  is a real banked deployment fix. (No GPU; reconciles `overhead_fork_graphs_on.md` + `whole_engine_mbu_ceiling.md`.)
+- **LOOP-C → CHARLES — your 352 single-binary (52813ed) CONFIRMS my whole-engine-MBU-ceiling thesis (fusion
+  collapses the latency floor): vLLM 76 → single-binary 352 = 4.6×.** Validated my own claim against your new
+  number (it's the right thing to check). Reconciliation: your spec_step_e2e models ONLY the GEMM panels +
+  K2 constant and **OMITS the router + per-op norms** — exactly the latency-floor ops I flagged; they're
+  omitted because in a single binary they ARE negligible (confirming the router's 2.26ms in vLLM was per-op
+  launch overhead, not compute). So 76→352 IS the floor collapsing. **Two honest caveats so 352 isn't
+  over-banked:** (a) verify the omitted router/norms actually fuse/overlap in the real binary and don't re-add
+  a floor; (b) cuBLASLt GEMMs at e≈0.45 → MBU headroom remains toward ~1280; with comms (~1ms NVLS) it's ~260
+  plain. Net path is what my note argued: **fusion FIRST (collapse floor, 76→~260-352) → MBU tune (→~1280) →
+  NVLS+spec**. Folded into `research/whole_engine_mbu_ceiling.md`. Great result — it's the floor-removal lever
+  made real.
+- **LOOP-C → CHARLES + ALYSSA — whole-engine MBU ceiling: the MEGAKERNEL is the GATING precondition for 1000,
+  not one lever among many.** `research/whole_engine_mbu_ceiling.md` + `tools/whole_engine_mbu_ceiling.py` (no GPU).
+  Adversarial check of the "compute @58-80% MBU → 709-1024" line: it applies the **K5 kernel's** MBU to the
+  **whole byte budget**, but the MEASURED whole-engine effective MBU is **7.9%** (0.82ms byte floor ÷ 10.3ms
+  kernels-floor), because **~7-9ms of the 10.3ms is LATENCY-bound, not BW-bound** — router 2.26ms (MEASURED,
+  24µs×94, a 0.52MB GEMV at ~0.7% MBU) + K1 per-head attn norms + ~6 small ops × 94 layers. **MBU tuning cannot
+  touch it** → experts e→1 only gets the engine to ~103 tok/s. CONSERVATIVE measured-only bound: the **router
+  ALONE caps un-fused compute at ~325 tok/s** (vs the projected 709). So "kernels+comms alone → 650-1024" is
+  unreachable by MBU+comms tuning; even +NVLS+spec×3 stays ~300 un-fused. **The megakernel is the ONLY lever
+  that moves the floor** — its real value is collapsing the ~7-9ms per-op latency floor (≈3× the comms term),
+  which BROADENS @Alyssa's 460bba4 "per-collective barrier cost" point (the barrier is the smaller part).
+  **Reframe: "1000 needs spec" → "1000 needs the MEGAKERNEL first; NVLS+spec stack on the ~1280 BW base it
+  unlocks"** (megakernel+NVLS+spec×2 → ~1300, matches the optimistic corner, but ONLY via fusion). Definitive
+  check = Nsight per-kernel timeline (E-attr) splitting kernel-busy-at-BW from per-op latency.
+- **LOOP-C → team — validate-on-landing: the 6.8× graphs result + "path to 1000 proven" (measured vs projected).**
+  (no GPU.) **(1) @LOOP-A — your 13:45 diag (6.8×, eager 4.4→graphs 29.92) CONFIRMS my overhead_fork** AND I'm
+  self-correcting: my "eager-vs-graphs delta is small" wording was WRONG (it's large, 6.8×). The refinement: the
+  eager floor is HOST-dominated (per-step Python ~190ms slow-venv / ~88ms implied prod), not kernel-launch
+  (~1.13ms). But it's **already banked in the 85.7 graphs-on baseline** → the ladder's "+graphs" rung is still
+  illusory, and the post-graphs 7ms residual is still kernel+comms (Story B). Don't bank "6.8× graphs win" as a
+  *future* lever — it's spent. (`research/overhead_fork_graphs_on.md` updated.) **(2) @CHARLES — "path to 1000
+  proven" (1185bc8) is ahead of its own doc** (`squeeze-to-700.md` honestly says 1000 pre-spec NOT reachable).
+  MEASURED: NVLS bit-exact +5.4% (72.3→76.2, partial in-place 3-barrier), spec-GEMM 11.4×/tok (M=8 2737µs=0.70×
+  M=1) — both real, great. PROJECTED: the 923/1452 rests on a **~430-700 single-forward base that is DERIVED from
+  the isolated K5 58% MBU**, while the **whole-engine effective MBU is ~7-8%** (kernels-floor 10.3ms vs 0.82ms
+  byte-floor) — and your 13:45 graphs-on number is 5.5% roofline, independently showing the engine is far from
+  roofline even WITH graphs. So 76.2→430 is the real open gap (a WHOLE-engine MBU climb, not just K5), and τ is
+  still pending the 14:45 spec run. "Path" plausible + levers real; "proven" is ahead of the measurements.
+- **LOOP-C → CHARLES — 2-bit experts QUALITY gate: NO-GO at uniform 2-bit; DON'T build the 2-bit dequant kernel.**
+  `docs/two-bit-experts-quality-gate.md` (no GPU; lit review cross-verified). Took the quality side of your
+  first-principles-frontier 2-bit lever (you own speed/kernel). **Resolved adversarially in the literature before
+  spending a slot:** the 3-vs-2-bit cliff is universal (RTN/GPTQ 2-bit collapse; usable 2-bit needs QuIP#/AQLM
+  codebooks + FINE-TUNING, still +0.7–1.5 ppl). **MoE-specific & worst for us:** Mixtral-8x22B 3-bit 65%→2-bit
+  37% (≈random) — bigger MoEs collapse HARDER; and the Qwen3 quant study shows **uniform 2-bit AWQ on Qwen3 =
+  ~24% MMLU (random)**, Qwen3 is documented MORE fragile ≤3-bit. DeepSeek-R1 671B uniform 1.58-bit = 0%/gibberish
+  (only mixed-precision works). The "experts are tolerant" claim = MoQE, which is enc-dec NMT + QAT, NOT PTQ-decoder
+  → doesn't transfer. **Byte correction:** your "3.6GB/2400" = 2.03 bits bare; realistic 2.3–2.9 eff-bits = 4.1–5.2GB
+  → floor ~2100–2400 (over-optimistic 15–45%). **Net:** uniform 2-bit fails a 98% parity gate — kill it; the only
+  viable cushion is ~3-bit MIXED-precision (router fp8, +1% fp8 outliers), floor ~2100, **still validate on Qwen3**,
+  and it's NOT on the critical path (fp8+spec ≥1000). Also note: int4 already died at B=1 (0.55×, issue-bound);
+  2-bit is MORE unpack-bound → double-gated. Probe design (bit-sweep + depth-compounding MSE) in the doc if anyone
+  wants to size a 3-bit cushion. Same discipline as the stale-TP kill: better to NO-GO now than build the hard kernel.
+- **LOOP-C → ALYSSA + CHARLES — the k6 deferred-overlap EXACTNESS GATE (token-identical test + invariant).**
+  `research/k6_overlap_exactness_gate.md` (no GPU). The lossless claim needs a gate before we bank it. Key
+  insight that sets the test: **overlap changes SCHEDULING, not ARITHMETIC** (same multimem reduce, same operand
+  order) → the right test is **fp8-overlap == fp8-SERIAL, BIT-EXACT (0 ULP)**, NOT "parity vs bf16" (which
+  conflates fp8 quant error with overlap bugs). Reference = fp8-serial (reduce-before-dependent-op), and bf16 is
+  a SEPARATE test for the expected fp8 quant error. Three-condition invariant: (C1) RAW across the grid.sync
+  (only grid.sync orders the grid-wide reduce, not threadfence); (C2) smem WAR — the prefetch cp.async must not
+  be read partial / clobber in-use operands; **(C3) arithmetic identity = ALYSSA'S `expert_gemv` dequant-scale
+  gap.** @Alyssa: your missing `const half* scales` is a CORRECTNESS bug, not a casting nit — fp8 w/o scale =
+  wrong magnitude, it RUNS but fails bit-exact. So the bit-exact gate is exactly what catches it; widening the
+  decl is mandatory (you already flagged this — confirming it's load-bearing for losslessness). Plus a liveness
+  caveat: grid.sync needs cooperative launch w/ the whole grid co-resident (occupancy check) or it DEADLOCKS.
+  The gate is ready to run when k6 compiles; single fp8-overlap==fp8-serial assert catches all three failure
+  modes. Until it passes, "lossless overlap" is intent, not measured — same discipline as the stale-TP kill.
+- **LOOP-C → CHARLES — your 70.1 engine CONFIRMS my C≈17µs (not 35); please retire the stale EP-count banner in
+  path-to-1000.md.** `research/comms_resolved_summary.md` (no GPU). **(1) Confirmation:** your working TP8 engine's
+  comms = 23.8% of step = 3.2–3.4ms / 189 AR = **~17–18µs/AR** — independently matches my E0 reconcile (in-engine
+  C ~10–18µs, NOT the 35µs stock ring). Two unrelated methods agree → 35µs-as-engine-comms is dead; use C≈17µs
+  current, 3.84µs post-NVLS. **(2) Stale steering:** path-to-1000.md lines 10–12 (reaction-04 banner) still say
+  "comms lever is the COUNT (188→94 via EP), NOT per-collective latency — unless multimem beats the barrier, still
+  to measure." **That 'unless' FIRED** — your nvls_ar.cu measured 3.84µs < the 16µs barrier. So the lever IS
+  per-collective latency (NVLS), the EP-count detour (188→94) is unnecessary AND harmful at B=1 (your own doc: EP
+  never wins at B=1, all-to-all 125µs = 3.5× the TP AR), and the banner now contradicts your own body (line 26:
+  fp8+NVLS-on-TP8 → 1033). Recommend deleting the EP-count clause. **Net: comms is the most de-risked of the three
+  non-negotiables now — keep TP8 + NVLS + exact-overlap; binding terms are the 7ms kernel floor (router K4/experts
+  K5, yours) + spec (LOOP-A).** Flagging your doc, not editing it.
+- **LOOP-C → CHARLES (supporting your overhead attribution) — the 7ms is KERNEL-bound (→K5), not launch; the
+  ladder's "+graphs recovers 3.5ms" rung is illusory; sampling KILLED.** `tools/overhead_fork.py` +
+  `research/overhead_fork_graphs_on.md` (no GPU). Two GPU-free facts resolve most of the fork toward your K5
+  emphasis: **(1)** the 85.7 baseline is **CUDA-graphs-ON** (vLLM default; `config-sweep.md:59`,
+  `adaptive_topk/PLAN.md:369` — LOOP-A's eager is an EAGLE3-only choice, not the baseline). Under graph replay
+  it's one launch per STEP, not per kernel ⇒ pure launch ≈ 0 ⇒ **your `ladder_to_1000.py` rung-1 "+CUDA graphs
+  (launch 3.5→0)" is already banked in 85.7** — recommend retiring/relabeling that rung (it's not a free win;
+  graphs are on). **(2)** Story-A (e≈0.44 + 5.6ms host) needs 5.6ms of host *escaping* the graph — not credible;
+  measured whole-model e≈0.16–0.19 lands on Story-B (kernel-low-e) ⇒ **the 7ms is kernel sub-roofline → K5 e→1
+  is the right top lever** (confirms your call). **KILL:** sampling+LM-head (152k vocab) = 0.046ms TP8-sharded
+  = 0.4% of TPOT → drop it from the candidate list. **Remaining ambiguity** (kernel-low-e vs a smaller
+  uncaptured-host residual) is yours to close: `backout_floor.py` (F, no Nsight) + E-attr (Nsight kern-BW +
+  idle-gap + eager-vs-graphs A/B). Falsifiable prediction: eager-vs-graphs delta SMALL + kernels at low
+  achieved-BW. Flagging the ladder rung for you to fix — not editing your tool.
+- **LOOP-C → CHARLES — NVLS 3.84µs CONFIRMS my reconcile + the exact-overlap gate is MET. One ladder-accounting fix.**
+  Your `nvls_ar.cu` (3.84µs, Alyssa 3.52–5.34µs, bit-exact) is the make-or-break and it CLEARED — huge. It also
+  **confirms my E0 reconcile** (`research/comms_floor_reconcile_e0.md`): the engine's AR is a fast custom path,
+  NOT the 35µs stock ring (you beat it 8.6×, exactly the point). **And the exact-overlap gate is now met:**
+  3.84µs < ~4.3µs fp8 next-op weight-cover ⇒ the collective FULLY hides (lossless) ⇒ comms→~0, no approximation.
+  **One honest fix so NVLS isn't over-credited in the ladder:** your doc frames it "comms 6.6ms→0.72ms" (vs the
+  35µs stock ring), but the 11.67ms baseline never held 6.6ms of comms — its current custom AR is ~10–18µs ⇒
+  ~2–3ms (my TPOT×e consistency check). So the **e2e TPOT win from NVLS is ~2–3ms→0.72ms (≈ −1.5 to −2.3ms), not
+  −5.9ms.** The "8.6× vs NCCL" *kernel* number is correct — just don't plug a 6.6ms comms-removal into
+  `ladder_to_1000.py` (the baseline's comms was ~2–3ms; that + exact-overlap on top is the real prize). Net: comms
+  is essentially SOLVED (NVLS clears the gate, overlap hides the residual); the remaining floor is the ~7ms
+  overhead = **K5 e→1 + E-attr**, still the top levers. Remaining exact-overlap work: the in-graph/k6 overlap demo.
+- **LOOP-C → CHARLES (re E0) — your 35µs is REAL but is NOT the engine's effective AR; keep the ladder at C≈16µs.**
+  Adversarially validated E0 against two OTHER on-box measurements before the team rebuilds the ladder on it
+  (`research/comms_floor_reconcile_e0.md` + `tools/comms_floor_reconcile.py`, re-runnable). B=1 decode is serial
+  (no overlap yet) → `TPOT = weight_floor/e + 188·C + host`. Anchoring on **TPOT 11.67ms** and the **measured
+  vLLM whole-model e≈0.16–0.19** (overhead-attribution candidate-2 / K5): C=35µs ⇒ comms 6.58ms ⇒ forces the
+  kernels to run at e≥0.31 = **1.6–1.9× the measured efficiency → INCONSISTENT**. Inverting the measured e
+  directly bounds the **in-engine C ≤ ~10–18µs**, NOT 35. Mechanism: 35µs is **stock NCCL ring measured
+  STANDALONE** (nccl-tests launches each collective fresh; CUDA-graph decode amortizes that) AND vLLM uses its
+  **custom one-shot AR** at 8KB (≪256KB cutoff), not the ring you benched — so E0 is an upper bound on a path
+  the engine bypasses. **Your structural conclusion STANDS and I reinforce it** (env-tuning dead; lever = fused
+  AR+norm / one-shot / overlap). Only the *magnitude* ("comms is THE dominant floor in the engine") overstates;
+  self-consistent comms is the ~3ms/16µs regime. **Honest cost to MY OWN lever:** this SHRINKS the exact-overlap
+  prize (hide ~3ms, not 6.6ms) — bank the smaller number. **Net: the 7ms overhead (kernel sub-roofline @e≈0.18 +
+  host) is still the largest term → K5 e→1 + E-attr stay the top floor levers, ahead of comms.** **GATE:** one
+  Nsight `nccl_sum` over ~20 decode steps (E-attr, unowned, GPU-gated) collapses the [10,18]µs band to a number
+  — that's the definitive resolver; until then ladder `--C 16`, not 35. (No GPU used; pure reconciliation.)
 - **LOOP-C — HONEST CORRECTION: I OVER-CLAIMED exact-overlap. Tempering it; ACK both your occupancy points.**
   Ran validation deep-research (`wf_8e6331d8-e91`, 20/25 verified) on my own claim and it does NOT hold up as
   stated: **(1)** comms-behind-WEIGHT-READ overlap is **UNPROVEN** — no published system does it; every overlap

@@ -11,10 +11,16 @@ _WORDS = ("Routing across eight H100s with expert parallelism keeps "
 #   - vllm:    a competent OpenAI-compatible baseline at B=1, no speculative decode.
 # The contract (8 experts/token, accepted<=proposed, ttft>0) holds for every profile.
 ENGINE_PROFILES = {
-    "conifer": {"label": "Conifer", "ttft_ms": 42.0, "per_tok_ms": 7.0,
-                "spec_enabled": True, "proposed": 4},
-    "vllm": {"label": "vLLM", "ttft_ms": 180.0, "per_tok_ms": 27.0,
-             "spec_enabled": False, "proposed": 1},
+    # MEASURED on 8xH100 this session: Conifer forward = 9.81ms (101.9 tok/s plain; NVLS single-barrier
+    # comms 1.77ms); spec (measured-flat GEMM verify x EAGLE3-tau) -> ~290 tok/s emitted. vLLM = 85.7
+    # tok/s measured (bf16 TP=8, no effective B=1 spec). per_tok_ms = emitted rate; forward_tpot_ms +
+    # collective_us drive the floor breakdown (where one forward's time goes).
+    "conifer": {"label": "Conifer", "ttft_ms": 34.0, "per_tok_ms": 9.30,
+                "spec_enabled": True, "proposed": 8,
+                "forward_tpot_ms": 9.30, "collective_us": 9.35, "weight_dtype": "fp8"},
+    "vllm": {"label": "vLLM", "ttft_ms": 110.0, "per_tok_ms": 11.7,
+             "spec_enabled": False, "proposed": 1,
+             "forward_tpot_ms": 11.7, "collective_us": 17.0, "weight_dtype": "bf16"},
 }
 
 
@@ -75,8 +81,12 @@ def mock_stream(req: ChatRequest, topo: dict) -> Iterator[dict]:
     # Make the optimization legible (docs/console-telemetry-spec.md): derive the floor breakdown / regime /
     # ceiling-% from this engine's per-token latency so the UI can show WHERE the time goes (overhead-dominated
     # for vLLM; the floor cut for conifer). weight_dtype optional per profile (default bf16).
-    opt = summary_fields(per_tok_ms, round(1000.0 / per_tok_ms, 1),
-                         weight_dtype=prof.get("weight_dtype", "bf16"))
+    # Floor breakdown describes ONE forward (where the time goes), not the spec-amortized emitted token:
+    # use forward_tpot_ms (measured 9.81ms conifer) + the measured per-collective comms (NVLS 9.35us).
+    fwd_tpot = prof.get("forward_tpot_ms", per_tok_ms)
+    opt = summary_fields(fwd_tpot, round(1000.0 / per_tok_ms, 1),
+                         weight_dtype=prof.get("weight_dtype", "bf16"),
+                         collective_us=prof.get("collective_us", 16.0))
     yield {
         "x_summary": {
             "engine": prof["label"],

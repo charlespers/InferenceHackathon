@@ -89,6 +89,15 @@ def main():
     print("Caveat: needs a drafter whose tokens are route-correlated with the target "
           "(self-spec or a draft trained/biased to match routes); overlap=0.45 is the "
           "token-to-token measured ceiling, achievable overlap TBD on real drafts.")
+    print("\n*** REGIME CAVEAT (read before trusting the above) ***")
+    print("This model is WEIGHT-BOUND (floor=0): verify_cost scales fully with the expert")
+    print("union. The MEASURED engine is ~86% FLOOR-bound, so the union tax falls on only the")
+    print("~14% weight term and the route-aware lift SHRINKS toward marginal — see")
+    print("charles-work tools/spec_floor_model.py (floor-aware) which reverses 'big trees lose'.")
+    print("The lever is therefore MEASUREMENT-GATED: decide on V=tau/S from the FP8 EAGLE3 slot")
+    print("(experiments/eagle3/ROUTE_AWARE_DECISION.md). V~1 => floor hides the tax => NO-GO;")
+    print("V>=1.3 & rising with tree size => GO. Do not implement route-aware shaping on this")
+    print("weight-bound model alone.")
 
 
 if __name__ == "__main__":

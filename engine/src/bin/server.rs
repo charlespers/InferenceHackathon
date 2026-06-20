@@ -188,17 +188,19 @@ impl TaskTracker {
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Clone)]
+struct GpuProc {
+    pid: u32,
+    label: String,
+    mem_mb: u64,
+}
+
+#[derive(Default, Clone)]
 struct LiveStats {
-    /// From vLLM /metrics: how many requests are currently running on the GPU.
-    vllm_requests_running: u64,
-    /// From vLLM /metrics: requests queued.
-    vllm_requests_waiting: u64,
-    /// From vLLM /metrics: KV-cache utilisation 0–100 %.
-    vllm_kv_cache_pct: f64,
-    /// true when vLLM /metrics was reachable last poll.
-    vllm_online: bool,
-    /// Per-GPU: (util_pct, mem_used_mb, mem_total_mb)
+    /// Per-GPU: (peak_util_pct, mem_used_mb, mem_total_mb).
+    /// util is a rolling peak over ~6 s to avoid 0% snapshots between token bursts.
     gpus: Vec<(u64, u64, u64)>,
+    /// Processes currently using any GPU, from nvidia-smi --query-compute-apps.
+    gpu_procs: Vec<GpuProc>,
 }
 
 struct AppState {
@@ -214,74 +216,78 @@ struct AppState {
     live: Mutex<LiveStats>,
 }
 
-/// Parse vLLM Prometheus text and extract the metrics we care about.
-fn parse_vllm_metrics(text: &str) -> (u64, u64, f64) {
-    let mut running = 0u64;
-    let mut waiting = 0u64;
-    let mut kv_pct = 0.0f64;
-    for line in text.lines() {
-        if line.starts_with('#') || line.is_empty() { continue; }
-        if line.starts_with("vllm:num_requests_running{") {
-            if let Some(v) = line.rsplit_once(' ').and_then(|(_, n)| n.parse::<f64>().ok()) {
-                running = v as u64;
-            }
-        } else if line.starts_with("vllm:num_requests_waiting{") {
-            if let Some(v) = line.rsplit_once(' ').and_then(|(_, n)| n.parse::<f64>().ok()) {
-                waiting = v as u64;
-            }
-        } else if line.starts_with("vllm:gpu_cache_usage_perc{") {
-            if let Some(v) = line.rsplit_once(' ').and_then(|(_, n)| n.parse::<f64>().ok()) {
-                kv_pct = v * 100.0;
-            }
-        }
+/// Parse a compute-apps name into something human-readable.
+fn label_gpu_proc(name: &str) -> Option<String> {
+    if name.contains("resource_tracker") { return None; }
+    if name.contains("vllm") || name.contains("api_server") {
+        return Some("vLLM API server".to_string());
     }
-    (running, waiting, kv_pct)
+    if name.contains("spawn_main") {
+        if let Some(tp) = name.split("fork_TP").nth(1).and_then(|s| s.split(')').next()) {
+            return Some(format!("vLLM TP worker {tp}"));
+        }
+        return Some("vLLM worker".to_string());
+    }
+    if name.contains("python") { return Some("python".to_string()); }
+    Some(name.split('/').last().unwrap_or(name).chars().take(40).collect())
 }
 
-/// Background task: refresh LiveStats every 2 s.
+/// Background task: refresh LiveStats every 2 s by reading directly from nvidia-smi.
+/// No dependency on vLLM — shows whatever is running on the GPU.
 async fn stats_poller(state: Arc<AppState>) {
-    let metrics_url = format!("{}/metrics", state.vllm_url);
+    // Rolling peak utilization per GPU across 3 polls (~6 s) to avoid
+    // catching the idle gaps between token bursts at B=1.
+    let mut util_window: Vec<Vec<u64>> = Vec::new();
+
     loop {
-        // Poll vLLM /metrics
-        let (running, waiting, kv_pct, online) =
-            match state.client.get(&metrics_url).send().await {
-                Ok(r) if r.status().is_success() => {
-                    let body = r.text().await.unwrap_or_default();
-                    let (r, w, k) = parse_vllm_metrics(&body);
-                    (r, w, k, true)
-                }
-                _ => (0, 0, 0.0, false),
-            };
+        // Per-GPU: utilization + memory
+        let smi_out = tokio::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
+            .output().await;
+        let current: Vec<(u64, u64, u64)> = match smi_out {
+            Ok(o) if o.status.success() =>
+                String::from_utf8_lossy(&o.stdout).lines()
+                    .filter_map(|l| {
+                        let p: Vec<&str> = l.split(',').map(str::trim).collect();
+                        if p.len() < 3 { return None; }
+                        Some((p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0), p[2].parse().unwrap_or(0)))
+                    })
+                    .collect(),
+            _ => vec![],
+        };
 
-        // Poll nvidia-smi (fire-and-forget parse)
-        let gpus = {
-            let out = tokio::process::Command::new("nvidia-smi")
-                .args(["--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
-                .output().await;
-            match out {
-                Ok(o) if o.status.success() =>
-                    String::from_utf8_lossy(&o.stdout).lines()
-                        .filter_map(|l| {
-                            let p: Vec<&str> = l.split(',').map(str::trim).collect();
-                            if p.len() < 3 { return None; }
-                            Some((
-                                p[0].parse::<u64>().unwrap_or(0),
-                                p[1].parse::<u64>().unwrap_or(0),
-                                p[2].parse::<u64>().unwrap_or(0),
-                            ))
-                        })
-                        .collect(),
-                _ => vec![],
+        util_window.push(current.iter().map(|(u, _, _)| *u).collect());
+        if util_window.len() > 3 { util_window.remove(0); }
+
+        let gpus: Vec<(u64, u64, u64)> = current.iter().enumerate().map(|(i, (_, used, total))| {
+            let peak = util_window.iter().filter_map(|w| w.get(i)).copied().max().unwrap_or(0);
+            (peak, *used, *total)
+        }).collect();
+
+        // Processes using GPU memory — ground truth for what's running, source of truth
+        let apps_out = tokio::process::Command::new("nvidia-smi")
+            .args(["--query-compute-apps=pid,used_memory,name", "--format=csv,noheader,nounits"])
+            .output().await;
+        let mut gpu_procs: Vec<GpuProc> = match apps_out {
+            Ok(o) if o.status.success() => {
+                let mut seen_pids = std::collections::HashSet::new();
+                String::from_utf8_lossy(&o.stdout).lines()
+                    .filter_map(|l| {
+                        let p: Vec<&str> = l.splitn(3, ',').map(str::trim).collect();
+                        if p.len() < 3 { return None; }
+                        let pid: u32 = p[0].parse().ok()?;
+                        if !seen_pids.insert(pid) { return None; }
+                        let mem_mb: u64 = p[1].parse().unwrap_or(0);
+                        let label = label_gpu_proc(p[2])?;
+                        Some(GpuProc { pid, label, mem_mb })
+                    })
+                    .collect()
             }
+            _ => vec![],
         };
+        gpu_procs.sort_by(|a, b| b.mem_mb.cmp(&a.mem_mb));
 
-        *state.live.lock().unwrap() = LiveStats {
-            vllm_requests_running: running,
-            vllm_requests_waiting: waiting,
-            vllm_kv_cache_pct: kv_pct,
-            vllm_online: online,
-            gpus,
-        };
+        *state.live.lock().unwrap() = LiveStats { gpus, gpu_procs };
 
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
@@ -611,89 +617,80 @@ async fn tasks_handler(
     }).collect();
 
     if wants_html {
-        let task_rows = if active.is_empty() {
-            "<tr><td colspan='5' style='text-align:center;color:#888'>No active requests via this server</td></tr>".to_string()
-        } else {
-            active.iter().map(|r| format!(
-                "<tr><td>{}</td><td>{}</td><td>{}s</td><td>{}</td><td>{} tok/s</td></tr>",
-                r["user"].as_str().unwrap_or(""),
-                r["prompt"].as_str().unwrap_or(""),
-                r["elapsed_s"],
-                r["tokens"],
-                r["tok_per_s"],
-            )).collect::<Vec<_>>().join("\n")
-        };
-
-        let vllm_status = if live.vllm_online {
-            let warn = if live.vllm_requests_running > 0 && active.is_empty() {
-                "<span style='color:#f0883e'> ← activity detected directly on vLLM!</span>"
-            } else { "" };
-            format!(
-                "<span style='color:#3fb950'>● online</span> &nbsp;\
-                 Running: <b>{}</b> &nbsp; Queued: <b>{}</b> &nbsp; KV cache: <b>{:.1}%</b>{}",
-                live.vllm_requests_running, live.vllm_requests_waiting,
-                live.vllm_kv_cache_pct, warn
-            )
-        } else {
-            "<span style='color:#8b949e'>○ offline</span>".to_string()
-        };
-
         let gpu_rows = if live.gpus.is_empty() {
-            "<tr><td colspan='4' style='color:#888'>nvidia-smi unavailable</td></tr>".to_string()
+            "<tr><td colspan='3' style='color:#888'>nvidia-smi unavailable</td></tr>".to_string()
         } else {
             live.gpus.iter().enumerate().map(|(i, (util, used, total))| {
                 let bar_width = (*util as usize).min(100);
                 let bar_color = if *util > 80 { "#f0883e" } else if *util > 20 { "#3fb950" } else { "#444" };
                 let bar = format!(
-                    "<div style='background:#21262d;width:120px;display:inline-block;border-radius:3px'>\
-                     <div style='background:{};width:{}%;height:10px;border-radius:3px'></div></div>",
-                    bar_color, bar_width
+                    "<div style='background:#21262d;width:140px;display:inline-block;border-radius:3px;vertical-align:middle'>\
+                     <div style='background:{bar_color};width:{bar_width}%;height:10px;border-radius:3px'></div></div>"
                 );
-                format!(
-                    "<tr><td>GPU {i}</td><td>{bar} {util}%</td><td>{used} / {total} MB</td></tr>",
-                )
+                format!("<tr><td>GPU {i}</td><td>{bar} &nbsp;{util}%</td><td>{used} / {total} MB</td></tr>")
             }).collect::<Vec<_>>().join("\n")
+        };
+
+        let proc_rows = if live.gpu_procs.is_empty() {
+            "<tr><td colspan='3' style='color:#888'>No GPU processes detected</td></tr>".to_string()
+        } else {
+            live.gpu_procs.iter().map(|p| format!(
+                "<tr><td>{}</td><td style='color:#8b949e'>{}</td><td>{} MB</td></tr>",
+                p.label, p.pid, p.mem_mb,
+            )).collect::<Vec<_>>().join("\n")
+        };
+
+        let proxy_rows = if active.is_empty() {
+            "<tr><td colspan='5' style='color:#888'>No active requests via port 8000</td></tr>".to_string()
+        } else {
+            active.iter().map(|r| format!(
+                "<tr><td>{}</td><td>{}</td><td>{}s</td><td>{}</td><td>{} tok/s</td></tr>",
+                r["user"].as_str().unwrap_or(""),
+                r["prompt"].as_str().unwrap_or(""),
+                r["elapsed_s"], r["tokens"], r["tok_per_s"],
+            )).collect::<Vec<_>>().join("\n")
         };
 
         let html = format!(r#"<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="2">
-<title>GPU Tasks</title>
+<title>GPU Monitor</title>
 <style>
   body {{ font-family: monospace; background: #0d1117; color: #e6edf3; padding: 24px; }}
   h2 {{ color: #58a6ff; margin-bottom: 4px; }}
-  h3 {{ color: #58a6ff; margin: 20px 0 6px; }}
+  h3 {{ color: #58a6ff; margin: 20px 0 6px; font-size: 1em; }}
   table {{ border-collapse: collapse; width: 100%; margin-bottom: 8px; }}
   th {{ background: #161b22; color: #8b949e; padding: 6px 12px; text-align: left; font-weight: normal; }}
   td {{ padding: 6px 12px; border-bottom: 1px solid #21262d; }}
-  .vllm-bar {{ background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 10px 14px; margin-bottom: 16px; }}
   .meta {{ color: #8b949e; margin-top: 16px; font-size: 0.85em; }}
 </style>
 </head><body>
-<h2>Inference Monitor</h2>
+<h2>GPU Monitor</h2>
 
-<div class="vllm-bar">
-  <b>vLLM</b> &nbsp; {vllm_status}
-</div>
-
-<h3>GPU Activity</h3>
+<h3>Per-GPU Utilization (peak over 6 s)</h3>
 <table>
-  <tr><th>GPU</th><th>Utilization</th><th>Memory</th></tr>
+  <tr><th>GPU</th><th>Compute</th><th>Memory</th></tr>
   {gpu_rows}
 </table>
 
-<h3>Requests via this server (port 9000)</h3>
+<h3>Processes on GPU</h3>
+<table>
+  <tr><th>Process</th><th>PID</th><th>GPU Mem</th></tr>
+  {proc_rows}
+</table>
+
+<h3>Requests via proxy (port 8000)</h3>
 <table>
   <tr><th>User</th><th>Prompt</th><th>Elapsed</th><th>Tokens</th><th>Speed</th></tr>
-  {task_rows}
+  {proxy_rows}
 </table>
 
 <p class="meta">Total served: {total} &nbsp;|&nbsp; Uptime: {uptime}s &nbsp;|&nbsp; Auto-refreshes every 2s</p>
 </body></html>"#,
-            vllm_status = vllm_status,
             gpu_rows = gpu_rows,
-            task_rows = task_rows,
+            proc_rows = proc_rows,
+            proxy_rows = proxy_rows,
             total = tracker.total_served,
             uptime = uptime,
         );
@@ -701,21 +698,15 @@ async fn tasks_handler(
         Html(html).into_response()
     } else {
         Json(json!({
-            "active": active,
+            "gpus": live.gpus.iter().enumerate().map(|(i, (u, m, t))| json!({
+                "id": i, "util_pct": u, "mem_used_mb": m, "mem_total_mb": t,
+            })).collect::<Vec<_>>(),
+            "gpu_procs": live.gpu_procs.iter().map(|p| json!({
+                "pid": p.pid, "label": p.label, "mem_mb": p.mem_mb,
+            })).collect::<Vec<_>>(),
+            "proxy_active": active,
             "total_served": tracker.total_served,
             "uptime_s": uptime,
-            "vllm": {
-                "online": live.vllm_online,
-                "requests_running": live.vllm_requests_running,
-                "requests_waiting": live.vllm_requests_waiting,
-                "kv_cache_pct": (live.vllm_kv_cache_pct * 10.0).round() / 10.0,
-            },
-            "gpus": live.gpus.iter().enumerate().map(|(i, (u, m, t))| json!({
-                "id": i,
-                "util_pct": u,
-                "mem_used_mb": m,
-                "mem_total_mb": t,
-            })).collect::<Vec<_>>(),
         })).into_response()
     }
 }

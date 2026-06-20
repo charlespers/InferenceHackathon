@@ -14,10 +14,10 @@ from inferutil.hardware import GPUS, Cluster
 from inferutil.latency import decode_latency
 
 
-def tpot_ms(plan, tp, ep, dtype, collective_us, eff, host_ms):
+def tpot_ms(plan, tp, ep, dtype, collective_us, eff, host_ms, ctx=512, kv_dtype=2):
     gpu = dataclasses.replace(GPUS["H100-SXM-80GB"], collective_latency_s=collective_us * 1e-6)
     b = decode_latency(QWEN3_235B, Cluster(gpu=gpu, n_gpus=8), plan=plan, dtype_bytes=dtype,
-                       kv_dtype_bytes=2, seq_len=512, tp=tp, ep=ep)
+                       kv_dtype_bytes=kv_dtype, seq_len=ctx, tp=tp, ep=ep)
     # model's bandwidth terms scaled by realized efficiency (global factor, per the bench convention),
     # comms is latency-bound (not eff-scaled), plus an explicit host/launch/sampling residual.
     bw_ms = (b.weight_read_s + b.kv_read_s) * 1e3 / eff
@@ -35,12 +35,24 @@ def main():
     ap.add_argument("--ttft-ms", type=float, default=777.0, help="measured cold TTFT; overridden by --prefix-cache")
     ap.add_argument("--prefix-cache", action="store_true", help="cache hit -> TTFT ≈ first decode step")
     ap.add_argument("--decode", type=int, default=128); ap.add_argument("--turns", type=int, default=1)
+    ap.add_argument("--ctx", type=int, default=512, help="context length (chat history grows this)")
+    ap.add_argument("--kv-dtype", type=int, default=2, help="2=bf16/fp16 KV, 1=fp8/int8 KV")
+    ap.add_argument("--ctx-sweep", action="store_true", help="TPOT vs context length (the long-chat regime)")
     ap.add_argument("--proven", action="store_true", help="preset: prefix-cache + n-gram τ=2 + comms 8µs + eff 0.30")
     a = ap.parse_args()
     if a.proven:
         a.prefix_cache = True; a.spec_tau = 2.0; a.collective_us = 8.0; a.eff = 0.30
 
-    base_tpot = tpot_ms(a.plan, a.tp, a.ep, a.dtype, a.collective_us, a.eff, a.host_ms)
+    if a.ctx_sweep:
+        print(f"== TPOT vs context (chat history) ==  {'bf16' if a.dtype==2 else 'fp8'} weights, "
+              f"comms={a.collective_us}µs eff={a.eff} spec_tau={a.spec_tau}  kv={'fp8' if a.kv_dtype==1 else 'bf16'}")
+        for c in (512, 4096, 16384, 32768, 65536, 131072):
+            t = tpot_ms(a.plan, a.tp, a.ep, a.dtype, a.collective_us, a.eff, a.host_ms, ctx=c, kv_dtype=a.kv_dtype) / max(a.spec_tau, 1.0)
+            print(f"  ctx={c:>7}: TPOT {t:6.2f} ms  ({1000.0/t:6.1f} tok/s)")
+        print("  (KV-read grows ∝ ctx; crossover where KV overtakes the ~weight+floor term = where KV quant/eviction starts to pay)")
+        return
+
+    base_tpot = tpot_ms(a.plan, a.tp, a.ep, a.dtype, a.collective_us, a.eff, a.host_ms, ctx=a.ctx, kv_dtype=a.kv_dtype)
     # spec amortizes the per-step floor over τ accepted tokens (valid while floor-dominated):
     eff_tpot = base_tpot / max(a.spec_tau, 1.0)
     ttft = (base_tpot if a.prefix_cache else a.ttft_ms)   # cache hit ≈ one decode step

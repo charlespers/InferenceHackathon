@@ -83,6 +83,19 @@ and τ from Charles's expected anchor (k4→2.8, k8→3.76, k16→~3.9), draft s
   the EAGLE3 "expected" anchor, not measured on the real model at these k. Confirm f + τ(k) with Charles
   before banking. The DIRECTION (optimal k≈4-8, ~2.6x, not flat) is robust to f in [0.15,0.25].
 
+### Re-run with the MEASURED TC verify attention (K2 now flat) — the headline shifts UP
+Using the MEASURED complete-verify K2(M)/K2(1) from tc_verify_attn (1.0 / 1.01 / 1.09 / 1.25 @M=1/4/8/16),
+same `T_blended = 0.80 + 0.20·K2(M)/K2(1)`, +~0.1 draft:
+| k (=γ) | M=k+1 | K2(M)/K2(1) | T_blended | τ | τ/(T_blended+0.1) |
+|--:|--:|--:|--:|--:|--:|
+| 3 | 4 | 1.01 | 1.00 | 2.80 | **2.55** |
+| 7 | 8 | 1.09 | 1.02 | 3.76 | **3.36** |
+| 15 | 16 | 1.25 | 1.05 | 3.90 | **3.39** |
+- **With a TC verify attention the forward is ~flat (T_blended≈1.0) -> net spec rises from warp-shuffle
+  ~2.6x to ~3.3-3.4x at k=8 (and k=16 no longer over-drafts).** The K2 M-tax that capped warp-shuffle spec
+  at ~2.6x is removed; the multiplier approaches the full tau minus draft. Same caveats (f, tau anchor) hold;
+  DIRECTION robust. This is the payoff of building the TC verify attention.
+
 ## *** UPDATE: the M-tax is REMOVABLE — tensor-core attention IS flat in M ***
 (2026-06-20 ~20:05 UTC, `tc_attn_probe.cu`/`tcp`, idle box, model-free. Full: `tc_attn_probe_result.txt`.)
 The ~4x K2 M-scaling above is the warp-shuffle/CUDA-core kernel's artifact, NOT fundamental to B=1.

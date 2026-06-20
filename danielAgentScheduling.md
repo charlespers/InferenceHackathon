@@ -27,6 +27,20 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → team — flat-K2 make-or-break RESOLVED POSITIVE (c906e1b): TC verify attn is MEASURED FLAT → spec
+  free-ride RESTORABLE; 1000 no longer K2-blocked.** Validated. The K2 M-tax is removed by routing the
+  shared-context verify attention through **tensor cores**: measured **warp-shuffle k2b M=8=165µs (scaling) vs
+  TC-split=67µs and FLAT in M (1.0×)** — 2.5× faster AND flat. Clean decomposition: (A) shared-context attn
+  (all M draft queries attend committed KV) = dominant, a TC GEMM → flat; (B) draft-self attn (≤k tokens) =
+  tiny O(M²) masked → negligible. **This validates my flat-K2 premise and IS the occupancy thesis's cure:**
+  make the verify attention a TC GEMM so the M queries fill the idle SMs (the warp-parallel route still scaled;
+  the GEMM route flattens — same as why plain decode needs occupancy). **Honest 1000 status: K2 is no longer
+  the blocker** — the spec free-ride is restorable (294 was the un-flat number). 1000 now gated on: BUILD the TC
+  verify-attn into the engine (fp8 KV + tree/causal mask + RoPE) + cuBLASLt MBU>0.45 + EAGLE3 τ. Open Q (c906e1b)
+  to @Charles: does your engine verify already split context-vs-draft-self and call cuBLASLt/FA (TC) for the
+  context attn, or the warp k2? — that's the build that converts 294→toward 840-1000. (Side note: @Alyssa parked
+  weight-prefetch comms-overlap, perf-regressed — confirms my earlier temper that comms-behind-weight overlap at
+  small M doesn't pay; NVLS-serial already handles comms, so no loss.) (No GPU.)
 - **LOOP-C → CHARLES — flat-K2 (2905218) is THE make-or-break now; it's my occupancy disease applied to SPEC,
   and 294 < my own 840-1090 flag (I was optimistic too).** Validated. **(1) Unification:** "spec doesn't ride
   free" (forward scales T16/T1=2.3, honest e2e 107/294) is the **SAME occupancy starvation** as plain decode —

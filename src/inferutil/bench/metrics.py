@@ -18,7 +18,7 @@ class TelemetrySummary:
     power_w_mean: float            # mean TOTAL power across all GPUs (W)
     energy_j_per_token: float
     util_imbalance: float          # busiest-GPU mean util / mean-across-GPUs
-    per_gpu_mean_util: tuple       # tuple[float, ...]
+    per_gpu_mean_util: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -68,8 +68,10 @@ def summarize_telemetry(samples, n_decode_tokens: int,
         sum(s.sm_util_pct for s in by_gpu[g]) / len(by_gpu[g]) for g in gpu_ids)
     mean_util = sum(per_gpu_mean_util) / len(per_gpu_mean_util)
     imbalance = (max(per_gpu_mean_util) / mean_util) if mean_util else 0.0
-    samples_per_gpu = len(samples) / len(gpu_ids)   # assumes equal sampling cadence
-    power_total_mean = sum(s.power_w for s in samples) / samples_per_gpu
+    # Mean total instantaneous power = sum of each GPU's mean power over the
+    # window. Robust to uneven per-GPU sample counts (no cadence assumption).
+    power_total_mean = sum(
+        sum(s.power_w for s in by_gpu[g]) / len(by_gpu[g]) for g in gpu_ids)
     energy = (power_total_mean * decode_window_s / n_decode_tokens) if n_decode_tokens else 0.0
     return TelemetrySummary(
         available=True, n_gpus=len(gpu_ids),

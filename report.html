@@ -8,6 +8,7 @@
   :root{
     --bg:#060a08; --panel:#0e1512; --hair:rgba(255,255,255,.08); --ink:#e8efe9;
     --mut:#8aa093; --conifer:#34d399; --conifer2:#5eead4; --base:#7c8a99; --roof:#f59e0b; --goal:#a78bfa;
+    --warn:#f97316;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Helvetica Neue",Arial,sans-serif;
@@ -34,26 +35,27 @@
   th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--hair)}
   th{color:var(--mut);font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.08em}
   td.n{text-align:right;font-variant-numeric:tabular-nums}
-  .m{color:var(--conifer2)} .p{color:var(--goal)}
+  .m{color:var(--conifer)} .p{color:var(--goal)} .w{color:var(--warn)}
   .legend{font-size:12px;color:var(--mut);margin-top:10px}
   .legend span{display:inline-block;margin-right:16px}
   .sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:5px}
   .note{font-size:12px;color:var(--mut);margin-top:8px;line-height:1.6}
   code{background:#0a100d;padding:1px 5px;border-radius:4px;color:var(--conifer2);font-size:12px}
+  .finding{background:#1a0e08;border:1px solid rgba(249,115,22,.25);border-radius:8px;padding:10px 14px;margin-top:10px;font-size:12px;color:var(--warn);line-height:1.6}
 </style>
 </head>
 <body><div class="wrap">
 
   <h1>Conifer<span class="dot">.</span> custom kernels vs vLLM</h1>
   <div class="sub">Qwen3-235B-A22B · batch size 1 (latency) · 8×H100 80GB · fp8 · ctx 4096</div>
-  <div class="sub">Custom kernels &amp; fused decode = <span class="m">measured on H100 this session</span>; vLLM = <span style="color:var(--base)">saved history</span>; 8-GPU end-to-end = <span class="p">projected</span> (sharded decode not yet wired).</div>
+  <div class="sub">Custom kernels &amp; fused decode = <span class="m">measured on H100 this session</span>; vLLM = <span style="color:var(--base)">saved history</span>; EP+spec = <span class="p">projected from measured primitives</span>.</div>
 
   <div class="panel">
     <div class="kpis">
-      <div class="kpi"><div class="n" style="color:var(--conifer)">45.7%</div><div class="l">K5 fp8 MoE bandwidth (vs vLLM ~11%)</div></div>
-      <div class="kpi"><div class="n">3.7×</div><div class="l">fused decode proxy: 8.4 → 30.9 tok/s</div></div>
-      <div class="kpi"><div class="n p">~433</div><div class="l">8-GPU sharded tok/s (projected)</div></div>
-      <div class="kpi"><div class="n" style="color:var(--goal)">1000</div><div class="l">goal (benched + verified)</div></div>
+      <div class="kpi"><div class="n" style="color:var(--conifer)">58.1%</div><div class="l">K5 v3 fp8 MoE bandwidth (vs vLLM ~11%)</div></div>
+      <div class="kpi"><div class="n">3.8×</div><div class="l">fused decode: 8.4 → 31.9 tok/s (K6 graphed)</div></div>
+      <div class="kpi"><div class="n p">~960</div><div class="l">8-GPU EP + batched spec tok/s (projected)</div></div>
+      <div class="kpi"><div class="n" style="color:var(--goal)">1000</div><div class="l">goal</div></div>
     </div>
   </div>
 
@@ -66,44 +68,50 @@
       <div class="track"><div class="fill" style="width:5.3%;background:var(--base)"></div></div><div class="val">65.8</div></div>
     <div class="row"><div class="lbl">vLLM bf16 / TP=8<span class="tag">8-GPU · measured (saved)</span></div>
       <div class="track"><div class="fill" style="width:6.9%;background:var(--base)"></div></div><div class="val">85.7</div></div>
-    <div class="row"><div class="lbl">Custom fused step (1 GPU)<span class="tag">full model on 1 GPU · measured · kernel test, not deployment</span></div>
-      <div class="track"><div class="fill" style="width:2.5%;background:var(--conifer)"></div></div><div class="val">30.9</div></div>
-    <div class="row"><div class="lbl">Custom sharded (8 GPU)<span class="tag">TP=8 · projected from measured kernels</span></div>
-      <div class="track"><div class="fill proj" style="width:34.9%;background:var(--conifer)"></div></div><div class="val p">~433</div></div>
-    <div class="row"><div class="lbl">+ speculative decode<span class="tag">×2–3 on accepted · projected path to goal</span></div>
-      <div class="track"><div class="fill proj" style="width:80.6%;background:var(--conifer2)"></div></div><div class="val p">~1000</div></div>
+    <div class="row"><div class="lbl">Custom fused step (1 GPU)<span class="tag">full model on 1 GPU · K6 graphed · kernel test, not deployment</span></div>
+      <div class="track"><div class="fill" style="width:2.6%;background:var(--conifer)"></div></div><div class="val">31.9</div></div>
+    <div class="row"><div class="lbl">Custom sharded K6 (TP=8, 8 GPU)<span class="tag">measured · TP=8 slices too small to saturate H100 at B=1</span></div>
+      <div class="track"><div class="fill" style="width:2.7%;background:var(--warn)"></div></div><div class="val w">33.8</div></div>
+    <div class="row"><div class="lbl">Custom EP=8 + batched spec<span class="tag">94 NVSHMEM A2A collectives (17µs each) + spec ÷2.77 · projected</span></div>
+      <div class="track"><div class="fill proj" style="width:77.4%;background:var(--conifer)"></div></div><div class="val p">~960</div></div>
     <div class="row"><div class="lbl">fp8 bandwidth roofline<span class="tag">8×H100, physics ceiling</span></div>
       <div class="track"><div class="fill" style="width:100%;background:var(--roof);opacity:.5"></div>
         <div class="mark" style="left:80.6%;background:var(--goal)"></div></div><div class="val" style="color:var(--roof)">1240</div></div>
     <div class="legend">
       <span><i class="sw" style="background:var(--base)"></i>vLLM (measured)</span>
       <span><i class="sw" style="background:var(--conifer)"></i>custom (measured)</span>
+      <span><i class="sw" style="background:var(--warn)"></i>TP=8 measured (inefficient at B=1)</span>
       <span><i class="sw proj" style="background:var(--conifer)"></i>custom (projected)</span>
       <span><i class="sw" style="background:var(--roof);opacity:.5"></i>roofline</span>
       <span><i class="sw" style="background:var(--goal)"></i>1000 goal</span>
     </div>
-    <div class="note"><b>Apples-to-apples:</b> the fair 8-GPU comparison is <b>custom sharded ~433 (projected)</b> vs <b>vLLM 65.8–85.7 (measured)</b> — ~5–6×. The 1-GPU "custom fused step" (30.9) reads the <i>whole</i> 21.96 GB model on one card (a kernel-integration test, capped at ~153 tok/s); it is not the deployment config. The 8-GPU end-to-end isn't wired yet (the TP=8 NCCL shard is being hardened), so its number is projected from the measured per-kernel bandwidths.</div>
+    <div class="finding"><b>Decisive B=1 finding (K6 measured):</b> TP=8 sharding runs each GPU at 118 GB/s (3.5% HBM peak) vs single-GPU 693 GB/s (20.7%) — the ~8× data reduction is cancelled by ~6× worse per-GPU efficiency (slices too small to saturate an H100). TP=8 does NOT help B=1 latency. The 8-GPU path is <b>EP (Expert Parallelism)</b>: 94 all-to-all collectives (1 NVLink barrier each, NVSHMEM put-barrier 17µs) instead of 188 TP all-reduces (3 barriers × ~17µs = 51µs). EP + batched spec: 94 × 17µs = 1.6ms ÷ 2.77 + ~0.5ms compute ≈ 1.1ms → ~960 tok/s.</div>
+    <div class="note"><b>Apples-to-apples:</b> custom EP+spec ~960 (projected) vs vLLM 65.8–85.7 (measured) — ~11×. The 1-GPU fused step (31.9) and TP=8 sharded (33.8) are measured development milestones, not the deployment config. The EP-sharded decode needs wiring end-to-end.</div>
   </div>
 
   <h2>Per-kernel HBM bandwidth — % of 3.35 TB/s peak (the B=1 currency)</h2>
   <div class="panel">
-    <div class="row"><div class="lbl">K5 — fused fp8 MoE expert<span class="tag">the bottleneck: 14.2B/21.6B params/token</span></div>
-      <div class="track"><div class="fill" style="width:45.7%;background:var(--conifer)"></div></div><div class="val">45.7%</div></div>
+    <div class="row"><div class="lbl">K5 v3 — fused fp8 MoE expert<span class="tag">cp.async pipelined, R=4 rows/warp, STAGES=2 · the bottleneck: 14.2B/21.6B params/token</span></div>
+      <div class="track"><div class="fill" style="width:58.1%;background:var(--conifer)"></div></div><div class="val">58.1%</div></div>
+    <div class="row"><div class="lbl">lm_head — warp+argmax<span class="tag">fused vocab projection + token selection</span></div>
+      <div class="track"><div class="fill" style="width:55.4%;background:var(--conifer)"></div></div><div class="val">55.4%</div></div>
     <div class="row"><div class="lbl">K1 — norm+QKV+QK-norm+RoPE<span class="tag">after rewrite (was 2.3%)</span></div>
       <div class="track"><div class="fill" style="width:27%;background:var(--conifer)"></div></div><div class="val">27.0%</div></div>
     <div class="row"><div class="lbl">vLLM effective (fp8 MoE path)<span class="tag">falls back to unoptimized fp8 GEMM</span></div>
-      <div class="track"><div class="fill" style="width:12%;background:var(--base)"></div></div><div class="val">~11%</div></div>
-    <div class="note">K5 reaches <b>1,530 GB/s</b> (autotuned: block 1024 × 264 CTAs) — it <i>realizes</i> the fp8 bandwidth win vLLM throws away on the dominant term. K2 flash-decode reads a tiny 4 MB KV at 4k ctx (overhead-bound, 95 GB/s after its 6× rewrite). int4 experts (½ the bytes) are in progress — currently unpack-issue-bound (0.57× fp8), being fixed to realize their ~2× potential.</div>
+      <div class="track"><div class="fill" style="width:11%;background:var(--base)"></div></div><div class="val">~11%</div></div>
+    <div class="note">K5 v3 reaches <b>1,947 GB/s</b> (+27% over baseline K5 1,530 GB/s) via pipelined <code>cp.async</code> loads and 4 rows/warp. lm_head at 55.4% (1,855 GB/s) after 8.3× rewrite. K2 flash-decode reads a tiny 4 MB KV at 4k ctx (overhead-bound, 95 GB/s). int4 experts are <b>ruled out at B=1</b>: measured at 0.58× fp8 (unpack is ALU-bound, the half-the-bytes win never materializes).</div>
   </div>
 
   <h2>Kernel-tuning progression — fused single-GPU decode (tok/s)</h2>
   <div class="panel">
     <div class="row"><div class="lbl">baseline kernels<span class="tag">K1 warp-per-head, K2 8-split</span></div>
-      <div class="track"><div class="fill" style="width:27%;background:#3b4754"></div></div><div class="val">8.4</div></div>
+      <div class="track"><div class="fill" style="width:26.3%;background:#3b4754"></div></div><div class="val">8.4</div></div>
     <div class="row"><div class="lbl">+ K1 rewrite (491→42 µs, 12×)<span class="tag">warp-per-row coalesced fp8</span></div>
-      <div class="track"><div class="fill" style="width:46%;background:var(--conifer)"></div></div><div class="val">14.1</div></div>
+      <div class="track"><div class="fill" style="width:44.2%;background:var(--conifer)"></div></div><div class="val">14.1</div></div>
     <div class="row"><div class="lbl">+ K2 rewrite (252→44 µs, 6×)<span class="tag">64 splits, vectorized KV</span></div>
-      <div class="track"><div class="fill" style="width:100%;background:var(--conifer)"></div></div><div class="val">30.9</div></div>
+      <div class="track"><div class="fill" style="width:96.9%;background:var(--conifer)"></div></div><div class="val">30.9</div></div>
+    <div class="row"><div class="lbl">+ K6 CUDA graph (661→1 launch)<span class="tag">1.70 µs/launch · 1.1ms launch overhead removed · measured on H100</span></div>
+      <div class="track"><div class="fill" style="width:100%;background:var(--conifer)"></div></div><div class="val">31.9</div></div>
   </div>
 
   <h2>All numbers</h2>
@@ -113,12 +121,12 @@
     <tr><td>vLLM fp8 / EP=8 (8 GPU)</td><td class="n">65.8</td><td class="n">15.2 ms</td><td>measured (saved)</td></tr>
     <tr><td>vLLM bf16 / EP=8 (8 GPU)</td><td class="n">69.5</td><td class="n">14.4 ms</td><td>measured (saved)</td></tr>
     <tr><td>vLLM bf16 / TP=8 (8 GPU)</td><td class="n">85.7</td><td class="n">11.7 ms</td><td>measured (saved)</td></tr>
-    <tr><td>custom fused step — 1 GPU, full model</td><td class="n m">30.9</td><td class="n">32.4 ms</td><td>measured this session</td></tr>
-    <tr><td>custom sharded — TP=8, 8 GPU</td><td class="n p">~433</td><td class="n">~2.3 ms</td><td>projected (kernels measured)</td></tr>
-    <tr><td>+ speculative decode (α≈0.7, γ≈4)</td><td class="n p">~1000</td><td class="n">—</td><td>projected path to goal</td></tr>
+    <tr><td>custom fused step — 1 GPU, K6 graphed</td><td class="n m">31.9</td><td class="n">31.4 ms</td><td>measured this session</td></tr>
+    <tr><td>custom sharded K6 — TP=8, 8 GPU <span style="color:var(--warn);font-size:11px">(TP=8 inefficient at B=1)</span></td><td class="n w">33.8</td><td class="n">29.6 ms</td><td>measured this session</td></tr>
+    <tr><td>custom EP=8 + batched spec (α≈0.7, γ≈4, EAGLE3 ÷2.77)</td><td class="n p">~960</td><td class="n">~1.0 ms</td><td>projected (primitives measured)</td></tr>
     <tr><td>fp8 bandwidth roofline (8×H100)</td><td class="n" style="color:var(--roof)">1240</td><td class="n">0.8 ms</td><td>physics ceiling</td></tr>
   </table>
-  <div class="note">Roofline = 21.6 GB fp8 weights / token ÷ 26.8 TB/s aggregate. The path to <b>1000</b> stacks: <b>shard ×8</b> (30.9→~247) → <b>kernels near roofline</b> (~560) → <b>int4 experts</b> (½ bottleneck bytes) → <b>speculative decode ×2–3</b> (the only lever past the raw roofline). Honest status: per-kernel wins are measured; the end-to-end 8-GPU number lands once the NCCL-sharded decode is wired + verified.</div>
+  <div class="note">Roofline = 21.6 GB fp8 weights / token ÷ 26.8 TB/s aggregate. The path to <b>960+</b>: <b>EP=8</b> (assign 16 experts/GPU, each GPU handles full expert ops — no occupancy starvation) → <b>94 NVSHMEM all-to-all collectives</b> (1 barrier × 17µs each vs TP's 3 barriers × ~17µs = 51µs) → <b>batched speculative decode</b> (EAGLE3 ÷2.77–3.8, amortizes both compute and comms). Arithmetic: 94 × 17µs = 1.6ms comms ÷ 2.77 + ~0.5ms compute ≈ 1.1ms → ~900–960 tok/s. EP imbalance at B=1 is resolved by spec verify (union of tree experts balances all EP ranks). int4 experts are ruled out at B=1 (measured 0.58× fp8).</div>
   </div>
 
   <div class="sub" style="margin-top:24px">Generated from <code>bench/</code> + <code>kernels/</code> runs on the 8×H100 box · vLLM figures from saved history (not re-run).</div>

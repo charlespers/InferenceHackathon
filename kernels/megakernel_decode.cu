@@ -117,6 +117,14 @@ constexpr int OROWS_PE    = HIDDEN   / NPES_EXPECT;      // 512 O-proj output ro
 // Experts: the model routes TOP_K=8 experts/token over EP=8 PEs.  As a balanced latency proxy each PE
 // owns ONE active-expert slot's worth of gate/up/down work (so the 8 PEs cover the 8 routed experts).
 constexpr int EXP_PER_PE  = 1;                           // active-expert slots handled by this PE
+#ifndef MK_R
+#define MK_R 4                                            // output rows streamed per warp (B=1 MLP fix)
+#endif
+#ifndef MK_STAGES
+#define MK_STAGES 2                                       // cp.async pipeline depth (double-buffered)
+#endif
+// per-warp cp.async ring, in floats (uint4=4 floats): STAGES*ROWS*32 uint4.
+#define MK_RING_FLOATS (MK_STAGES * MK_R * 32 * 4)
 
 // ================================================================================================
 // Device dot primitive — the repo's coalesced split-K fp8 GEMV inner loop (k5/k1/k3/k4 share it).
@@ -152,6 +160,138 @@ static __device__ __forceinline__ float mk_warp_dot(const fp8* __restrict__ w,
   return acc;
 }
 
+// ================================================================================================
+// cp.async DOUBLE-BUFFERED multi-row GEMV — ported from k5_experts_v3.cu (the kernel that hits 58%
+// HBM vs naive warp-dot's ~5%).  The async-copy engine streams the NEXT weight tile into shared
+// memory while the current tile is dequant+FMA'd, keeping many 16-byte HBM transactions in flight —
+// the deep memory-level parallelism a synchronous load loop (mk_warp_dot / mk_warp_dot_R) cannot
+// reach at B=1.  This is THE decode-loop efficiency fix.  `wbuf` is this warp's [STAGES][ROWS][32]
+// uint4 ring in shared memory; out[ROWS] valid on lane 0.  n a multiple of 16.
+// ================================================================================================
+__device__ __forceinline__ void mk_cp_async_16(void* smem_dst, const void* gmem_src) {
+  unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem_src));
+}
+__device__ __forceinline__ void mk_cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N> __device__ __forceinline__ void mk_cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+__device__ __forceinline__ void mk_fma_uint4(const uint4& p, const float* __restrict__ yy,
+                                             float& a0, float& a1, float& a2, float& a3) {
+  const unsigned* wu = reinterpret_cast<const unsigned*>(&p);
+  #pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    unsigned wq = wu[q];
+    __nv_fp8x2_e4m3 lo, hi; lo.__x = (unsigned short)(wq & 0xffffu); hi.__x = (unsigned short)(wq >> 16);
+    float2 fl = __half22float2((__half2)lo), fh = __half22float2((__half2)hi);
+    const float* yq = yy + (q << 2);
+    a0 += yq[0]*fl.x; a1 += yq[1]*fl.y; a2 += yq[2]*fh.x; a3 += yq[3]*fh.y;
+  }
+}
+
+template <int ROWS, int STAGES>
+__device__ __forceinline__ void mk_dot_rows_pipe(const fp8* __restrict__ W0, int n, int lane,
+                                                 const float* __restrict__ ys,
+                                                 uint4* __restrict__ wbuf, float* __restrict__ out) {
+  constexpr int TILE_V = 32;
+  const int nv = n >> 4;
+  const int ntile = (nv + TILE_V - 1) / TILE_V;
+  const uint4* __restrict__ Wv[ROWS];
+  #pragma unroll
+  for (int r = 0; r < ROWS; ++r) Wv[r] = reinterpret_cast<const uint4*>(W0 + (size_t)r * n);
+  auto slot = [&](int st, int r) -> uint4* { return wbuf + ((size_t)st * ROWS + r) * TILE_V; };
+
+  int fetch = 0;
+  #pragma unroll 1
+  for (; fetch < STAGES && fetch < ntile; ++fetch) {
+    const int v = fetch * TILE_V + lane;
+    #pragma unroll
+    for (int r = 0; r < ROWS; ++r) if (v < nv) mk_cp_async_16(slot(fetch, r) + lane, Wv[r] + v);
+    mk_cp_async_commit();
+  }
+  float acc[ROWS][4];
+  #pragma unroll
+  for (int r = 0; r < ROWS; ++r) { acc[r][0]=acc[r][1]=acc[r][2]=acc[r][3]=0.f; }
+  #pragma unroll 1
+  for (int t = 0; t < ntile; ++t) {
+    mk_cp_async_wait<STAGES - 1>();
+    __syncwarp();
+    const int st = t % STAGES;
+    const int v  = t * TILE_V + lane;
+    if (v < nv) {
+      const float* yy = ys + (v << 4);
+      #pragma unroll
+      for (int r = 0; r < ROWS; ++r) mk_fma_uint4(*(slot(st, r) + lane), yy, acc[r][0], acc[r][1], acc[r][2], acc[r][3]);
+    }
+    const int nf = t + STAGES;
+    if (nf < ntile) {
+      const int fv = nf * TILE_V + lane;
+      __syncwarp();
+      #pragma unroll
+      for (int r = 0; r < ROWS; ++r) if (fv < nv) mk_cp_async_16(slot(st, r) + lane, Wv[r] + fv);
+    }
+    mk_cp_async_commit();
+  }
+  mk_cp_async_wait<0>();
+  __syncwarp();
+  #pragma unroll
+  for (int r = 0; r < ROWS; ++r) {
+    float a = acc[r][0] + acc[r][1] + acc[r][2] + acc[r][3];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(0xffffffffu, a, o);
+    if (lane == 0) out[r] = a;
+  }
+}
+
+// Per-warp cp.async ring size (uint4) for ROWS rows, STAGES deep.
+template <int ROWS, int STAGES> __device__ __host__ constexpr int mk_ring_u4() { return STAGES * ROWS * 32; }
+
+// ================================================================================================
+// MULTI-ROW warp dot — the B=1 bandwidth fix.  One warp streams R output rows of W at once, sharing
+// the x read and keeping R INDEPENDENT accumulator chains.  At B=1 the GEMV is HBM-latency-bound, not
+// throughput-bound: a single-row warp has too few loads in flight to hide ~500ns HBM latency at the
+// 12.5% occupancy a persistent grid runs at.  R independent weight-row loads per iteration give R×
+// the memory-level parallelism -> bandwidth utilization climbs from ~2-5% toward the K5 v3 ~58%.
+// w0 = first row, rows are `row_stride` apart; out[R] valid on lane 0.  n a multiple of 16.
+// ================================================================================================
+template<int R>
+static __device__ __forceinline__ void mk_warp_dot_R(const fp8* __restrict__ w0, int row_stride,
+                                                      const float* __restrict__ xs, int n, int lane,
+                                                      float* __restrict__ out) {
+  float acc[R];
+  #pragma unroll
+  for (int r = 0; r < R; ++r) acc[r] = 0.f;
+  const int nv = n >> 4;
+  const uint4* __restrict__ wv0 = reinterpret_cast<const uint4*>(w0);
+  const int row_v = row_stride >> 4;                       // row stride in uint4 units
+  for (int v = lane; v < nv; v += 32) {
+    const float* xx = xs + (v << 4);
+    float x[16];
+    #pragma unroll
+    for (int t = 0; t < 16; ++t) x[t] = xx[t];
+    uint4 p[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) p[r] = wv0[(size_t)r * row_v + v];   // R independent loads -> ILP
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const unsigned* wu = reinterpret_cast<const unsigned*>(&p[r]);
+      #pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        unsigned wq = wu[q];
+        __nv_fp8x2_e4m3 lo, hi; lo.__x = (unsigned short)(wq & 0xffffu); hi.__x = (unsigned short)(wq >> 16);
+        float2 fl = __half22float2((__half2)lo), fh = __half22float2((__half2)hi);
+        acc[r] += x[q*4]*fl.x + x[q*4+1]*fl.y + x[q*4+2]*fh.x + x[q*4+3]*fh.y;
+      }
+    }
+  }
+  #pragma unroll
+  for (int r = 0; r < R; ++r) {
+    float a = acc[r];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(0xffffffffu, a, o);
+    if (lane == 0) out[r] = a;
+  }
+}
+
 static __device__ __forceinline__ float mk_silu(float x) { return x / (1.f + __expf(-x)); }
 
 // ================================================================================================
@@ -163,7 +303,13 @@ struct MegaState {
   float* h_sym  = nullptr;     // [HIDDEN] residual, symmetric — REPLICATED on every PE (NOT reduced)
   float* delta_sym = nullptr;  // [HIDDEN] this PE's PARTIAL projection (O-proj / MoE), symmetric;
                                //          all-reduced (sum of 8 disjoint partials) then added to h_sym
-  float* ar_recv= nullptr;     // [HIDDEN] all-reduce scratch, symmetric
+  float* ar_recv= nullptr;     // [npes*HIDDEN] all-reduce scratch, symmetric (one-shot: a slot per PE)
+  // NVLS (in-switch multimem) all-reduce: delta_mc is the MULTICAST view of delta_sym — a multimem
+  // ld_reduce on it returns the SUM across all PEs in one switch op.  bar_flag is a symmetric u32 the
+  // multimem flag-barrier increments (cross-PE arrival count); bar_flag_mc its multicast view.
+  float*    delta_mc   = nullptr;  // multicast VA of delta_sym (NULL if NVLS unavailable)
+  unsigned* bar_flag   = nullptr;  // [1] symmetric barrier counter
+  unsigned* bar_flag_mc= nullptr;  // multicast VA of bar_flag
 
   // staged-activation scratch in plain HBM (per-PE local; produced+consumed within a layer)
   float* y_norm = nullptr;     // [HIDDEN] staged normed activation (K1 / K4 input)
@@ -203,7 +349,11 @@ struct MegaState {
   float* logit_max = nullptr;  int* logit_arg = nullptr; // [grid blocks] per-CTA partial argmax
 
   int mype = 0, npes = 0;
+  int ar_mode = 0;   // 0=recdouble, 1=one-shot, 2=skip, 3=NVLS multimem (MK_ONESHOT env)
 };
+
+// device-side generation counter for the NVLS multimem flag-barrier (one all-reduce = one generation).
+__device__ unsigned g_nvls_gen = 0;
 
 // ================================================================================================
 // IN-KERNEL recursive-doubling all-reduce(SUM) over the resident grid + 8 PEs.
@@ -236,6 +386,80 @@ static __device__ void mk_allreduce_recd(float* __restrict__ acc, float* __restr
   }
   // Make the reduced `acc` visible to ALL of this PE's CTAs for the next stage.
   grid.sync();
+}
+
+// ================================================================================================
+// IN-KERNEL ONE-SHOT all-reduce(SUM) — 1 barrier instead of recursive-doubling's 6.
+// -------------------------------------------------------------------------------------------------
+// Each PE puts its full [n] partial into ITS OWN slot (recv + mype*n) on every peer, then ONE
+// all-PE barrier, then EVERY CTA on this PE grid-strides the npes slots and sums them locally.
+// vs recursive-doubling (3 rounds x 2 barriers = 6 barriers): one-shot is 1 barrier — and the
+// local reduction is spread across the WHOLE resident grid, not serialized on block 0.  This is the
+// nvshmem_comms.cu a2a_put idiom (measured 17us isolated) folded into the persistent kernel.
+// `recv` must be symmetric [npes*n].  P2P NVLink puts (npes-1 per PE) overlap the barrier handshake.
+// ================================================================================================
+static __device__ void mk_allreduce_oneshot(float* __restrict__ acc, float* __restrict__ recv,
+                                             int n, int mype, int npes, cg::grid_group& grid) {
+  grid.sync();                                            // every CTA finished writing `acc`
+  if (blockIdx.x == 0) {
+    const int tid = threadIdx.x, nthr = blockDim.x;
+    float* myslot = recv + (size_t)mype * n;
+    for (int j = 0; j < npes; ++j) {
+      if (j == mype) { for (int i = tid; i < n; i += nthr) myslot[i] = acc[i]; }
+      else           { nvshmemx_float_put_block(recv + (size_t)mype * n, acc, n, j); }
+    }
+    nvshmem_fence();
+    nvshmemx_barrier_all_block();                         // ONE barrier: all peers' slots delivered
+  }
+  grid.sync();                                            // block 0's barrier done -> recv populated for all CTAs
+  // ALL CTAs sum the npes slots (grid-strided) — the reduction is parallel across the resident grid.
+  const int g = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
+  for (int i = g; i < n; i += stride) {
+    float s = 0.f;
+    #pragma unroll 1
+    for (int p = 0; p < npes; ++p) s += recv[(size_t)p * n + i];
+    acc[i] = s;
+  }
+  grid.sync();                                            // reduced `acc` visible to next stage
+}
+
+// ================================================================================================
+// IN-KERNEL NVLS (in-switch multimem) all-reduce — the FAST path (standalone-measured 5.2us correct).
+// -------------------------------------------------------------------------------------------------
+// `acc_mc` is the MULTICAST view of the symmetric partial `acc`.  Each element is reduced by EXACTLY
+// ONE PE (partition [pe*chunk,(pe+1)*chunk)) so the in-switch sum isn't double-counted; multimem.st
+// broadcasts the result to ALL PEs.  A multimem flag-barrier (add to a multicast counter, spin until
+// the global arrival sum hits npes*gen) replaces the nvshmem barrier — no host round-trip.  The two
+// grid.sync()s order this PE's CTAs (all partials written before reduce; result visible after).
+// ================================================================================================
+static __device__ void mk_allreduce_nvls(float* __restrict__ acc_mc,
+                                          unsigned* __restrict__ flag_mc,
+                                          int n, int mype, int npes, cg::grid_group& grid) {
+  grid.sync();                                            // every CTA finished writing the partial `acc`
+  // partition: this PE reduces+broadcasts elements [lo,hi), 4-float (128-bit) multimem ops.
+  const int chunk = ((n / 4) + npes - 1) / npes * 4;
+  const int lo = mype * chunk, hi = min(n, lo + chunk);
+  const int g = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
+  for (int i = lo + g * 4; i < hi; i += stride * 4) {
+    float a,b,c,d;
+    asm volatile("multimem.ld_reduce.global.add.v4.f32 {%0,%1,%2,%3}, [%4];"
+                 : "=f"(a),"=f"(b),"=f"(c),"=f"(d) : "l"(acc_mc + i) : "memory");
+    asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};"
+                 :: "l"(acc_mc + i),"f"(a),"f"(b),"f"(c),"f"(d) : "memory");
+  }
+  grid.sync();                                            // this PE's slice fully written by all its CTAs
+  // cross-PE multimem flag-barrier: one thread/PE arrives, all spin until every PE delivered its slice.
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    g_nvls_gen++;
+    unsigned target = g_nvls_gen * (unsigned)npes;
+    __threadfence_system();
+    asm volatile("multimem.red.global.add.u32 [%0], 1;" :: "l"(flag_mc) : "memory");
+    unsigned got = 0;
+    do {
+      asm volatile("multimem.ld_reduce.global.add.u32 %0, [%1];" : "=r"(got) : "l"(flag_mc) : "memory");
+    } while (got < target);
+  }
+  grid.sync();                                            // all PEs' slices visible to every CTA
 }
 
 // Grid-strided zero of a symmetric [n] buffer across ALL of this PE's CTAs (caller fences with grid.sync).
@@ -273,6 +497,7 @@ static __device__ void mk_rmsnorm(const float* __restrict__ h, const float* __re
   __syncthreads();
   const float rinv = rinv_sh;
   for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) y_out[i] = h[i] * rinv * w[i];
+  __syncthreads();   // CTA-local: each CTA wrote the FULL y_out and reads only its own writes downstream
 }
 
 // ================================================================================================
@@ -285,10 +510,14 @@ static __device__ void mk_qkv_gemv(const MegaState& S) {
   const int lane  = threadIdx.x & 31;
   const int gwarp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int nwarp = (gridDim.x * blockDim.x) >> 5;
-  // This PE owns QKV_ROWS_PE consecutive QKV output rows (its TP slice); warp-per-row grid-stride.
-  for (int o = gwarp; o < QKV_ROWS_PE; o += nwarp) {
-    float r = mk_warp_dot(S.Wqkv + (size_t)o * HIDDEN, ys, HIDDEN, lane);
-    if (lane == 0) S.proj[o] = r * S.Wqkv_scale[o];
+  // This PE owns QKV_ROWS_PE rows; MK_R rows/warp for memory-level parallelism (B=1 latency-bound).
+  for (int o4 = gwarp; o4 < QKV_ROWS_PE / MK_R; o4 += nwarp) {
+    const int o = o4 * MK_R;
+    float out[MK_R];
+    mk_warp_dot_R<MK_R>(S.Wqkv + (size_t)o * HIDDEN, HIDDEN, ys, HIDDEN, lane, out);
+    if (lane == 0)
+      #pragma unroll
+      for (int r = 0; r < MK_R; ++r) S.proj[o + r] = out[r] * S.Wqkv_scale[o + r];
   }
 }
 
@@ -449,9 +678,13 @@ static __device__ void mk_oproj_partial(const MegaState& S, float* __restrict__ 
   // PE does NOT own stay 0 and the sum is a gather (NOT a multiply of a replicated residual — the v1
   // bug, where partials were atomicAdded onto the already-replicated h_sym and then summed x8).
   const int row_base = S.mype * OROWS_PE;
-  for (int o = gwarp; o < OROWS_PE; o += nwarp) {
-    float acc = mk_warp_dot(S.Wo + (size_t)o * Q_DIM, xs_q, Q_DIM, lane);
-    if (lane == 0) S.delta_sym[row_base + o] = acc * S.Wo_scale[o];
+  for (int o4 = gwarp; o4 < OROWS_PE / MK_R; o4 += nwarp) {
+    const int o = o4 * MK_R;
+    float out[MK_R];
+    mk_warp_dot_R<MK_R>(S.Wo + (size_t)o * Q_DIM, Q_DIM, xs_q, Q_DIM, lane, out);
+    if (lane == 0)
+      #pragma unroll
+      for (int r = 0; r < MK_R; ++r) S.delta_sym[row_base + o + r] = out[r] * S.Wo_scale[o + r];
   }
 }
 
@@ -503,45 +736,51 @@ static __device__ void mk_router(const MegaState& S, float* __restrict__ logits 
 // One PE handles EXP_PER_PE active-expert slots; warp-per-output-row, grid-stride.  y_norm is the
 // post-RMSNorm activation (same one the router scored), staged in shared memory per CTA.
 // ================================================================================================
-static __device__ void mk_expert_gateup(const MegaState& S, float* __restrict__ ys /*smem [HIDDEN]*/) {
+static __device__ void mk_expert_gateup(const MegaState& S, float* __restrict__ ys /*smem [HIDDEN]+ring*/) {
   for (int k = threadIdx.x; k < HIDDEN; k += blockDim.x) ys[k] = S.y_norm[k];
   __syncthreads();
   const int lane  = threadIdx.x & 31;
   const int gwarp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int nwarp = (gridDim.x * blockDim.x) >> 5;
-  const int total = EXP_PER_PE * MOE_INTER;
+  const int total = EXP_PER_PE * (MOE_INTER / MK_R);
   for (int item = gwarp; item < total; item += nwarp) {
-    const int slot = item / MOE_INTER;
-    const int j    = item - slot * MOE_INTER;
+    const int slot = item / (MOE_INTER / MK_R);
+    const int j    = (item - slot * (MOE_INTER / MK_R)) * MK_R;
     const fp8*   W = S.Wgu  + (size_t)slot * (2 * MOE_INTER) * HIDDEN;
     const float* Sc= S.Wgu_scale + (size_t)slot * (2 * MOE_INTER);
-    float g = mk_warp_dot(W + (size_t)j * HIDDEN,               ys, HIDDEN, lane);
-    float u = mk_warp_dot(W + (size_t)(MOE_INTER + j) * HIDDEN, ys, HIDDEN, lane);
+    float g[MK_R], u[MK_R];
+    mk_warp_dot_R<MK_R>(W + (size_t)j * HIDDEN,               HIDDEN, ys, HIDDEN, lane, g);
+    mk_warp_dot_R<MK_R>(W + (size_t)(MOE_INTER + j) * HIDDEN, HIDDEN, ys, HIDDEN, lane, u);
     if (lane == 0)
-      S.a_glb[(size_t)slot * MOE_INTER + j] = mk_silu(g * Sc[j]) * (u * Sc[MOE_INTER + j]);
+      #pragma unroll
+      for (int r = 0; r < MK_R; ++r)
+        S.a_glb[(size_t)slot * MOE_INTER + j + r] = mk_silu(g[r] * Sc[j + r]) * (u[r] * Sc[MOE_INTER + j + r]);
   }
 }
 
-static __device__ void mk_expert_down(const MegaState& S, float* __restrict__ as /*smem [EXP_PER_PE*MOE_INTER]*/) {
+static __device__ void mk_expert_down(const MegaState& S, float* __restrict__ as /*smem [EXP*MOE_INTER]+ring*/) {
   const int na = EXP_PER_PE * MOE_INTER;
   for (int i = threadIdx.x; i < na; i += blockDim.x) as[i] = S.a_glb[i];
   __syncthreads();
   const int lane  = threadIdx.x & 31;
   const int gwarp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int nwarp = (gridDim.x * blockDim.x) >> 5;
-  const int total = EXP_PER_PE * HIDDEN;
+  const int total = EXP_PER_PE * (HIDDEN / MK_R);
   // EP down-proj: this PE owns EXP_PER_PE expert slots, each contributing to ALL HIDDEN channels, so
   // this is a genuine SUM of partials across PEs (unlike O-proj's disjoint rows).  Write the partial
   // into delta_sym (which the O-proj all-reduce already drained back to 0); the second all-reduce(SUM)
   // combines the 8 PEs' expert contributions.  atomicAdd handles EXP_PER_PE>1 slots on this PE.
   for (int item = gwarp; item < total; item += nwarp) {
-    const int slot = item / HIDDEN;
-    const int o    = item - slot * HIDDEN;
+    const int slot = item / (HIDDEN / MK_R);
+    const int o    = (item - slot * (HIDDEN / MK_R)) * MK_R;
     const float gw = S.sel_w[slot];                       // routed weight for this PE's slot
     const fp8*   W = S.Wd + (size_t)slot * HIDDEN * MOE_INTER;
     const float* Sc= S.Wd_scale + (size_t)slot * HIDDEN;
-    float d = mk_warp_dot(W + (size_t)o * MOE_INTER, as + (size_t)slot * MOE_INTER, MOE_INTER, lane);
-    if (lane == 0) atomicAdd(&S.delta_sym[o], gw * d * Sc[o]);  // EP partial; all-reduce sums across PEs
+    float d[MK_R];
+    mk_warp_dot_R<MK_R>(W + (size_t)o * MOE_INTER, MOE_INTER, as + (size_t)slot * MOE_INTER, MOE_INTER, lane, d);
+    if (lane == 0)
+      #pragma unroll
+      for (int r = 0; r < MK_R; ++r) atomicAdd(&S.delta_sym[o + r], gw * d[r] * Sc[o + r]);
   }
 }
 
@@ -552,6 +791,9 @@ static __device__ void mk_expert_down(const MegaState& S, float* __restrict__ as
 // ================================================================================================
 extern "C" __global__ void megakernel_decode(MegaState S, int n_layers) {
   cg::grid_group grid = cg::this_grid();
+  const bool use_oneshot = (S.ar_mode == 1);   // 0=recdouble(6 barriers), 1=one-shot(1 barrier), 2=skip, 3=NVLS
+  const bool skip_ar     = (S.ar_mode == 2);   // isolate grid.sync+compute (NO nvshmem barriers)
+  const bool use_nvls    = (S.ar_mode == 3);   // in-switch multimem AR (5.2us standalone)
 
   // Dynamic shared memory shared by the stages that need a staged activation (sized to the max:
   // Q_DIM floats for the O-proj stage).  Stages that need less just use the prefix.
@@ -560,8 +802,8 @@ extern "C" __global__ void megakernel_decode(MegaState S, int n_layers) {
 
   for (int layer = 0; layer < n_layers; ++layer) {
     // ---- K1: input RMSNorm -> y_norm, then QKV GEMV (this PE's slice) ----
-    mk_rmsnorm(S.h_sym, S.w_in_norm, S.y_norm);
-    grid.sync();                                          // y_norm fully written before the GEMV reads
+    mk_rmsnorm(S.h_sym, S.w_in_norm, S.y_norm);           // ends w/ __syncthreads (CTA-local full y_norm)
+    if (!use_nvls) grid.sync();                           // recdouble needs grid lockstep; NVLS does not
     mk_qkv_gemv(S);
     grid.sync();                                          // proj fully written before the epilogue
     mk_q_norm_rope(S);
@@ -578,13 +820,16 @@ extern "C" __global__ void megakernel_decode(MegaState S, int n_layers) {
     grid.sync();
     mk_oproj_partial(S, xs_q);
     // ---- AR1: IN-KERNEL all-reduce(SUM) of the PARTIAL (the TP comm) -> full O-proj output everywhere ----
-    mk_allreduce_recd(S.delta_sym, S.ar_recv, HIDDEN, S.mype, S.npes, grid);
+    if      (skip_ar)     grid.sync();   // keep the 2 grid barriers, skip the nvshmem barriers (decomposition)
+    else if (use_nvls)    mk_allreduce_nvls   (S.delta_mc, S.bar_flag_mc, HIDDEN, S.mype, S.npes, grid);
+    else if (use_oneshot) mk_allreduce_oneshot(S.delta_sym, S.ar_recv, HIDDEN, S.mype, S.npes, grid);
+    else                  mk_allreduce_recd   (S.delta_sym, S.ar_recv, HIDDEN, S.mype, S.npes, grid);
     mk_add_into(S.h_sym, S.delta_sym, HIDDEN);            // residual += reduced O-proj partial (added ONCE)
     grid.sync();
 
     // ---- K4: router (post-RMSNorm staged into y_norm, then gate+top8) ----
-    mk_rmsnorm(S.h_sym, S.w_post_norm, S.y_norm);
-    grid.sync();
+    mk_rmsnorm(S.h_sym, S.w_post_norm, S.y_norm);         // ends w/ __syncthreads (CTA-local full y_norm)
+    if (!use_nvls) grid.sync();
     mk_router(S, xs_q /*reused as [N_EXPERTS] logits scratch in smem prefix*/);
     grid.sync();                                          // sel_idx/sel_w published
 
@@ -595,7 +840,10 @@ extern "C" __global__ void megakernel_decode(MegaState S, int n_layers) {
     grid.sync();                                          // a_glb ready
     mk_expert_down(S, xs_q /*[EXP_PER_PE*MOE_INTER] staged a*/);
     // ---- AR2: SECOND in-kernel all-reduce(SUM) (the EP combine: sum of per-PE expert partials) ----
-    mk_allreduce_recd(S.delta_sym, S.ar_recv, HIDDEN, S.mype, S.npes, grid);
+    if      (skip_ar)     grid.sync();
+    else if (use_nvls)    mk_allreduce_nvls   (S.delta_mc, S.bar_flag_mc, HIDDEN, S.mype, S.npes, grid);
+    else if (use_oneshot) mk_allreduce_oneshot(S.delta_sym, S.ar_recv, HIDDEN, S.mype, S.npes, grid);
+    else                  mk_allreduce_recd   (S.delta_sym, S.ar_recv, HIDDEN, S.mype, S.npes, grid);
     mk_add_into(S.h_sym, S.delta_sym, HIDDEN);            // residual += reduced MoE partial (added ONCE)
     grid.sync();
   }
@@ -692,13 +940,27 @@ int main(int argc, char** argv) {
 
   // ---- allocate the resident state (ONE layer's dummy weights; reused — latency proxy) ----------
   MegaState S{}; S.mype = mype; S.npes = npes; S.ctx_len = ctx_len;
+  S.ar_mode = getenv("MK_ONESHOT") ? atoi(getenv("MK_ONESHOT")) : 0;
+  if (mype == 0) {
+    const char* nm = S.ar_mode==3 ? "NVLS multimem (in-switch)" : S.ar_mode==2 ? "SKIP (decomp)"
+                   : S.ar_mode==1 ? "ONE-SHOT (1 barrier)" : "recursive-doubling (6 barriers)";
+    printf("all-reduce mode: %s\n", nm);
+  }
   S.n_splits = 64; { int mbc = (ctx_len + 31) / 32; if (S.n_splits > mbc) S.n_splits = mbc; if (S.n_splits < 1) S.n_splits = 1; }
 
   // symmetric heap: residual + partial-delta + all-reduce scratch (must be symmetric for the in-kernel put).
   S.h_sym     = (float*)nvshmem_malloc(sizeof(float) * HIDDEN);
   S.delta_sym = (float*)nvshmem_malloc(sizeof(float) * HIDDEN);
-  S.ar_recv   = (float*)nvshmem_malloc(sizeof(float) * HIDDEN);
-  if (!S.h_sym || !S.delta_sym || !S.ar_recv) { printf("PE %d: nvshmem_malloc failed\n", mype); nvshmem_global_exit(2); }
+  S.ar_recv   = (float*)nvshmem_malloc(sizeof(float) * (size_t)npes * HIDDEN);
+  S.bar_flag  = (unsigned*)nvshmem_malloc(sizeof(unsigned));
+  if (!S.h_sym || !S.delta_sym || !S.ar_recv || !S.bar_flag) { printf("PE %d: nvshmem_malloc failed\n", mype); nvshmem_global_exit(2); }
+  CK(cudaMemset(S.bar_flag, 0, sizeof(unsigned)));
+  // NVLS multicast views (NULL if the system has no NVSwitch multicast).  Used only when ar_mode==3.
+  S.delta_mc    = (float*)   nvshmemx_mc_ptr(NVSHMEM_TEAM_WORLD, S.delta_sym);
+  S.bar_flag_mc = (unsigned*)nvshmemx_mc_ptr(NVSHMEM_TEAM_WORLD, S.bar_flag);
+  if (mype == 0)
+    printf("NVLS multicast: delta_mc=%p bar_flag_mc=%p (%s)\n", (void*)S.delta_mc, (void*)S.bar_flag_mc,
+           (S.delta_mc && S.bar_flag_mc) ? "AVAILABLE" : "UNAVAILABLE — ar_mode=3 will fail");
 
   // plain HBM scratch / weights.
   CK(cudaMalloc(&S.y_norm, HIDDEN * sizeof(float)));
@@ -757,13 +1019,28 @@ int main(int argc, char** argv) {
   // Query the max blocks/SM for this kernel at our block size + dynamic smem, then cap the grid to
   // (blocks/SM * #SMs).  Dynamic smem = Q_DIM floats (the O-proj stage's staged activation).
   const int block = 256;
-  const size_t smem = (size_t)Q_DIM * sizeof(float);     // 32 KB
+  const int nwarps_blk = block >> 5;
+  // smem must hold the largest [staged-activation + per-warp cp.async rings] of any stage:
+  //   O-proj:       Q_DIM floats (no ring — still naive)        = 8192
+  //   expert gate/up: HIDDEN + nwarps*MK_RING_FLOATS (cp.async ring)
+  //   expert down:    EXP_PER_PE*MOE_INTER + nwarps*MK_RING_FLOATS
+  const size_t ring_f = (size_t)nwarps_blk * MK_RING_FLOATS;
+  size_t smem_f = (size_t)Q_DIM;
+  smem_f = max(smem_f, (size_t)HIDDEN + ring_f);
+  smem_f = max(smem_f, (size_t)EXP_PER_PE * MOE_INTER + ring_f);
+  const size_t smem = smem_f * sizeof(float);
   CK(cudaFuncSetAttribute(megakernel_decode, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
   int blocks_per_sm = 0;
   CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, megakernel_decode, block, smem));
   if (blocks_per_sm < 1) blocks_per_sm = 1;
   int grid_blocks = blocks_per_sm * prop.multiProcessorCount;
   if (grid_blocks < 1) grid_blocks = prop.multiProcessorCount;
+  // Override blocks/SM to test the grid.sync()-cost-vs-occupancy tradeoff: a cooperative grid barrier
+  // gets cheaper with fewer resident blocks, but the GEMVs lose parallelism.  MK_BPSM env sweeps it.
+  if (getenv("MK_BPSM")) {
+    int bp = atoi(getenv("MK_BPSM"));
+    if (bp >= 1 && bp <= blocks_per_sm) { blocks_per_sm = bp; grid_blocks = bp * prop.multiProcessorCount; }
+  }
 
   // per-CTA argmax partials (one entry per resident block).
   CK(cudaMalloc(&S.logit_max, grid_blocks * sizeof(float)));
@@ -889,16 +1166,16 @@ int main(int argc, char** argv) {
   // ---- teardown (best-effort) ----
   nvshmem_barrier_all();
   CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
-  nvshmem_free(S.h_sym); nvshmem_free(S.delta_sym); nvshmem_free(S.ar_recv);
+  nvshmem_free(S.h_sym); nvshmem_free(S.delta_sym); nvshmem_free(S.ar_recv); nvshmem_free(S.bar_flag);
   CK(cudaStreamDestroy(s));
   nvshmem_finalize();
   return 0;
 }
 
 // ================================================================================================
-// Standalone correctness proof for the in-kernel all-reduce primitive (same recursive-doubling path
-// the megakernel uses).  ONE block; uses the device-side put/barrier idiom directly (no grid sync
-// needed for a single block).  Launched via nvshmemx_collective_launch from the correctness section.
+// Standalone correctness proof for the in-kernel all-reduce primitive (same ONE-SHOT put+barrier path
+// the megakernel's mk_allreduce_oneshot uses).  ONE block; the device-side put/barrier + local sum
+// idiom directly (no grid sync needed for a single block).  Launched via nvshmemx_collective_launch.
 // ================================================================================================
 __global__ void mk_ar_proof(float* acc, float* recv, int n, int mype, int npes) {
   const int tid = threadIdx.x, nthr = blockDim.x;

@@ -14,9 +14,19 @@ physically impossible:
 3. **~Zero overhead** — the **~7 ms** of launch/host/scheduler/sub-roofline must go to ~0. **Non-negotiable.**
 
 `0.78 (fp8) + 0.19 (NVLS) + ~0 (overhead) = 0.97 ms → ~1033 tok/s.` That's the whole budget. There is **no slack
-for the current floor.** The one mechanism that delivers all three at once is the **persistent megakernel**
-(`megakernel-b1.md`): fp8 weights streamed + dequant fused (free) + device-side NVLS all-reduce in-kernel +
-no launches/host = zero overhead. **The megakernel is the linchpin of 1000 tok/s.**
+for the current floor.**
+
+**The good news — you do NOT need a whole new megakernel engine.** All three are deliverable by **two
+standalone, isolation-testable kernels + CUDA graphs + a scheduler-free loop:**
+1. **fp8 K5 at e→1** — the weight at roofline (0.78 ms; e=0.46 today gives 1.7 ms, so it *must* be tuned —
+   `k5-tuning-roadmap.md`). Fused dequant.
+2. **the NVLS all-reduce kernel** — C ≤ ~4 µs (`kernels/nvls_allreduce.cu`).
+3. **CUDA graphs** capture both into one launch/step (launch overhead → 0), and a **scheduler-free B=1 loop**
+   (`b1-fast-path-design.md`) drives host → 0.
+The persistent megakernel's *only* extra over this is keeping the activation on-chip between layers — which at
+fp8 is **0.06 µs/token, negligible**. So the persistent megakernel is the clean ~5–10% finish, **not the gate.**
+**The make-or-break is the NVLS all-reduce kernel** (its single number C decides everything); fp8-K5-at-e→1 is
+the necessary partner. Two kernels, both testable in isolation today, both graph-captured — that's the linchpin.
 
 ## The budget, term by term (what it is, what it must be, what gets it there)
 | term | now (bf16-TP8) | must be for 1000 | what gets it there | proven? |

@@ -59,17 +59,24 @@ layer boundaries; the 8 KB activation stays in registers/smem between layers (`m
 - **int4 experts** (0.39 ms weight) → ~2000; **adaptive-top-k** (4 experts) → more margin — both quality-gated.
 - **depth reduction** — the most leveraged lossy knob (fewer layers cut weight AND the 188 count together).
 
-## The honest risk assessment
-- **Stage 3 (NVLS) is the make-or-break.** If the box's multimem in-switch reduce hits ~1 µs, 1000 is lossless
-  and tight (3% margin). If it floors at ~4 µs, comms is 0.75 ms and **1000 needs a lossy lever** (depth/int4).
-  Test this kernel *first and in isolation* — it gates everything.
-- **vLLM tops out ~400–600** (Stages 0–2 + a graph-captured NVLS): graphs leave a host residual and can't host a
-  whole-model persistent kernel. **The 600→1000 leap is Stages 4–5 in the cudarc engine — that's the real ask.**
+## The honest risk assessment (and why Stage 5 is NOT the gate)
+- **Stage 3 (NVLS) is the make-or-break.** If the box's multimem in-switch reduce hits ~2–3 µs, 1000 is lossless
+  (with small-tree spec). If it floors at ~4 µs, 1000 needs stale-TP (LOOP-C) to hide it or a lossy lever
+  (depth/int4). Test this kernel *first and in isolation* — it gates everything.
+- **The persistent megakernel (Stage 5) is OPTIONAL.** Its only gain over Stages 2–4 is keeping the activation
+  on-chip between layers — **0.06 µs/token at fp8, negligible.** CUDA graphs already fold the per-layer kernels
+  (incl. the Stage-3 NVLS kernel) into one launch/step, and the Stage-4 scheduler-free loop drives host→0. So
+  **1000 is reachable as: graphs(fp8-K5-at-e→1 + NVLS-AR) + scheduler-free loop + small-tree spec** — two custom
+  kernels integrated as vLLM custom ops, **not a whole new engine.** Stage 5 is the clean ~5–10% finish.
+- **So the real ask is TWO isolation-testable kernels**, not a megakernel rewrite: **fp8-K5 at e→1** (Stage 2 —
+  e=0.46→~1.0, the weight at roofline) and the **NVLS all-reduce** (Stage 3 — C≤~4 µs). Both graph-captured.
+  vLLM gets ~300 on flags (Stage 0); the 300→1000 leap is these two kernels + the fast-path, integratable into
+  vLLM (custom ops) — the cudarc engine is a *parallel* clean path, not a prerequisite.
 - **Order discipline:** spec + prefix-cache now (bank 3.5×); fp8 only *with* the floor work; NVLS kernel is the
-  pivot; the megakernel is the finish. Don't chase fp8/int4/adaptive-k while the floor is up — they're invisible
-  or negative there (proven twice: `ab_adaptive`, Alyssa's fp8).
+  pivot; the persistent megakernel is an optional polish. Don't chase fp8/int4/adaptive-k while the floor is up
+  — invisible or negative there (proven twice: `ab_adaptive`, Alyssa's fp8).
 
 ## One line
-Five stages: bank spec (~300) → `E-attr` → fp8+fused-dequant → **the NVLS all-reduce kernel (the crux, test it
-in isolation first)** → scheduler-free loop → persistent megakernel = ~1.0 ms. vLLM gets ~half; the cudarc
-megakernel is the 600→1000 finish.
+**1000 = two isolation-testable, graph-captured kernels (fp8-K5 at e→1, and the NVLS all-reduce ≤4 µs) +
+CUDA graphs + a scheduler-free loop + small-tree spec.** Bank spec ~300 now; the NVLS kernel is the make-or-break
+pivot; the persistent megakernel is a negligible (0.06 µs) polish, not the gate. No new engine required.

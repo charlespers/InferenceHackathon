@@ -10,7 +10,7 @@
 set -u
 KV="${1:?usage: kv_ab.sh {auto|fp8} [port]}"
 PORT="${2:-8088}"
-REPO=/alloc/data/InferenceHackathon
+REPO="${REPO:-/alloc/data/InferenceHackathon}"   # override to an isolated worktree
 MODEL="Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"   # FP8 weights (HF-cached)
 SERVED=qwen3
 OUT="$REPO/results/kv_fp8/$KV"

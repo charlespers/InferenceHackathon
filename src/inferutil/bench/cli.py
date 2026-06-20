@@ -26,7 +26,7 @@ from .attribution import diagnose
 from .levers import recommend
 from .manifest import build_manifest
 from .sweep import depth_sweep, config_sweep, quant_grid, layout_grid, full_grid
-from .gate import Thresholds, evaluate
+from .gate import Thresholds, evaluate, regression_gate
 
 DEFAULT_RESULTS_DIR = "results"
 
@@ -117,12 +117,19 @@ def _cmd_gate(args) -> None:
     rec = _resolve(args)
     th = Thresholds(min_decode_tok_per_s=args.min_tok_s, max_ttft_s=args.max_ttft_s,
                     min_pct_of_floor=args.min_pct_floor, min_quality_match=args.min_quality)
-    g = evaluate(rec.result, th)
-    if g.passed:
+    failures = list(evaluate(rec.result, th).failures)
+    if args.baseline:
+        base_path = os.path.join(args.results_dir, args.name, args.baseline + ".json")
+        try:
+            base = load_run(base_path)
+        except FileNotFoundError:
+            raise SystemExit(f"no baseline run '{args.baseline}' for '{args.name}'")
+        failures += list(regression_gate(base.result, rec.result).failures)
+    if not failures:
         print(f"GATE PASS  [{rec.runid}] {rec.config.name}")
     else:
         print(f"GATE FAIL  [{rec.runid}] {rec.config.name}")
-        for f in g.failures:
+        for f in failures:
             print(f"  - {f}")
         raise SystemExit(1)
 
@@ -229,6 +236,8 @@ def main(argv=None) -> None:
     gp.add_argument("--max-ttft-s", type=float, default=None)
     gp.add_argument("--min-pct-floor", type=float, default=None)
     gp.add_argument("--min-quality", type=float, default=None)
+    gp.add_argument("--baseline", default=None,
+                    help="runid to compare against; fails on a significant throughput regression")
     gp.set_defaults(func=_cmd_gate)
 
     dp = sub.add_parser("diagnose",

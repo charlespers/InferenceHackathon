@@ -57,15 +57,17 @@ echo "armed $(date -u) — stale-TP probe waiting for the FIRST genuinely-idle w
 # Require a 2-cycle confirm so we don't race a job that's mid-teardown. Capped wait.
 WAITED=0; idle_streak=0
 while :; do
-  free=$(freemin); busy=0
-  pgrep -f 'vllm.entrypoints|vllm serve' >/dev/null 2>&1 && busy=1
-  if [ "$busy" -eq 0 ] && [ "$free" -gt 65000 ] && [ ! -d /alloc/data/gpu.lock ]; then
+  free=$(freemin)
+  # Arbiters: the atomic lock (any launching loop holds it) + GPU free (a loaded model
+  # uses >14GB, so free>65GB means no model resident). Deliberately NO pgrep on a 'vllm'
+  # string -- that self-matches diagnostic shells containing the word and never converges.
+  if [ "$free" -gt 65000 ] && [ ! -d /alloc/data/gpu.lock ]; then
     idle_streak=$((idle_streak + 1))
   else
     idle_streak=0
   fi
   if [ "$idle_streak" -ge 2 ]; then
-    echo "IDLE window confirmed $(date -u) (free=${free}MB, no active vLLM, lock-free)" >> "$LOG"; break
+    echo "IDLE window confirmed $(date -u) (free=${free}MB, lock-free x2)" >> "$LOG"; break
   fi
   WAITED=$((WAITED + 20))
   if [ "$WAITED" -ge 5700 ]; then echo "no idle window in 95min — giving up $(date -u)" >> "$LOG"; exit 0; fi

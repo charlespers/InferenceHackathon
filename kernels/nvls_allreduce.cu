@@ -1,7 +1,20 @@
 // nvls_allreduce.cu — multimem (NVLS / NVLink-SHARP in-switch) all-reduce for the B=1 8KB payload.
 // THE make-or-break kernel for 1000 tok/s (docs/megakernel-build-plan.md Stage 3, docs/path-to-1000.md):
-// gets the per-collective latency C from ~16us (NCCL ring) toward ~1-4us (one in-switch reduce), which is what
-// makes the 188 serial all-reduces fit the 1.0ms budget (and what makes LOOP-C's stale-TP overlap viable).
+// gets the per-collective latency C from ~16us (NCCL ring) toward ~1-4us (one in-switch reduce).
+//
+// WHY C<=~4us MATTERS (the dual role, results-reaction-05.md): the comms can't be *faked* (stale/predicted-TP
+// MEASURED DEAD — info barrier) but it CAN be HIDDEN losslessly via LOOP-C's exact DEFERRED-OVERLAP: overlap this
+// EXACT reduce with the next op's HBM weight stream (NVLink vs HBM = different HW paths). The per-collective
+// weight cover is ~4.3us at fp8 (AR-A overlaps the routed MoE gate/up read; AR-M overlaps the next QKV read).
+// So at C<=~4us this reduce is FULLY hidden -> comms->0 -> ~roofline (~1218), LOSSLESS. At 16us it's partial
+// (~half) -> ~938 with spec. => This kernel's C decides FULL vs PARTIAL lossless comms-hiding.
+//
+// DEFERRED-OVERLAP INTEGRATION (kernel feature, LOOP-C's schedule + my kernel; megakernel-b1.md K6):
+//   In the persistent megakernel, run THIS reduce on a few SMs (multimem needs only ~2-8 SMs for 8KB) while the
+//   REMAINING SMs cp.async-stream the next op's weights (per the schedule: post-attn AR-A || MoE gate/up load;
+//   post-MoE AR-M || next-layer QKV load). The dependent multiply waits on the reduced activation, then runs on
+//   already-resident weights. So the standalone reduce below is ALSO the overlap primitive — keep its SM
+//   footprint small so it co-resides with the weight-stream warps.
 //
 // STATUS: starting skeleton to COMPILE + TUNE + VALIDATE on the 8xH100 box (like K5 began). The multimem PTX +
 // the CU multicast setup are the essential structure; the TODOs are the box-specific bits to verify. Test this

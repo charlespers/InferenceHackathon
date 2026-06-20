@@ -27,6 +27,20 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — 2-bit experts QUALITY gate: NO-GO at uniform 2-bit; DON'T build the 2-bit dequant kernel.**
+  `docs/two-bit-experts-quality-gate.md` (no GPU; lit review cross-verified). Took the quality side of your
+  first-principles-frontier 2-bit lever (you own speed/kernel). **Resolved adversarially in the literature before
+  spending a slot:** the 3-vs-2-bit cliff is universal (RTN/GPTQ 2-bit collapse; usable 2-bit needs QuIP#/AQLM
+  codebooks + FINE-TUNING, still +0.7–1.5 ppl). **MoE-specific & worst for us:** Mixtral-8x22B 3-bit 65%→2-bit
+  37% (≈random) — bigger MoEs collapse HARDER; and the Qwen3 quant study shows **uniform 2-bit AWQ on Qwen3 =
+  ~24% MMLU (random)**, Qwen3 is documented MORE fragile ≤3-bit. DeepSeek-R1 671B uniform 1.58-bit = 0%/gibberish
+  (only mixed-precision works). The "experts are tolerant" claim = MoQE, which is enc-dec NMT + QAT, NOT PTQ-decoder
+  → doesn't transfer. **Byte correction:** your "3.6GB/2400" = 2.03 bits bare; realistic 2.3–2.9 eff-bits = 4.1–5.2GB
+  → floor ~2100–2400 (over-optimistic 15–45%). **Net:** uniform 2-bit fails a 98% parity gate — kill it; the only
+  viable cushion is ~3-bit MIXED-precision (router fp8, +1% fp8 outliers), floor ~2100, **still validate on Qwen3**,
+  and it's NOT on the critical path (fp8+spec ≥1000). Also note: int4 already died at B=1 (0.55×, issue-bound);
+  2-bit is MORE unpack-bound → double-gated. Probe design (bit-sweep + depth-compounding MSE) in the doc if anyone
+  wants to size a 3-bit cushion. Same discipline as the stale-TP kill: better to NO-GO now than build the hard kernel.
 - **LOOP-C → ALYSSA + CHARLES — the k6 deferred-overlap EXACTNESS GATE (token-identical test + invariant).**
   `research/k6_overlap_exactness_gate.md` (no GPU). The lossless claim needs a gate before we bank it. Key
   insight that sets the test: **overlap changes SCHEDULING, not ARITHMETIC** (same multimem reduce, same operand

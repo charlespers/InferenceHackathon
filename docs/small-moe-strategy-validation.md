@@ -63,4 +63,9 @@ directly to the 235B. Run on the box (GPU 0, bf16, 8 prompts, 24 tok). Random ba
 235B's exact architecture — DirectProxy predicts the next layer's top-8 at **72% accuracy, 11.6× random**,
 *not* by layer-reuse (B≈random) but because `h_L` proxies `h_{L+1}` for L+1's router. Re-run on the full
 235B (8-way sharded; needs the `lens_top` device fix shipped here) for the final deploy number.
-E9 self-spec on Qwen3-30B-A3B: in progress (GPU 1).
+**E9 self-spec on Qwen3-30B-A3B (48 layers) — NOT VIABLE, confirms OLMoE.** top1 agreement by depth:
+12/48 0.024 · 24/48 0.016 · 36/48 0.049 · 43/48 0.382 · 46/48 0.626 · **47/48 0.756 → τ=1.51 < 1.86
+break-even**. Even at 97% depth it doesn't clear break-even, and a *cheap* shallow pass (≤24/48) is
+≈random — the last ~5 layers do all the disambiguation. **Self-speculation is out on the 235B family →
+draft via n-gram (repetitive) + a trained MTP/EAGLE3 head (general).** (The `lens_top` device fix made
+this multi-depth run complete cleanly.)

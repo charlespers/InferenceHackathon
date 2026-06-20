@@ -1,0 +1,55 @@
+armed Sat Jun 20 13:13:09 UTC 2026 diag — waiting for a FRESH :45 slot
+slot start Sat Jun 20 13:45:00 UTC 2026
+min GPU free 77910MB
+=== launch baseline_eager Sat Jun 20 13:45:00 UTC 2026: --enforce-eager ===
+baseline_eager serving — measuring decode tok/s (decode=64 x3) + greedy
+measuring http://localhost:8077 model=qwen3 decode=64 x3 ...
+  run 1: {'ok': True, 'ttft_ms': 1120.58, 'tpot_ms': 99.742, 'decode_tok_s': 10.03, 'tokens': 64}
+  run 2: {'ok': True, 'ttft_ms': 108.59, 'tpot_ms': 227.422, 'decode_tok_s': 4.4, 'tokens': 64}
+  run 3: {'ok': True, 'ttft_ms': 108.52, 'tpot_ms': 292.186, 'decode_tok_s': 3.42, 'tokens': 64}
+
+=== BASELINE ===
+  TTFT      108.59 ms
+  TPOT      227.422 ms/token
+  decode    4.4 tok/s  (0.8% of ~540.0 roofline)
+  bottleneck hint: DOMINATED by floor (launch/host/comms — fix fast-path first)
+  -> /alloc/data/eagle3_diag/m_baseline_eager.json
+  [1/10] ok (288 chars)
+  [2/10] ok (37 chars)
+  [3/10] ok (274 chars)
+  [4/10] ok (194 chars)
+  [5/10] ok (321 chars)
+  [6/10] ok (244 chars)
+  [7/10] ok (290 chars)
+  [8/10] ok (293 chars)
+  [9/10] ok (20 chars)
+  [10/10] ok (195 chars)
+-> /alloc/data/eagle3_diag/q_baseline_eager.json
+  m_baseline_eager.json: "decode_tok_s": 4.4
+=== launch baseline_graphs Sat Jun 20 13:52:06 UTC 2026:  ===
+baseline_graphs serving — measuring decode tok/s (decode=64 x3) + greedy
+measuring http://localhost:8077 model=qwen3 decode=64 x3 ...
+  run 1: {'ok': True, 'ttft_ms': 1779.31, 'tpot_ms': 99.798, 'decode_tok_s': 10.02, 'tokens': 64}
+  run 2: {'ok': True, 'ttft_ms': 854.22, 'tpot_ms': 33.424, 'decode_tok_s': 29.92, 'tokens': 64}
+  run 3: {'ok': True, 'ttft_ms': 317.99, 'tpot_ms': 14.142, 'decode_tok_s': 70.71, 'tokens': 64}
+
+=== BASELINE ===
+  TTFT      854.22 ms
+  TPOT      33.424 ms/token
+  decode    29.92 tok/s  (5.5% of ~540.0 roofline)
+  bottleneck hint: DOMINATED by floor (launch/host/comms — fix fast-path first)
+  -> /alloc/data/eagle3_diag/m_baseline_graphs.json
+  [1/10] ok (285 chars)
+  [2/10] ok (37 chars)
+  [3/10] ok (274 chars)
+  [4/10] ok (190 chars)
+  [5/10] ok (274 chars)
+  [6/10] ok (244 chars)
+  [7/10] ok (290 chars)
+  [8/10] ok (282 chars)
+  [9/10] ok (20 chars)
+  [10/10] ok (195 chars)
+-> /alloc/data/eagle3_diag/q_baseline_graphs.json
+  m_baseline_graphs.json: "decode_tok_s": 29.92
+skip eagle3_graphs (out of slot time) — get it next slot
+diag done Sat Jun 20 13:54:26 UTC 2026

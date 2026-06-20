@@ -34,6 +34,14 @@ def format_result(record: RunRecord) -> str:
         f"{r.analytical_floor_tok_per_s:.1f} tok/s = "
         f"{r.pct_of_floor*100:.1f}% of floor",
     ]
+    mb = r.measured_breakdown
+    if mb is not None:
+        ms = 1e3
+        lines += [
+            "  -- measured decode breakdown (mean ms/token) --",
+            f"  weight {mb.weight_s*ms:.3f}  kv {mb.kv_s*ms:.3f}  "
+            f"comms {mb.comms_s*ms:.3f}  compute {mb.compute_s*ms:.4f}",
+        ]
     if t.available:
         lines += [
             "  -- device telemetry --",

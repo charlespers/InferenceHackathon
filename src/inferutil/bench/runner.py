@@ -24,6 +24,7 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
     samples_tok_s = []
     step_seconds = []
     gpu_samples = []
+    last_breakdowns = []
     ttft_s = 0.0
     prefill_tok_per_s = 0.0
     for rep in range(config.repeats):
@@ -35,7 +36,12 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
         last_rep = rep == config.repeats - 1
         if last_rep:
             telemetry.start()
-        step_seconds = [engine.decode_step().seconds for _ in range(config.decode_tokens - 1)]
+        if last_rep:
+            steps = [engine.decode_step() for _ in range(config.decode_tokens - 1)]
+            step_seconds = [s.seconds for s in steps]
+            last_breakdowns = [s.breakdown for s in steps]
+        else:
+            step_seconds = [engine.decode_step().seconds for _ in range(config.decode_tokens - 1)]
         if last_rep:
             gpu_samples = telemetry.stop()
         total = sum(step_seconds)
@@ -45,4 +51,5 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
     return build_result(cfg=cfg, cluster=cluster, config=config, ttft_s=ttft_s,
                         prefill_tok_per_s=prefill_tok_per_s,
                         decode_step_seconds=step_seconds, telemetry_summary=summary,
-                        decode_tok_per_s_samples=samples_tok_s)
+                        decode_tok_per_s_samples=samples_tok_s,
+                        step_breakdowns=last_breakdowns)

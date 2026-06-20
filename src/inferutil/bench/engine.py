@@ -17,6 +17,14 @@ class ExpertRoute:
 
 
 @dataclass(frozen=True)
+class StepBreakdown:
+    weight_s: float
+    kv_s: float
+    comms_s: float
+    compute_s: float
+
+
+@dataclass(frozen=True)
 class PrefillResult:
     n_prompt_tokens: int
     seconds: float                 # prompt-processing wall-time
@@ -28,6 +36,7 @@ class DecodeStep:
     index: int
     seconds: float
     routes: tuple = ()             # tuple[ExpertRoute, ...]; empty if not exposed
+    breakdown: "StepBreakdown | None" = None
 
 
 @runtime_checkable
@@ -56,13 +65,16 @@ class MockEngine:
         self.seed = seed
         self.expose_routes = expose_routes
         self._floor_s = 0.0
+        self._shares = (0.0, 0.0, 0.0, 0.0)
         self._index = 0
         self._rng = random.Random(seed)
 
     def reset(self, *, plan, dtype_bytes, kv_dtype_bytes, tp, ep, seq_len):
-        self._floor_s = decode_latency(
+        bd = decode_latency(
             self.cfg, self.cluster, plan=plan, dtype_bytes=dtype_bytes,
-            kv_dtype_bytes=kv_dtype_bytes, seq_len=seq_len, tp=tp, ep=ep).total_s
+            kv_dtype_bytes=kv_dtype_bytes, seq_len=seq_len, tp=tp, ep=ep)
+        self._floor_s = bd.total_s
+        self._shares = (bd.weight_read_s, bd.kv_read_s, bd.comms_s, bd.compute_s)
         self._index = 0
         self._rng = random.Random(self.seed)
 
@@ -92,4 +104,9 @@ class MockEngine:
                 )
                 for k in range(self.cfg.top_k)
             )
-        return DecodeStep(index=i, seconds=self._step_seconds(), routes=routes)
+        s = self._step_seconds()
+        w, k, c, comp = self._shares
+        scale = (s / self._floor_s) if self._floor_s else 0.0
+        breakdown = StepBreakdown(weight_s=w * scale, kv_s=k * scale,
+                                  comms_s=c * scale, compute_s=comp * scale)
+        return DecodeStep(index=i, seconds=s, routes=routes, breakdown=breakdown)

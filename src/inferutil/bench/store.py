@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass, asdict
 
 from .config import BenchConfig
-from .metrics import BenchResult, TelemetrySummary
+from .metrics import BenchResult, TelemetrySummary, MeasuredBreakdown
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,10 @@ def _record_from_dict(d: dict) -> RunRecord:
     res = dict(d["result"])
     tele = dict(res.pop("telemetry"))
     tele["per_gpu_mean_util"] = tuple(tele["per_gpu_mean_util"])
-    result = BenchResult(telemetry=TelemetrySummary(**tele), **res)
+    mb = res.pop("measured_breakdown", None)
+    measured = MeasuredBreakdown(**mb) if mb else None
+    result = BenchResult(telemetry=TelemetrySummary(**tele),
+                         measured_breakdown=measured, **res)
     return RunRecord(runid=d["runid"], config=BenchConfig(**d["config"]),
                      env=d["env"], result=result)
 

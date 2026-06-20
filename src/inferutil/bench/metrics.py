@@ -22,6 +22,14 @@ class TelemetrySummary:
 
 
 @dataclass(frozen=True)
+class MeasuredBreakdown:
+    weight_s: float                # mean seconds/token
+    kv_s: float
+    comms_s: float
+    compute_s: float
+
+
+@dataclass(frozen=True)
 class BenchResult:
     # latency
     ttft_s: float
@@ -42,6 +50,7 @@ class BenchResult:
     # variance (appended, defaulted — keeps existing positional construction valid)
     n_repeats: int = 1
     decode_tok_per_s_std: float = 0.0
+    measured_breakdown: "MeasuredBreakdown | None" = None
 
 
 def bytes_per_token(cfg: MoEConfig, seq_len: int, dtype_bytes: int,
@@ -85,10 +94,22 @@ def summarize_telemetry(samples, n_decode_tokens: int,
         util_imbalance=imbalance, per_gpu_mean_util=per_gpu_mean_util)
 
 
+def aggregate_breakdown(step_breakdowns) -> "MeasuredBreakdown | None":
+    bs = [b for b in (step_breakdowns or []) if b is not None]
+    if not bs:
+        return None
+    n = len(bs)
+    return MeasuredBreakdown(
+        weight_s=sum(b.weight_s for b in bs) / n,
+        kv_s=sum(b.kv_s for b in bs) / n,
+        comms_s=sum(b.comms_s for b in bs) / n,
+        compute_s=sum(b.compute_s for b in bs) / n)
+
+
 def build_result(*, cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
                  ttft_s: float, prefill_tok_per_s: float, decode_step_seconds: list,
                  telemetry_summary: TelemetrySummary,
-                 decode_tok_per_s_samples=None) -> BenchResult:
+                 decode_tok_per_s_samples=None, step_breakdowns=None) -> BenchResult:
     steps_sorted = sorted(decode_step_seconds)
     n = len(decode_step_seconds)
     total_decode = sum(decode_step_seconds)
@@ -122,4 +143,5 @@ def build_result(*, cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
         analytical_floor_tok_per_s=floor_tok_s,
         pct_of_floor=(decode_tok_per_s / floor_tok_s) if floor_tok_s else 0.0,
         telemetry=telemetry_summary,
-        n_repeats=n_rep, decode_tok_per_s_std=decode_tok_per_s_std)
+        n_repeats=n_rep, decode_tok_per_s_std=decode_tok_per_s_std,
+        measured_breakdown=aggregate_breakdown(step_breakdowns))

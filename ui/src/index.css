@@ -2,4 +2,83 @@
 @tailwind components;
 @tailwind utilities;
 
-body { @apply bg-neutral-950 text-neutral-100 antialiased; }
+/* Right-rail stats stay monospace; chat text uses system sans */
+* {
+  font-family: ui-monospace, "Cascadia Code", "SF Mono", Menlo, "Consolas", monospace;
+}
+.font-chat {
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+               "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+html { color-scheme: dark; }
+html.light { color-scheme: light; }
+
+/* Bar colors — CSS vars so they win over any Tailwind specificity */
+:root {
+  --bar-track: #2a2a2a;
+  --bar-fill: #525252;
+  --bar-fill-accent: #10b981;
+}
+html.light {
+  --bar-track: #b8c4d0;
+  --bar-fill: #96a8b8;
+  --bar-fill-accent: #8498aa;
+}
+
+/* Prevent browser from adding a white default to textareas */
+textarea { background-color: transparent; }
+
+/* Guarantee text is visible in light mode regardless of Tailwind cascade */
+html.light textarea,
+html.light input[type="text"],
+html.light input[type="number"],
+html.light input:not([type]) {
+  color: #1c1a17;
+}
+
+/* Chat message text in light mode */
+html.light .font-chat {
+  color: #1c1a17;
+}
+
+/* All opacity-based black borders are invisible on cream — boost them */
+html.light [class*="border-black"] {
+  border-color: rgba(0, 0, 0, 0.20);
+}
+html.light [class*="border-neutral-3"] {
+  border-color: rgba(0, 0, 0, 0.18);
+}
+
+/* ── Dark mode ────────────────────────────────────────────────────────────
+   Cool-blue sweep from the top fading into near-black — mirrors the light
+   mode's warm sweep but inverted in tone.
+──────────────────────────────────────────────────────────────────────────── */
+body {
+  @apply antialiased;
+  color: #c8c8c6;
+  background-color: #0d0d0b;
+  background-image: linear-gradient(
+    to bottom,
+    #111c2e 0%,
+    #0e1320 22%,
+    #0d0e0f 50%,
+    #0d0d0b 100%
+  );
+  min-height: 100vh;
+}
+
+/* ── Light mode ───────────────────────────────────────────────────────────
+   Full-page sweep: warm peach/amber at the top fading to cream.
+──────────────────────────────────────────────────────────────────────────── */
+html.light body {
+  color: #1c1a17;
+  background-color: #eaf0f8;
+  background-image: linear-gradient(
+    to bottom,
+    #b8cfe4 0%,
+    #ccdaea 28%,
+    #dae5f2 55%,
+    #eaf0f8 100%
+  );
+}

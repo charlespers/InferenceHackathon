@@ -49,10 +49,24 @@ probe () { # $1=label  -> greedy capture under the CURRENT ctl
       --tokens "$TOK" --out "$OUT/q_$1.json" >> "$LOG" 2>&1
 }
 
-echo "armed $(date -u) — stale-TP probe waiting for a free window" > "$LOG"
-# Negotiated window: take any slot we can lock (probe is short). Wait for a fresh one
-# if armed mid-slot so we get a full window.
-while [ "$(mins)" -ge 58 ]; do sleep 15; done
+echo "armed $(date -u) — stale-TP probe waiting for a SAFE free djamoils window" > "$LOG"
+# LOOP-C is a djamoils loop -> use the djamoils :45-:00 slot, but DEFER to LOOP-A's
+# armed EAGLE3 (priority). Only proceed when ALL hold: in :45-:51 (leaves time to
+# finish a ~7-min probe before :00, never straddling Jaymin's :00 slot), lock-free,
+# NO active vLLM serve (EAGLE3 running -> wait), and >65GB free. If EAGLE3 uses the
+# whole slot, this rolls to the next djamoils slot. Cap the wait so it can't hang.
+WAITED=0
+while :; do
+  m=$(mins); free=$(freemin); busy=0
+  pgrep -f 'vllm.entrypoints|vllm serve' >/dev/null 2>&1 && busy=1
+  if [ "$m" -ge 45 ] && [ "$m" -le 51 ] && [ "$busy" -eq 0 ] \
+     && [ "$free" -gt 65000 ] && [ ! -d /alloc/data/gpu.lock ]; then
+    echo "SAFE window $(date -u) (min=$m free=${free}MB, no active vLLM)" >> "$LOG"; break
+  fi
+  WAITED=$((WAITED + 20))
+  if [ "$WAITED" -ge 5700 ]; then echo "no safe window in 95min — giving up $(date -u)" >> "$LOG"; exit 0; fi
+  sleep 20
+done
 
 # stale-lock cleanup (>20 min) then atomic acquire
 [ -d /alloc/data/gpu.lock ] && [ -n "$(find /alloc/data/gpu.lock -mmin +20 2>/dev/null)" ] && { rm -f /alloc/data/gpu.lock/holder; rmdir /alloc/data/gpu.lock 2>/dev/null; }

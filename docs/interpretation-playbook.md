@@ -3,13 +3,16 @@
 So the GPU agent's data drives the right lever immediately (and my reactions stay consistent). Each row:
 **if you measure X → do Y.** Fill the Results Log in `gpu-agent-experiments.md`; this says what each result means.
 
-## E0 — real all-reduce latency (`nccl-tests`, the strategy switch)
+## E0 — real all-reduce latency (`nccl-tests`) — ✅ RESOLVED: ~16µs → **comms-bound**
+Measured: all-reduce@8 ≈**16µs**, all-to-all@8 ≈10µs, all-reduce@2 ≈6.5µs (`config-sweep.md`). That's the
+**≥4–5µs comms-bound branch** below → **NCCL comms tuning is now the #1 lever** (target 16→4–8µs), then
+fp8+TP8 (block-64 requant), then the kernel/overhead gap, then spec. See `results-reaction-01.md`.
 | 8–16 KB all-reduce latency | meaning | do next |
 |---|---|---|
-| **≤ ~2 µs** | weight-bound (TP8 comms ≈0.28 ms ≪ weight 0.81 ms) | prioritize **E7 int4** + **E4 kernel**; real TP8 → ~370+ tok/s |
-| **~3–4 µs** | mixed | do E1 baseline; both byte + comms levers pay |
-| **≥ ~4–5 µs** | comms-bound (matches the model's 0.94 ms) | prioritize **route-prefetch** (`scheduler.rs`) + one-shot all-reduce + **E6 spec**; int4 helps less |
-→ then set `src/inferutil/hardware.py: collective_latency_s` to the measured value and re-run `predict_matrix.py`.
+| ≤ ~2 µs | weight-bound | int4 + kernel first |
+| ~3–4 µs | mixed | both levers pay |
+| **≥ ~4–5 µs (← measured 16µs)** | **comms-bound** | **NCCL tuning (LL/one-shot) #1** → route-prefetch + spec; int4 helps less |
+→ set `src/inferutil/hardware.py: collective_latency_s = 16e-6` and re-run `predict_matrix.py 0.46 H100-SXM-80GB 16`.
 
 ## E1 — FP8+EP engine baseline (real TTFT/TPOT/tok-s)
 Back out the true terms: `weight_ms ≈ ideal_weight/e`, `comms_ms ≈ TPOT − weight_ms − kv_ms`. Then:

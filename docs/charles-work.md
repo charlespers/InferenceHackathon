@@ -3,18 +3,21 @@
 Async channel between the **planning agent** (no GPU) and the **GPU agent** (15-min slot, Charles :30–:45).
 Goal: maximize single-user (batch-1) decode tok/s. **Start here, then open `gpu-agent-experiments.md`.**
 
-## The one number that decides everything → run **E0 first**
-B=1 decode is bandwidth-bound, but is it **weight**-bound or **comms**-bound? The team's model assumes
-`collective_latency_s=5µs` → comms 0.94 ms dominates; my estimate (~1.5µs tuned) → weight dominates.
-**`nccl-tests` measures the real all-reduce latency in seconds, no model load** (E0). It decides whether
-the #1 lever is route-prefetch/spec (comms-bound) or int4/kernels (weight-bound). Everything keys off it.
+## ✅ Real data landed → we are COMMS-BOUND (see `results-reaction-01.md`)
+E0 is resolved: `nccl-tests` measured all-reduce@8 ≈**16µs** (3.2× the model's 5µs). So decode is
+**comms-bound**, and the reprioritized levers are: **(1) NCCL comms tuning** (LL/one-shot, 16→4–8µs) →
+**(2) fp8+TP8 via block-64 requant** (the blocked prize cell) → **(3) kernel/overhead** (the ~7ms gap;
+K5 + CUDA graphs) → **(4) n-gram spec**. The EP→TP inversion is **confirmed on hardware** (fp8+EP8 64.5 <
+bf16+TP8 85.7 tok/s). Real routing imbalance is **5–8×** (not 2.6×). Current best: **bf16+TP8 = 85.7 tok/s**
+(16% of floor → big headroom).
 
-## Measured / validated (real, on-box where noted)
+## Measured / validated (real, on-box)
+- **EP→TP inversion confirmed on hardware:** fp8+EP8 64.5 < bf16+TP8 85.7 tok/s (EP penalty swamps fp8).
+- **E0 = comms-bound:** all-reduce@8 ≈16µs, all-to-all ≈10µs (default NCCL) — comms (3.0ms) ≫ weight at TP8.
 - **K5 MoE-expert kernel: scalar → e=0.46 (1538 GB/s), ~100×, correctness-clean** (max_rel 3.2e-5), on H100.
-  A/B split: gate/up 0.49, down 0.405 (the weak link).
-- **EP→TP inversion, triple-confirmed:** my spec + my measured kernel + the team's own `latency.py` model.
-  Their model at my e=0.46: **TP8 261 vs EP8 94 tok/s** (2.8×).
-- **vLLM `192%128` TP8-FP8 crash reproduced live** — exactly as the spec predicted; fix = `--enable-expert-parallel`.
+  vLLM's default MoE kernels run at ~16% util → the ~7ms overhead gap K5 attacks.
+- **vLLM `192%128` TP8-FP8 crash reproduced live** — fix = `--enable-expert-parallel` (EP, slower) or a
+  **block-64 FP8 requant** to unblock the winning fp8+TP8 cell.
 
 ## Doc map
 | Doc | What |

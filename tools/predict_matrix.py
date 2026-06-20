@@ -5,14 +5,19 @@
 Pure-stdlib, no GPU. Produces the single reference table the experiment plan keys off.
   PYTHONPATH=src python3 tools/predict_matrix.py [efficiency=0.46] [gpu=H100-SXM-80GB]
 """
-import sys
+import sys, dataclasses
 from inferutil.model import QWEN3_235B
 from inferutil.hardware import GPUS, Cluster
 from inferutil.latency import decode_latency
 
 E = float(sys.argv[1]) if len(sys.argv) > 1 else 0.46
 GPU = sys.argv[2] if len(sys.argv) > 2 else "H100-SXM-80GB"
-cl = Cluster(gpu=GPUS[GPU], n_gpus=8)
+# 3rd arg: per-collective latency in µs. Team measured ~16µs all-reduce @8 GPUs (default NCCL); the
+# model's built-in is 5µs. Pass 16 to reflect reality, ~4-8 for the tuned (LL/one-shot) projection.
+gpu = GPUS[GPU]
+if len(sys.argv) > 3:
+    gpu = dataclasses.replace(gpu, collective_latency_s=float(sys.argv[3]) * 1e-6)
+cl = Cluster(gpu=gpu, n_gpus=8)
 LAYOUTS = [("tp", 8, 1), ("hybrid", 4, 2), ("hybrid", 2, 4), ("ep", 1, 8)]
 
 print(f"# Predicted B=1 decode tok/s — {GPU}, measured efficiency e={E}\n")

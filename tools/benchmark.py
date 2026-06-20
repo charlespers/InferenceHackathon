@@ -44,14 +44,17 @@ PROMPTS = [
 _MODEL_ID = "qwen3-235b-a22b"
 
 
-def stream_request(base: str, prompt: str, max_tokens: int, user: str | None = None) -> dict:
-    payload = json.dumps({
+def stream_request(base: str, prompt: str, max_tokens: int, user: str | None = None,
+                   enable_thinking: bool = False) -> dict:
+    payload_dict: dict = {
         "model": _MODEL_ID,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": True,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }).encode()
+    }
+    if not enable_thinking:
+        payload_dict["chat_template_kwargs"] = {"enable_thinking": False}
+    payload = json.dumps(payload_dict).encode()
 
     hdrs = {"Content-Type": "application/json"}
     if user:
@@ -118,6 +121,7 @@ def main():
     ap.add_argument("--out", default=None, help="optional JSON output file")
     ap.add_argument("--user", default=None, help="your name — shown in /api/tasks during the run")
     ap.add_argument("--model", default=None, help="override model ID sent to the server")
+    ap.add_argument("--thinking", action="store_true", help="enable thinking mode (default: off)")
     args = ap.parse_args()
     if args.model:
         global _MODEL_ID
@@ -133,7 +137,7 @@ def main():
     results = []
     for i, prompt in enumerate(prompts):
         try:
-            r = stream_request(args.base, prompt, args.tokens, user)
+            r = stream_request(args.base, prompt, args.tokens, user, enable_thinking=args.thinking)
             results.append(r)
             hit_str = f"{r['predictor_hit_rate']*100:.1f}%" if r.get("predictor_hit_rate") is not None else "  N/A"
             print(f"{i+1:>3}  {r['ttft_ms']:>10.1f}  {r['decode_tok_per_s']:>8.1f}"

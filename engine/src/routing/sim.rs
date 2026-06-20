@@ -78,6 +78,44 @@ impl RoutingSimulator {
         Ok(Self { predictor, top_experts, top_k })
     }
 
+    /// Score predictor accuracy using real routing data from the vLLM hook.
+    ///
+    /// `real_routing[layer]` = expert IDs that actually fired at that layer.
+    /// Same flow as `simulate_token` but with real expert selections instead of
+    /// the precomputed static top-k from activation counts.
+    ///
+    /// Returns hit_rate = hits / total_predictions in [0, 1].
+    pub fn score_real_routing(&mut self, real_routing: &[Vec<u32>]) -> f32 {
+        let n_layers = real_routing.len().min(self.top_experts.len());
+        let mut hits = 0u32;
+        let mut total = 0u32;
+        let mut prev_prediction: Vec<ExpertId> = Vec::new();
+
+        for layer in 0..n_layers {
+            let actual: Vec<ExpertId> = real_routing[layer].iter().copied().collect();
+
+            if !prev_prediction.is_empty() {
+                let hit_count = actual.iter()
+                    .filter(|&&e| prev_prediction.contains(&e))
+                    .count() as u32;
+                hits += hit_count;
+                total += actual.len() as u32;
+            }
+
+            if layer > 0 {
+                let prev_actual: Vec<ExpertId> = real_routing[layer - 1].iter().copied().collect();
+                if let Some(mk) = &mut self.predictor.markov {
+                    mk.observe(layer - 1, &prev_actual, &actual);
+                }
+            }
+
+            let pred = self.predictor.predict_full(layer, &[], Some(&actual), self.top_k);
+            prev_prediction = pred.experts;
+        }
+
+        if total > 0 { hits as f32 / total as f32 } else { 0.0 }
+    }
+
     /// Simulate one token's full forward pass through all layers.
     ///
     /// For each layer L: score the previous layer's prediction against actual,

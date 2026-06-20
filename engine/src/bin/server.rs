@@ -45,6 +45,92 @@ const N_LAYERS: usize = 94;
 const N_EXPERTS: usize = 128;
 const ROUTING_STATS_PATH: &str = "/alloc/data/routing_stats.json";
 const PLACEMENT_PATH: &str = "/alloc/data/optimized_placement.json";
+const ROUTING_SOCK: &str = "/tmp/vllm_routing.sock";
+
+// ---------------------------------------------------------------------------
+// Real routing reader — reads from Unix socket written by start_vllm.py.
+// Buffers one full token's worth of layer records (94 entries).
+// Falls back to None when socket isn't connected.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct RoutingReader {
+    /// Completed token routing: outer = tokens, inner = per-layer expert lists.
+    /// Shared ring buffer; Mutex<VecDeque> so proxy can pop tokens in order.
+    buffer: Arc<Mutex<std::collections::VecDeque<Vec<Vec<u32>>>>>,
+    connected: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RoutingReader {
+    fn new() -> Self {
+        let reader = Self {
+            buffer: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let r = reader.clone();
+        tokio::spawn(async move { r.run().await });
+        reader
+    }
+
+    async fn run(&self) {
+        loop {
+            match tokio::net::UnixStream::connect(ROUTING_SOCK).await {
+                Ok(stream) => {
+                    self.connected.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("[routing_reader] connected to {ROUTING_SOCK}");
+                    self.read_stream(stream).await;
+                    self.connected.store(false, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("[routing_reader] disconnected, retrying…");
+                }
+                Err(_) => {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+
+    async fn read_stream(&self, stream: tokio::net::UnixStream) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let reader = BufReader::new(stream);
+        let mut lines = reader.lines();
+        // Accumulate one token's 94 layers
+        let mut token_layers: Vec<(usize, Vec<u32>)> = Vec::with_capacity(N_LAYERS);
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            let layer = record["layer"].as_u64().unwrap_or(0) as usize;
+            let experts: Vec<u32> = record["experts"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_u64().map(|e| e as u32)).collect())
+                .unwrap_or_default();
+
+            token_layers.push((layer, experts));
+
+            // Once we have all N_LAYERS for this token, push to buffer
+            if token_layers.len() >= N_LAYERS {
+                let mut by_layer = vec![vec![]; N_LAYERS];
+                for (l, e) in token_layers.drain(..) {
+                    if l < N_LAYERS { by_layer[l] = e; }
+                }
+                self.buffer.lock().unwrap().push_back(by_layer);
+                // Cap buffer at 64 tokens to avoid unbounded growth
+                let mut buf = self.buffer.lock().unwrap();
+                while buf.len() > 64 { buf.pop_front(); }
+            }
+        }
+    }
+
+    /// Pop the next token's routing data (94 layers × top-k experts).
+    /// Returns None if the socket isn't connected or buffer is empty.
+    fn pop_token(&self) -> Option<Vec<Vec<u32>>> {
+        self.buffer.lock().unwrap().pop_front()
+    }
+
+    #[allow(dead_code)]
+    fn is_connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Task tracking
@@ -102,6 +188,8 @@ struct AppState {
     /// Placement JSON cached for x_telemetry ({"placement": {"0": {"0": 2, ...}}})
     placement_json: Value,
     tasks: Mutex<TaskTracker>,
+    /// Real routing data from vLLM hook (start_vllm.py). None when not connected.
+    routing_reader: RoutingReader,
 }
 
 #[tokio::main]
@@ -131,6 +219,7 @@ async fn main() {
         simulator: Mutex::new(simulator),
         placement_json,
         tasks: Mutex::new(TaskTracker::new()),
+        routing_reader: RoutingReader::new(),
     });
 
     let app = Router::new()
@@ -318,8 +407,14 @@ async fn proxy_and_inject(
                 if t_first.is_none() { t_first = Some(now); }
                 let t_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
-                // Run predictor simulation for this token (all 94 layers)
-                let hr = state.simulator.lock().unwrap().simulate_token();
+                // Run predictor for this token.
+                // If the vLLM routing hook (start_vllm.py) is connected, use
+                // real per-layer expert selections; otherwise fall back to simulation.
+                let hr = if let Some(real_routing) = state.routing_reader.pop_token() {
+                    state.simulator.lock().unwrap().score_real_routing(&real_routing)
+                } else {
+                    state.simulator.lock().unwrap().simulate_token()
+                };
                 hit_rate_sum += hr;
                 n_simulated += 1;
 

@@ -113,12 +113,24 @@ BACKEND=mock uvicorn server.main:app --port 8000
 
 ## vLLM
 
-Both servers proxy to vLLM at `localhost:8001`. Start it with:
+### Option A — with routing hook (recommended for benchmarking)
+
+Captures real per-token expert selections and streams them to the Rust server.
+The Rust server uses real routing data instead of simulation when connected.
 
 ```bash
-tmux new-session -d -s vllm 'vllm serve /alloc/data/Qwen3-235B-A22B --tensor-parallel-size 8 --port 8001 --disable-log-requests 2>&1 | tee /alloc/data/vllm.log'
+tmux new-session -d -s vllm 'cd /alloc/data/InferenceHackathon && python3 tools/start_vllm.py 2>&1 | tee /alloc/data/vllm.log'
 
 # Watch startup (~5 min):
 tail -f /alloc/data/vllm.log
 # Ready when you see: "Application startup complete"
+# The Rust server connects automatically; you'll see "[routing_reader] connected" in server.log
+```
+
+### Option B — plain vLLM
+
+No routing capture; the Rust server falls back to simulation mode.
+
+```bash
+tmux new-session -d -s vllm 'vllm serve /alloc/data/Qwen3-235B-A22B --tensor-parallel-size 8 --port 8001 --disable-log-requests 2>&1 | tee /alloc/data/vllm.log'
 ```

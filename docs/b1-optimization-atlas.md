@@ -3,13 +3,13 @@
 The complete map of the converged team effort (my docs + `research/` + `tools/`). Status: ✅measured ·
 📊projected · 🧪experiment-ready · 🔬research. Current: **bf16-TP8 85.7 tok/s / 777ms TTFT / 2271ms@128tok**.
 
-## 🎯 NORTH STAR: 1000 tok/s (`path-to-1000.md`, `ladder_to_1000.py`, `megakernel-build-plan.md`)
-The quantitative ladder (`ladder_to_1000.py`): **86 → graphs 122 → fast-path 150 → fp8-K5-at-e→1 260 →
-NVLS@2µs 816 → small-tree spec 1101.** 1000 needs **TWO isolation-testable, graph-captured kernels** (not a new
-engine): **(1) fp8 K5 at e→1** (weight at roofline) and **(2) the NVLS all-reduce ≤~4µs** (`nvls_allreduce.cu`,
-the make-or-break — measure C with `measure_collective.sh`). Plus CUDA graphs + a scheduler-free loop + small-tree
-spec. **Comms is the crux** — make it fast (NVLS) or hide it (LOOP-C stale-TP → ~1588). Lossy cushion if it slips:
-int4 experts / depth. **Cheap first ship (~300, lossless): spec + prefix-cache on bf16-TP8 (the 09:45 rung).**
+## 🎯 NORTH STAR: 1000 tok/s — UPDATED by measured data (`results-reaction-04.md`, `1000-experiments.md`)
+Squeeze round changed the picture: **comms is BARRIER-bound (~16µs/collective, can't make it faster — in-kernel
+recursive-doubling is worse), int4 RULED OUT at B=1 (0.58×), spec is the lever.** So:
+- **Engine: graphs + scheduler-free loop + fp8-K5 (e→1) + big-tree spec amortizes the barrier-bound comms → ~745–870 LOSSLESS** (`ladder_to_1000.py --C 16 --ncoll 188`; route-aware big-tree verify adds ~15%, now first-order).
+- **The 300→1000 leap = ONE of:** (a) **proxy/stale-TP** hides the comms (LOOP-C; quality-gated — use **DirectProxy** as the predictor to preserve routing) → ~1218; (b) **EAGLE3 realized ×3.8** (trained draft) → ~1003; (c) a *lossless* EP collective-count cut (flagged uncertain — 2 TP ARs are intrinsic, DP-attn is a net loss).
+- **int4 / count-via-DP-attn / making-the-AR-faster are dead ends.** **Make-or-break experiments (`1000-experiments.md`):** #1 comms C (`measure_collective.sh`, no model load), #2 EAGLE3 realized S (09:45), #3 proxy/stale-TP quality (LOOP-C).
+- **Cheap first ship (~300, lossless today):** spec + prefix-cache on bf16-TP8.
 
 ## The decode-step decomposition (the spine — `overhead-attribution.md`)
 TPOT 11.67ms = **overhead ~7.0ms (60%) · comms ~3.0ms (26%) · weight ~1.6ms (14%)**. Floor-bound: weight

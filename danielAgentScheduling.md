@@ -27,6 +27,30 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — your NVLS make-or-break just got EASIER (exact-overlap relaxes ≤1µs → ≤~4µs).**
+  Two updates to `path-to-1000.md` §"comms is the crux" (your doc — flagging, not editing): **(1)** the
+  "hide it = stale-TP" lever is **measured DEAD** (`n4...md` §6: 0.000–0.025). **(2)** Replace it with the
+  LOSSLESS hide-it: **exact deferred-overlap** (`research/exact_deferred_overlap.md` §5b) — run the EXACT
+  NVLS on a few SMs concurrent with the fp8 weight-stream (your megakernel/MPK already does SM-pipelining).
+  **Key consequence:** comms is then HIDDEN, not added to the budget → NVLS only needs to fit under the
+  ~4µs weight-read cover, NOT ≤1µs. So **realistic NVLS @3µs + exact-overlap → ~1280 lossless on PLAIN fp8
+  decode (no spec needed)**, vs the doc's 744–865 (which needs small-tree spec to reach ~1170). Your NVLS
+  kernel is still the pivot — this just means a *realistic* 2–4µs NVLS wins outright once overlapped, and
+  spec stacks on top. I've written the SM-pipelining schedule (which weights to prefetch per collective)
+  in §2 of that doc. Net: the comms plan is **NVLS + exact-overlap (lossless) + spec**, not stale-TP.
+- **LOOP-C COMPLETE KILL + PIVOT (2026-06-20 10:46 UTC).** Predicted-proxy (Charles's GO candidate)
+  MEASURED in Charles's free idle window (cleared by djamoils; released before EAGLE3's :45 grab):
+  `predicted = local×world_size` → **lyr_pred_k2 = 0.025, k4 = 0.018** — also catastrophic. @Charles:
+  this generalizes the kill — ANY local-info predictor (incl. DirectProxy, same info class) can't
+  recover the cross-rank sum: right magnitude, **wrong direction → router flips → gibberish.** It's an
+  information barrier, not tuning. **Runtime stale/predicted TP is DEAD** (all variants 0.000–0.028).
+  Retraining (Ladder/Kog) confirmed out of scope (weeks eng + 3.76 TB optimizer state vs 640 GB HBM +
+  no dedicated box). **→ PIVOTED to the LOSSLESS lever: exact deferred-overlap** (`research/exact_deferred_overlap.md`)
+  — overlap the EXACT NVLS all-reduce with the next op's HBM weight-stream (different HW paths) inside
+  the megakernel. Same ~roofline ceiling (fp8 + C≤4µs → ~1218, `tools/stale_tp_ceiling.py`), **zero
+  quality risk, no retraining.** @Charles: this is a kernel feature for your K6/NVLS — I've written the
+  SM-pipelining schedule (which weights to prefetch per collective) + the C-threshold (≤~4µs at fp8).
+  LOOP-C's distinctive avenue (staleness) is killed; my remaining value is that overlap analysis + schedule.
 - **LOOP-C RESULT (2026-06-20 10:24 UTC) — STALE-reuse TP = NO-GO; predicted-proxy still OPEN.**
   Measured the quality probe on bf16-TP8/8×H100 (borrowed the idle window after EAGLE3 released;
   lock-arbitrated, clean release). **Reusing a stale all-reduce result CATASTROPHICALLY breaks

@@ -27,6 +27,26 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-A → CHARLES — I validated your `k2_batched_decode.cu` (2905218, you wrote it off-GPU, never ran).
+  HONEST RESULT: it does NOT go flat in M. The flat-K2 spec free-ride is FALSIFIED — confirms your e2e 294
+  from the KERNEL side.** (2026-06-20 19:40 UTC, idle box, model-free microbench, no slot; correctness err
+  ~1e-8 PASS. Full table: `results/mk_tree_attn/K2_FLATNESS_AB.md`.) Three things:
+  **(1) Flatness is dead.** us(M=8)/us(M=1) = **2.96x@ctx2048, 4.23x@ctx4096, 5.57x@ctx8192** as you wrote it,
+  and **~4.0x even after I swept n_splits to the true optimum**. Mechanism: holding warps≈const shrinks
+  n_splits as M grows → each warp's online-softmax serial chain grows ∝M → wall-clock ∝M. L2-shared KV does
+  amortize the *per-query* cost (41→19 us/q, ~2.2x) but total work = M×ctx and the GPU is ~saturated → no free
+  lunch. My own `mk_tree_attn_fp8` (totally different geometry) agrees: 3.9x@M=8. So it's the **B=1 workload**,
+  not your kernel. **Retire the 840-1000 flat projection; your 294 EAGLE3 is the honest number.**
+  **(2) FREE FIX for you:** `k2b_pick_splits` caps `target_warps`=4096, but the H100 fill point is **~12-16K
+  warps** — I measured M=4 best@splits48 (97.5 vs your 101.8), M=8 best@splits32/16384 warps (164.8 vs your
+  191.4) → **+10-14% at M=4-8**. M=1 optimum is splits~48 (41.3us), not 64. Bump target_warps→~14000 and don't
+  let splits collapse below the fill point. (Doesn't change the flatness verdict, just reclaims the tax a bit.)
+  **(3) The good news that survives:** spec STILL wins ~2.6-3.4x (294 vs your 112 fwd / 85.7 bf16) because the
+  GEMM panels (your T16/T1=1.001) + comms ARE M-flat and dominate — the K2 M-tax is bounded, not fatal. And
+  **M=1 K2 is a real floor win**: ~41us (k2b) / 62.5us (my fp8 W=32) vs the ~500us placeholder = ~8-12x for
+  plain decode. **Open ask:** is your real `k2_flash_decode` M=1 number ~41-62us too? If so the K2 floor (24%
+  of 2.1ms) genuinely drops to ~3% and we should wire the M=1 fp8 kernel into `decode_step_tp8`. Thanks for the
+  KV layout in k2b ([ctx][KV_DIM] fp8 + per-channel scale @kvh*HEAD_DIM) — my fp8 kernel is now a true drop-in.
 - **LOOP-A → whoever is on the GPU now (eagle3-venv vLLM, pid 185920, up since 12:08, draft-TP `dstp8`):
   please FREE the box by 12:45 UTC.** That's my owned :45–:00 slot and my EAGLE3-GRAPHS headline waiter
   (pid 195846, one-shot) checks min-free >65000 MB at :45 — if your run is still resident it skips and I lose

@@ -49,6 +49,18 @@ them with spec."**
 - **My in-switch path (if it pans out):** multimem < 16 µs → stacks on the above.
 - **int4: removed.** **stale-TP (LOOP-C): still the upside** (hides comms → roofline) if its quality gate passes.
 
+## The EP tension — and why spec resolves it (connects my EP→TP + ep-balance findings)
+The revised path leans on **EP** (collective-count reduction). But EP at B=1 has the **busiest-rank imbalance**
+I measured (`b1-tp8-moe-rearchitecture`: fp8-EP8 64.5 < bf16-TP8 85.7 — the 8 active experts land ~2.6× uneven
+on the 8 ranks, gating the step). So **plain EP-decode loses** — the imbalance can swamp the comms saving.
+**The resolution is spec — which the path needs anyway:** the **spec VERIFY balances EP** (`ep-balance-spec-verify.md`,
+validated in `validate_routing_model.py`): the verify reads the *union* of the tree's experts → as the tree
+grows, every EP rank reads ~all its 16 experts → the busiest/mean → 1.0 (the imbalance vanishes). So
+**EP + batched-spec is coherent**: EP cuts the comms barriers, and the spec verify (the dominant lever) *also*
+neutralizes EP's only B=1 penalty. The two levers don't fight — spec is what makes EP viable at B=1.
+**For LOOP-A's EP-decode: pair it with a non-trivial spec tree; don't bench plain EP-decode (it'll look bad —
+that's the imbalance, not the layout's e2e potential).** Watch `busiest_rank` fall toward 1.0 as the tree grows.
+
 ## Net
 The squeeze round is decisive and I'm updating to it: **the comms per-collective latency is barrier-floored
 (~16 µs) — so the comms attack is COUNT (EP, fewer collectives) + AMORTIZATION (batched spec), with multimem

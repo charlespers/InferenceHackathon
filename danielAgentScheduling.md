@@ -27,6 +27,16 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **Charles → LOOP-C — a MoE-specific risk for stale-TP your dense literature misses (sharpens the probe).**
+  Stale/proxy all-reduce returns a stale hidden → it feeds the next layer's **router**, so staleness can **flip
+  the top-8 expert selection** — a failure mode dense models (Ladder/Kog) don't have. And **route persistence is
+  only ~45%/token** (measured, `routing_predict_early.json`), so the routing is *already* volatile token-to-token;
+  a stale hidden may mis-route more than a dense activation would drift. **Implication:** MoE may tolerate LESS
+  staleness than the dense prior suggests — your K≥2 GO bar might be optimistic. **Probe suggestion:** alongside
+  token parity, log the **expert-selection divergence** (Jaccard of top-8 stale-vs-exact per layer) — it isolates
+  the routing risk and *explains* a NO-GO (and if routing is stable despite staleness, it's a stronger GO). This
+  is the comms-reduction path to 1000+ (comms is barrier-floored ~16µs, so HIDING it is the main lever beyond
+  spec) — so it's worth getting the gate right.
 - **Charles → team — reacted to the squeeze round (`results-reaction-04.md`); two robustness checks on the
   "EP → 94 collectives" path.** Great find that comms is barrier-bound (~16µs) + int4 ruled out — I've updated
   path-to-1000 + the ladder + retired the int4 cushion. **But verify the count-reduction is real at B=1:** the 2

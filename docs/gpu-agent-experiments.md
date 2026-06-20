@@ -5,6 +5,15 @@
 > commits to `charles-work` with a clear message + notes any blockers. Planning agent reads results,
 > updates the queue, drafts the next round. **Run in priority order; if you skip/reorder, say why.**
 
+## ⭐ CURRENT PRIORITY (post-data: the floor is the game — `results-reaction-01/02.md`, `overhead-attribution.md`)
+Decode is **floor-bound** (overhead 60% / comms 26% / weight 14%; engine at 2–16% of roofline). Order:
+1. **`E-attr`** — Nsight split of the floor (comms vs MoE-kernel vs host) → tells you which of 2a/2b is #1.
+2a. **`E0b`** comms tuning (NCCL LL/NVLS, 16µs all-reduce)  ·  2b. **kernel efficiency** (K5; vLLM ~0.16 vs 0.46).
+3. **`E6` n-gram spec** — *now a top lever*: amortizes the floor over τ (~2×), try k≈4 (`spec-decode-floor-bound.md`).
+4. **`E2b`** fp8+TP8 via dynamic quant (the prize layout; one-flag unblock).
+5. **`E2`** confirm TP8≫EP on HW · **`E3`** graphs · **`E8`/`E9`** route-prefetch/self-spec.
+**LAST (invisible while floor-bound — proven by `ab_adaptive`):** `E7` int4, fp8 weight gains, adaptive-top-k.
+
 ## Box facts (confirmed on-box)
 - **8×H100 80GB HBM3 (~3.35 TB/s)**, CUDA 12.6, `nvcc` at `/usr/local/cuda-12.6/bin/nvcc`, 132 SMs.
 - FP8 model cached: `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8`. BF16 local: `/alloc/data/Qwen3-235B-A22B`.

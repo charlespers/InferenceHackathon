@@ -5,12 +5,16 @@ After `results-reaction-04.md` the picture is: **fp8 + graphs + fast-path + fp8-
 in-switch / stale-TP) — all uncertain.** So 1000 is at the margin and gated on a few measurements. Run them in
 *this* order (cheapest/most-decisive first); each has a clean decision. Plug results into `ladder_to_1000.py`.
 
-## 1. Comms C — `measure_collective.sh` (NO model load, seconds) — CHEAPEST + most decisive
+## 1. Comms C — `measure_collective.sh` (NO model load, seconds) — CHEAPEST + decides the ENGINE
 **Measures:** the 8 KB all-reduce latency across NCCL Ring/Tree/**NVLS** + (if built) the multimem
-`nvls_allreduce.cu`. **Decides:** is there ANY sub-16 µs "make-it-faster" comms lever?
-- multimem in-switch **< ~8 µs** → real comms-latency win, stacks with everything. Build it.
-- all ≈ 16 µs (NCCL already in-switch) → **no make-faster lever**; the comms term is barrier-floored → 1000 must
-  come from **stale-TP (hide)** or **count (EP, verify it's lossless)** + spec. Settles the whole comms strategy.
+`nvls_allreduce.cu`. **Decides the engine complexity** (stale/proxy-TP is DEAD — reaction-05; the comms is
+hidden *losslessly* via exact deferred-overlap, not faked):
+- multimem in-switch **C ≤ ~4 µs** → comms is small *and* fully hideable; **standalone NVLS kernel + graphs +
+  spec already clears 1000 (~1870) — NO megakernel needed.** Simplest path.
+- C ≈ 16 µs (likely — NCCL's 16 µs may already be the in-switch barrier) → **need the megakernel deferred-overlap**
+  (`nvls_allreduce.cu` co-resident with the weight stream, LOOP-C's schedule) → hides ~half → ~938 with spec, ≥1000
+  with EAGLE3 ≥×3.05. So **C decides: standalone kernel (C≤4µs) vs persistent megakernel (C=16µs).** Most decisive
+  number; run first.
 
 ## 2. EAGLE3 realized spec multiplier — the 09:45 slot (`slot_eagle3.sh`) — THE dominant lever
 **Measures:** τ, S = tok/s(spec)/tok/s(baseline), V = τ/S on the real engine (`eagle3_analyze.py` + my
@@ -20,11 +24,13 @@ in-switch / stale-TP) — all uncertain.** So 1000 is at the margin and gated on
 - S ≈ 2.5 → spec alone → ~700; need BOTH a comms reduction AND a good tree. (Watch the verify is correctly
   batched — the squeeze bench's per-row scaling was a bench bug; the real verify reads the union once.)
 
-## 3. stale-TP quality probe — LOOP-C (`run_stale_probe.sh` + `DECISION.md`) — the comms UPSIDE
-**Measures:** greedy parity vs exact at K∈{2,4} with stale/proxy all-reduce. **Decides:** can the comms be
-*hidden* (overlapped) losslessly-enough?
-- GO (A2 ≥ 0.99, control degraded) → comms → ~0 → **fp8 roofline ~1218**, 1000 comfortable. The big upside.
-- NO-GO → comms stays barrier-bound; fall back to spec + count + (if it pans out) in-switch.
+## 3. ~~stale-TP quality probe~~ → DONE (DEAD) → build the exact DEFERRED-OVERLAP kernel instead
+**RESOLVED (reaction-05):** LOOP-C measured stale + predicted-proxy TP → **0.000–0.025 parity = DEAD** (info
+barrier: no local-info predictor recovers the cross-rank sum; my DirectProxy idea included — retired). **The
+lossless replacement is exact deferred-overlap** — overlap the EXACT NVLS reduce with the next op's weight stream
+(LOOP-C's schedule, my `nvls_allreduce.cu` + megakernel). **No quality probe needed (it's lossless).** The work
+is the *kernel*: run the multimem reduce on a few SMs while the rest stream the next weights. Hides ~half at
+C=16 µs (→ ~938 with spec), fully at C ≤ 4 µs (→ ≫1000). This is the comms lever now — gate it on #1 (the C).
 
 ## 4. EP-decode count — verify it's LOSSLESS at B=1 (`reaction-04` flag) — the count lever
 **Question:** does EP actually cut the *barrier* count vs NCCL's 1-barrier (16 µs) TP all-reduce? **Beware:**

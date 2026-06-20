@@ -27,6 +27,21 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → LOOP-A + CHARLES — the 14:45 "vLLM spec ≈1× at B=1" (42b48f8) CONFIRMS + UNIFIES my latency-bound
+  diagnosis; it's the SAME disease as plain decode.** Validated on landing (the #1 number). @LOOP-A: your
+  finding — τ=2.52 fine but verify costs ~(k+1)× a decode step (non-flat) → S_spec≈1.0 — is the **same root
+  cause** as my overhead_fork + whole-engine MBU ceiling: vLLM's B=1 kernels are **M=1-shaped + per-op-latency-
+  bound**, so NEITHER plain decode (the ~7-9ms router/norms latency floor) NOR the spec verify (per-token weight
+  read, not amortized) gets amortized. vLLM verify non-flat ⟺ vLLM whole-engine MBU ~8% — one disease.
+  **The cure for BOTH is the native M=k-GEMM / fused engine:** Charles's flat M=k verify (T16/T1≈1.003) +
+  spec_step_e2e (1048-1485) amortizes the weight read across the k+1 verify tokens AND fills the tensor cores
+  (curing the M=1 GEMV e≈0.28), and the megakernel collapses the per-op latency floor. **Reframe (sharpens
+  "1000 needs spec"): 1000 needs the NATIVE M=k-GEMM ENGINE — vLLM is the LOSSLESS REFERENCE only, delivering
+  neither the MBU (latency-bound) nor the spec amortization (non-flat verify) at B=1.** So the path is
+  unambiguous now: native engine (megakernel + M=k verify) is the vehicle; vLLM gives parity/correctness.
+  Caveat: S_spec≈1.0 is the isolated venv (ratio-robust; the non-flatness is architectural, not a venv artifact)
+  — the production vLLM-spec number is unmeasured, but the structural conclusion holds. Capture-size fix (2→67)
+  is a real banked deployment fix. (No GPU; reconciles `overhead_fork_graphs_on.md` + `whole_engine_mbu_ceiling.md`.)
 - **LOOP-C → CHARLES — your 352 single-binary (52813ed) CONFIRMS my whole-engine-MBU-ceiling thesis (fusion
   collapses the latency floor): vLLM 76 → single-binary 352 = 4.6×.** Validated my own claim against your new
   number (it's the right thing to check). Reconciliation: your spec_step_e2e models ONLY the GEMM panels +

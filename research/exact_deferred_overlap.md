@@ -9,6 +9,40 @@
 > collective, **overlap the EXACT collective with the next op's HBM weight-stream.** Same ~roofline
 > prize (`tools/stale_tp_ceiling.py`), zero quality risk, no retraining.
 
+> ## ⚠️ VALIDATION UPDATE (2026-06-20, deep-research `wf_8e6331d8-e91`, 20/25 claims verified)
+> **This lever is PLAUSIBLE-IN-PRINCIPLE but UNPROVEN — do NOT bank the ~1280/"de-risked" headline
+> below until prototyped + measured.** The literature review found:
+> 1. **No published system overlaps a collective with a WEIGHT/HBM read.** *Every* fine-grained overlap
+>    system (MPK, ParallelKittens, NanoFlow, T3, TokenWeave, TileLink, Triton-distributed, HazyResearch
+>    PGL) hides the collective behind **GEMM COMPUTE**, and all **collapse/are disabled at small M**
+>    (TokenWeave turns overlap OFF < 1K tokens; FLUX *slows down* at m=64). The comms-behind-weight-read
+>    idea **appears nowhere** → it's novel and unproven (not refuted, just no precedent at M=1).
+> 2. **The ≤4 µs NVLS floor is NOT established.** The only measured small-message multimem AR in the
+>    corpus is **~16 µs** (TokenWeave, but at ~1 MB, not 8 KB). MultiShot is "up to 3× faster than Ring
+>    at small msg" → plausibly low single-digit µs, but **the true ~8 KB 8×H100 number is unpinned (≈3–16 µs)**.
+>    At the high end (~16 µs > the ~8 µs/layer fp8 cover) the AR only **PARTIALLY** hides (~1.5×, the 16 µs
+>    row of the ceiling tool) — NOT the full hide / ~1280 the §3/§5b tables assume.
+> 3. **"Different HW paths run free" is a RISK, not a given.** Collective DMA + weight read contend at the
+>    shared DRAM controller (T3 needed an arbitration policy); saturating multimem can consume ~76 SMs
+>    (ParallelKittens). A few-SM design may avoid this, but it's unmeasured. (These contention framings
+>    were themselves down-voted as *decisive* disproof, so: caveat-level risk, not a confirmed blocker.)
+> 4. **"~1280 on PLAIN decode, no spec needed" is WRONG — occupancy starvation (Charles react-06).** Even
+>    with comms fully hidden, **B=1 plain decode does NOT reach the weight roofline**: the TP8 sharded
+>    weight read runs at **~3.5% of peak BW** (occupancy-starved — the per-GPU slices are too small to
+>    saturate; measured ~33.8 tok/s sharded bench). So the fp8 "roofline ~1280" is unreachable by plain
+>    decode regardless of comms. **Spec's batched verify** (many rows → real occupancy) is what actually
+>    saturates BW. → exact-overlap removes the **comms** term but is **necessary-not-sufficient**; spec is
+>    REQUIRED for the weight term. My "no spec needed" was wrong.
+> **VERDICT: a research BET, not a banked lever, and not a standalone path.** What would prove/size it:
+> (i) Charles's `measure_collective.sh` → the real 8 KB NVLS C; (ii) a prototype of `k6_overlap_decode.cu`
+> actually overlapping AR with weight prefetch at M=1 (would be the FIRST such demonstration). Treat
+> §3/§5b's ~1280 as the **optimistic ceiling IF C≤4 µs AND concurrency is free AND the weight read
+> saturates** — none of which holds yet. **Honest role of exact-overlap: it removes/hides the COMMS term
+> (a real contribution to the floor), but reaching 1000 still needs SPEC for occupancy** (Charles's
+> dominant lever) — they compose, exact-overlap is not a solo path. The TP8 end-state in
+> `tp_degree_model.py` is likewise **occupancy-coupled** (weight read ≈ `active/(TP·e(TP))`, e(TP) low and
+> falling), not engine-independent.
+
 ## 1. The mechanism (and the honest B=1 subtlety)
 
 At B=1 the per-layer cost is **weight-read time** (the GEMV ≈ the HBM read; compute ≈ 0). The TP

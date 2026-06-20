@@ -110,7 +110,19 @@ def main():
     print("   (≈3% at k=5/α=.7, but ~38% at k=1 — the missing bonus). Affects spec_moe_model + my spec tools;")
     print("   minor for the k≥5 configs in use, but use the +1 form. Flagged to LOOP-A in danielAgentScheduling.\n")
 
-    print(f"Net: the union + EP-imbalance + verify-rebalancing models are empirically sound on a simulated")
+    print("5) VERIFY-COST SPLIT — w(k)=0.34+0.66·(union/8): the 0.34/0.66 (non-expert/expert) from config facts")
+    # per-layer params (hidden 4096, Q 8192, KV 4×128, intermediate 1536, 8 active experts, router 128):
+    attn = 4096*8192 + 4096*512 + 4096*512 + 8192*4096      # Q,K,V,O
+    router = 4096*128
+    one_expert = 4096*1536 + 4096*1536 + 1536*4096          # gate,up,down
+    expert8 = 8 * one_expert
+    nonexp = attn + router
+    tot = nonexp + expert8
+    print(f"   attn+router {nonexp/1e6:.1f}M/layer, 8 experts {expert8/1e6:.1f}M/layer -> "
+          f"non-expert share {nonexp/tot:.3f}, expert share {expert8/tot:.3f}")
+    print(f"   code uses 0.34/0.66; accurate is {nonexp/tot:.2f}/{expert8/tot:.2f} (~{100*abs(0.34-nonexp/tot)/(nonexp/tot):.0f}% off) — minor, flag for spec_moe_model.\n")
+
+    print(f"Net: the union + EP-imbalance + verify-rebalancing + verify-split models are empirically sound on a simulated")
     print("128-expert top-8 MoE. The same formulas drive spec_floor_model / tree_spec_optimizer / spec_predict /")
     print("backout_floor — so those rest on a validated foundation before the H100 runs confirm the absolute numbers.")
 

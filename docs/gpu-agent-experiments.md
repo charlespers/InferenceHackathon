@@ -94,9 +94,12 @@ vllm serve Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --tensor-parallel-size 8 --ena
   --speculative-config '{"method":"ngram","num_speculative_tokens":4,"prompt_lookup_max":3,"prompt_lookup_min":1}'
 # then re-run E1's measure.py at ctx 128/2048 and read acceptance + tok/s
 ```
-Record: decode tok/s vs E1 (no-spec), `spec_accept_rate`/τ. **Go/no-go:** tok/s up AND acceptance >~25%.
-Keep the draft tree NARROW (num_speculative_tokens 3–4) — bushy trees go net-negative on this MoE. See
-`docs/next-levers-research.md` L1. Expect ~1.1–1.4× on structured prompts, less on prose.
+Record: decode tok/s vs E1 (no-spec), `spec_accept_rate`/τ. **Go/no-go is REALIZED tok/s, not acceptance.**
+Use **`num_speculative_tokens` 2–3, single drafter** — on this MoE the batched verify reads the expert
+*union* of the draft positions, so the break-even τ is ~1.6 (k=2) / ~2.2 (k=3) but ~4.6 at the dense-tuned
+k=8 → k=8 LOSES. Sweep k∈{2,3,4} and keep the best realized tok/s. Full derivation +
+the recommendation for the team's `engine/spec/ SpecConfig` (which defaults to draft_len=8): see
+**`docs/spec-decode-moe-tax.md`**. Expect ~1.1–1.4× on structured prompts at small k, less on prose.
 
 ### E7 — INT4/AWQ expert weights (biggest byte win; gated on a checkpoint)
 First resolve the blocker: does an AWQ/GPTQ-INT4 `Qwen3-235B-A22B` checkpoint exist on HF for vLLM?

@@ -26,22 +26,25 @@ floor-bound — `ab_adaptive` made it *slower* (9.67 vs 13.23 tok/s). **Proven p
 ## Doc map
 | Doc | What |
 |---|---|
-| `gpu-agent-experiments.md` | **The work order** — E0–E9, exact commands, go/no-go signals, Results Log |
-| `interpretation-playbook.md` | **measured value → next action** for every experiment (the data-to-lever map) |
+| `gpu-agent-experiments.md` | **The work order** — priority header + E0–E9/E-attr/E-ttft, commands, Results Log |
+| `single-user-latency-budget.md` | **The whole thesis in one table** — current 2.3s/86tok-s → ~0.45s/~290 (4–5×) |
+| `results-reaction-01.md` / `-02.md` | **Reactions to real data** — comms-bound; floor is the game; route-prediction validated |
+| `overhead-attribution.md` | Real TPOT = overhead 60% / comms 26% / weight 14% → attribute the floor (`E-attr`) |
+| `ttft-analysis.md` | TTFT 777ms = 20–300× the physics → prefix caching ~50–100× (the cheap big win) |
+| `spec-decode-floor-bound.md` | Spec amortizes the floor → a TOP lever now (~2×, k≈4, regime-adaptive) |
+| `interpretation-playbook.md` | **measured value → next action** for every experiment |
 | `team-coordination.md` | How this fits `origin/main` (Rust engine + bench); cross-validation; comms reconciliation |
-| `next-levers-research.md` | Prioritized, vetted levers (engine baseline → n-gram spec → int4 → down-proj) |
-| `predicted-tok-s-matrix.md` | Predicted tok/s, all layouts×precision×ctx, at measured e=0.46 (TP8 ~261 vs EP ~94) |
-| `spec-decode-moe-tax.md` | Why their `SpecConfig draft_len=8` loses on the MoE; use k≈2–3 (for `engine/spec/`) |
-| `self-speculation-design.md` | Draft with the target's own shallow layers (no extra model/GPU); honest cost model |
-| `ep-placement-for-b1.md` | Their optimizer balances *average* load; B=1 needs per-step busiest-rank (co-activation) |
-| `b1-latency-architecture.md` | The 15-avenue first-principles research (H100 canonical) |
-| `b1-tp8-moe-rearchitecture-h200.md` | The TP8 MoE re-architecture spec (numbers ÷1.433 for this H100) |
-| `k5-kernel-results-h100.md` | The measured kernel optimization journey |
+| `spec-decode-moe-tax.md` | The weight-bound spec tree-size analysis (k≤3) — superseded by floor-bound while floor-bound |
+| `self-speculation-design.md` · `ep-placement-for-b1.md` | self-spec cost model · co-activation placement for B=1 |
+| `predicted-tok-s-matrix.md` · `next-levers-research.md` | predicted tok/s matrix · the prioritized lever dossier |
+| `b1-latency-architecture.md` · `b1-tp8-moe-rearchitecture-h200.md` · `k5-kernel-results-h100.md` | research · TP8 spec · kernel journey |
 
-## Kernel files (`kernels/`) + tools
-- `k5_experts.cu` (reference) · `k5_experts_warp.cu` (**measured winner**) · `k5_microbench.cu` (repro)
-- `k5_experts_warp2.cu` + `k5_downproj_bench.cu` (down-proj occupancy fix, for E4)
-- `k5_experts_int4.cu` + `k5_int4_bench.cu` (int4 byte lever — does the unpack eat the 2×? → E4)
+## Tools + kernels (`tools/`, `kernels/`, `bench/`)
+- `tools/latency_budget.py` — single-user latency calculator (`--proven` → 290 tok/s / 448ms; multi-turn chat)
+- `tools/predict_matrix.py` · `verify_route_prediction.py` (E8) · `verify_self_speculation.py` (E9)
+- `bench/run_bench4.sh` (fp8-TP8+comms/E2b+E0b) · `run_bench5.sh` (n-gram spec/E6) · `run_bench6.sh` (prefix-cache/E-ttft)
+- `kernels/k5_experts_warp.cu` (**measured winner**) · `k5_microbench.cu` · `k5_ksweep_bench.cu` (adaptive-k wall-clock)
+- `k5_experts_warp2.cu`+`k5_downproj_bench.cu` (down-proj fix) · `k5_experts_int4.cu`+`k5_int4_bench.cu` (int4)
 - `tools/verify_route_prediction.py` (E8, `predictor.rs`) · `tools/verify_self_speculation.py` (E9)
 - `tools/predict_matrix.py` (calibrated predictions from the team's model)
 

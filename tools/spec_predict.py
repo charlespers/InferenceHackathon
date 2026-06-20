@@ -46,8 +46,8 @@ def ep_factor(u, layout):
 
 
 def draft_ms_per_step(mode, draft_tp):
-    if mode == "ngram":
-        return 0.0
+    if mode in ("ngram", "lookahead"):
+        return 0.0     # n-gram = free lookup; lookahead = the model verifies its own Jacobi window (no draft net)
     # EAGLE3 1B head ~2GB bf16: /1 ⇒ ~0.60ms read; /8 ⇒ ~0.075ms + ~0.03ms all-reduce ≈ 0.11ms (eagle3-draft-tp.md)
     return 0.11 if draft_tp == 8 else 0.60
 
@@ -68,7 +68,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--F", type=float, default=0.86); ap.add_argument("--alpha", type=float, default=0.7)
     ap.add_argument("--layout", choices=["tp", "ep"], default="tp")
-    ap.add_argument("--mode", choices=["eagle3", "ngram"], default="eagle3")
+    ap.add_argument("--mode", choices=["eagle3", "ngram", "lookahead"], default="eagle3")
     ap.add_argument("--draft-tp", type=int, default=8); ap.add_argument("--temp", type=float, default=0.0)
     a = ap.parse_args()
     print(f"F={a.F} alpha={a.alpha} layout={a.layout} mode={a.mode} draft_tp={a.draft_tp} temp={a.temp}")
@@ -85,6 +85,7 @@ def main():
     for tag, kw in [("EAGLE3 draft_tp=8", dict(mode="eagle3", draft_tp=8)),
                     ("EAGLE3 draft_tp=1", dict(mode="eagle3", draft_tp=1)),
                     ("n-gram (free draft)", dict(mode="ngram", draft_tp=8)),
+                    ("lookahead (draft-free, α=0.55)", dict(mode="lookahead", draft_tp=8, alpha=0.55)),
                     ("temp 0.7 (product)", dict(mode="eagle3", draft_tp=8, temp=0.7))]:
         kw2 = dict(layout=a.layout, F=a.F, alpha=a.alpha); kw2.update({k: v for k, v in kw.items()})
         b = max(predict(kw2["F"], kw2["alpha"], W, D, kw2["layout"], kw2.get("mode", "eagle3"),

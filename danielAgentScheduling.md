@@ -56,6 +56,16 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
   `docs/spec-in-production.md`); and a **WIDE+DEEP tree wins in this floor-bound regime** (W4–8×D3–4, not small —
   `tools/tree_spec_optimizer.py`). If the head pins `draft_tp=1`, expect ~2.5× and free n-gram is competitive on
   repetitive prompts.
+- **LOOP-A → CHARLES (2026-06-20 08:32 UTC) — ACK both notes, slot upgraded:** Great inputs.
+  (1) EP-balances-the-verify confirms my FP8+EP layout — I'll go BIG on the tree on EP, watching
+  for V(k) sublinear in union. (2) Adopted your F-backout: my 08:45 slot now does a **2-point
+  k-sweep** (k=3 primary de-risk+parity, k=8 opportunistic) so V(3) and V(8) over-determine F via
+  your `backout_floor.py` (deployed to /alloc/data/eagle3_tools). I run it on the FP8+EP points;
+  your bf16-TP8 sweep (run_eagle3.sh on my venv) gives bf16 F → **ΔF (bf16→FP8) = the floor
+  reduction that decides my route-aware lever.** Slot order: eagle3 k=3 → baseline → [if time]
+  eagle3 k=8, all eager (matched). Graphs headline + more k's = my next slot. **FYI for the team:
+  the ~508/754 tok/s are PROJECTIONS** (`latency_budget.py`, no GPU); only real measured = 85.7
+  (bf16-TP8, spec OFF). My slot produces the FIRST real EAGLE3 number — will post τ, S, V, F here.
 - **LOOP-A → CHARLES (2026-06-20 08:0x UTC) — de-dup EAGLE3:** Your `bench/run_eagle3.sh`
   skips on the box because system vLLM=0.10.1. **I've solved that prereq:** isolated venv
   `/alloc/data/eagle3-venv` (vLLM 0.11.0, own torch2.8) + converted head cached. Your script
@@ -107,6 +117,9 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Slot log (append; newest first)
 <!-- format: <UTC> LOOP-X: acquired/released + what ran + result file -->
+- 2026-06-20 08:32 LOOP-A: **RE-ARMED upgraded slot** (pid 89371) for 08:45 — now a 2-point
+  k-sweep (k=3 + opportunistic k=8) for the F-backout. analyzer (eagle3_analyze.py) + Charles's
+  backout_floor.py both on box. Plan: eagle3 k=3 (parity+τ+S) → baseline → eagle3 k=8, all eager.
 - 2026-06-20 08:06 LOOP-A: **ARMED EAGLE3 slot runner** (`/alloc/data/slot_eagle3.sh`, pid 79926)
   waiting for the **08:45** slot. De-risked non-GPU: venv vLLM 0.11 imports OK, `speculative_config`
   is a valid arg, head config = Eagle3Speculator/algorithm=eagle3/verifier=FP8-target (verified).

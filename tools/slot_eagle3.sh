@@ -23,9 +23,13 @@ LOG=/alloc/data/slot_eagle3.log
 SCHED=/alloc/data/danielAgentScheduling.md
 MODEL=${MODEL:-Qwen/Qwen3-235B-A22B-Instruct-2507-FP8}
 HEAD=nm-testing/Qwen3-235B-A22B-EAGLE3-converted-speculators-lmsys
-SPEC="{\"method\":\"eagle3\",\"model\":\"$HEAD\",\"num_speculative_tokens\":3,\"draft_tensor_parallel_size\":1}"
+spec_cfg () { echo "{\"method\":\"eagle3\",\"model\":\"$HEAD\",\"num_speculative_tokens\":$1,\"draft_tensor_parallel_size\":1}"; }
 PORT=8077
-NSPEC=${NSPEC:-3}
+# Two tree sizes so V at k1 and k2 over-determine the floor F (Charles' backout_floor.py):
+# V(k)=F+(1-F)(0.34+0.66*union(k)/8). NSPEC1 = primary (de-risk + parity); NSPEC2 = opportunistic
+# 2nd point (only if slot time remains). On EP, go BIG (Charles: verify balances EP at large union).
+NSPEC1=${NSPEC1:-3}
+NSPEC2=${NSPEC2:-8}
 # MODE=eager (slot 1: de-risk + lossless parity + accept-len, matched-eager speedup)
 # MODE=graphs (slot 2: drop --enforce-eager for the CUDA-graph headline; only after eager passes)
 MODE=${MODE:-eager}
@@ -79,8 +83,8 @@ if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
   echo "LOOP-A(eagle3) $(date -u)" > /alloc/data/gpu.lock/holder
   echo "- $(date -u) LOOP-A: acquired gpu.lock -> EAGLE3 $MODE + baseline ($MODE)" >> "$SCHED"
 
-  # 1) EAGLE3 — de-risk + accept-length + lossless capture (most important)
-  launch_measure "eagle3_$MODE" "$EAGER --speculative-config $SPEC" 0.85
+  # 1) EAGLE3 @ k=NSPEC1 — de-risk + accept-length + lossless capture (most important)
+  launch_measure "eagle3_$MODE" "$EAGER --speculative-config $(spec_cfg $NSPEC1)" 0.85
 
   # 2) baseline FP8 in the SAME mode — so S=tok/s(eagle3)/tok/s(base) and V=tau/S are valid
   #    (matched floor in both). If time remains.
@@ -88,6 +92,14 @@ if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
     launch_measure "baseline_$MODE" "$EAGER" 0.9
   else
     echo "skip baseline (out of slot time)" >> "$LOG"
+  fi
+
+  # 3) OPPORTUNISTIC 2nd tree size @ k=NSPEC2 — gives the 2nd V point to back out F.
+  #    Only if there's a full launch's worth of slot left (needs <52 to finish by :00).
+  if [ "$(mins)" -lt 52 ]; then
+    launch_measure "eagle3_${MODE}_k${NSPEC2}" "$EAGER --speculative-config $(spec_cfg $NSPEC2)" 0.85
+  else
+    echo "skip 2nd tree size k=$NSPEC2 (out of slot time) — get it next slot" >> "$LOG"
   fi
 
   rmdir /alloc/data/gpu.lock 2>/dev/null

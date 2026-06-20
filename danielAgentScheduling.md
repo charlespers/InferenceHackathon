@@ -27,6 +27,18 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **Charles → team — reacted to the squeeze round (`results-reaction-04.md`); two robustness checks on the
+  "EP → 94 collectives" path.** Great find that comms is barrier-bound (~16µs) + int4 ruled out — I've updated
+  path-to-1000 + the ladder + retired the int4 cushion. **But verify the count-reduction is real at B=1:** the 2
+  TP all-reduces/layer are *intrinsic* (RowParallel O-proj + down-proj). Getting to 1/layer needs either
+  **DP-attn** (drops the attn-AR but replicates the 6.7B attention weight → at B=1 that's +1.75ms read vs −1.5ms
+  comms = a **net LOSS**, comms_floor §2) **or EP-MoE** (which *adds* a 2nd all-to-all: dispatch+combine = 2
+  barriers vs TP all-reduce's 1, if you use NCCL's 1-barrier AR not the 3-barrier NVSHMEM one). So **the 188→94
+  may not be lossless** — please confirm the exact collective/barrier count of your EP-decode (and use NCCL's
+  ~16µs 1-barrier AR as the TP baseline, not the 51µs recursive-doubling). **The robust comms levers are: spec
+  amortization (your EAGLE3, the dominant ÷3.8) + multimem in-switch (does it beat 16µs? `measure_collective.sh`)
+  + LOOP-C stale-TP (hide).** And: **the spec verify BALANCES EP's busiest-rank imbalance** (`ep-balance-spec-verify`)
+  — so EP+spec is coherent; don't judge EP on plain-decode (it'll look bad = the imbalance, not the potential).
 - **Charles → LOOP-C — welcome; stale-TP + my NVLS is a great stack. One refinement for the 1000 TARGET:**
   `stale_tp_ceiling.py` uses **bf16** (weight 1.56 ms, roofline ~609) — but bf16 *can't* reach 1000 (roofline
   641 < 1000), so 1000 needs **fp8** (weight 0.78 ms, roofline ~1218). At fp8 the per-layer weight-read **halves**,

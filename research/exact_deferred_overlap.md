@@ -44,6 +44,52 @@ Two collectives/layer (TP=8): AR-A after attention o_proj, AR-M after MoE down-p
 At B=1 the cover (one op's weight read) is ~8.3 µs at fp8 / ~16.6 µs at bf16 per layer (the active
 slice). So an NVLS reduction at **C ≤ ~4 µs (fp8)** is *fully* hidden — see ceiling table below.
 
+## 2b. Concrete megakernel schedule (implementable — for Charles's K6/NVLS)
+
+The schedule structure is **fixed by the data dependencies** above (independent of the feasibility
+question the research `wf_8e6331d8-e91` is settling). It is a 2-stage software pipeline inside the
+persistent kernel, with the SMs partitioned into two disjoint sets so there is no occupancy contention:
+
+- **COMMS set (small, ~2–8 SMs):** issues the in-switch all-reduce via **`multimem.ld_reduce` +
+  `multimem.st`** (NVLS) over NVLink. Tiny SM footprint — TokenWeave shows the multimem AR needs only
+  2–8 SMs. It signals completion via a flag in shared/global memory.
+- **STREAM/COMPUTE set (the rest, ~124–130 SMs):** runs the current op's GEMV against resident weights,
+  AND **prefetches the NEXT op's weights** from HBM via **Hopper TMA (`cp.async.bulk`)** into a second
+  buffer. Pure HBM bandwidth op; uses the memory pipe, not NVLink.
+
+**Per-op pipeline (the overlap):**
+```
+op N:  [GEMV compute on resident W_N]      (tiny @ B=1)
+       └─ depends on AR_{N-1} result ──────────────────┐
+   ║ CONCURRENT on disjoint SM sets ║                   │
+   COMMS:   AR_N (multimem, NVLink) ───────────┐        │
+   STREAM:  cp.async prefetch W_{N+1} (HBM) ───┴── cover│
+op N+1: waits on max(AR_N, prefetch W_{N+1}) then GEMV ─┘
+```
+Critical path per op = **`tiny_compute + max(AR_latency, weight_prefetch)`** instead of the serial
+`AR + weight_read + compute`. Hidden = `min(AR, weight_prefetch)`. Since `weight_prefetch ≈ 8.3 µs/layer`
+(fp8) and a realistic NVLS AR is ~2–4 µs, the AR hides entirely → critical path collapses to the weight
+stream → **fp8 weight roofline (~1280)**.
+
+**The hazard that does NOT overlap (be honest):** the AR *output* is the GEMV's *activation input*, so
+the GEMV **compute** of op N+1 must wait for AR_N. That's fine — at B=1 the GEMV compute is ~0; only the
+*weight read* is large, and that's the part we prefetch. So we hide the AR behind the *next* op's weight
+read, never behind its compute (that's the distinction from FLUX, which needs compute to hide behind and
+collapses at B=1).
+
+**Buffering:** double-buffer the active-op weight tiles in SMEM/registers (standard cp.async pipelining).
+No need to stage a whole layer — only the next op's first tiles need to be in flight when its turn comes.
+L2 (50 MB) is irrelevant; the cover is the in-flight HBM *transfer*, not a resident copy.
+
+**OPEN feasibility questions (being answered by `wf_8e6331d8-e91`, fold in when it lands):**
+1. Do `multimem.ld_reduce` (NVLink) and `cp.async.bulk` (HBM) actually run **concurrently**, or do they
+   contend (shared mem controllers / copy engines / SM scheduler)? — decides the *hidden fraction*.
+2. Realistic 8 KB NVLS AR latency on 8×H100 NVSwitch — is it ≤ the ~4 µs cover, or barrier-bound ~16 µs?
+3. Does any published megakernel (MPK, TileLink, Triton-distributed) demonstrate comms↔**memory** overlap
+   (not comms↔compute) at M=1? — the precedent that makes this more than a paper design.
+If (1) shows contention or (2) shows C ≫ cover, the hidden fraction drops and this lever is partial, not
+total — I will temper §3/§5b accordingly.
+
 ## 3. The prize (from `tools/stale_tp_ceiling.py`; the overlap math is identical for exact)
 
 The ceiling tool's "+overlap" column is **lossless here** (the mechanism is the same; only correctness

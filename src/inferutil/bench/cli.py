@@ -38,6 +38,17 @@ def _build_config(args) -> BenchConfig:
         prompt_tokens=args.prompt, decode_tokens=args.decode, repeats=args.repeats)
 
 
+def _unique_runid(results_dir: str, name: str) -> str:
+    """Second-resolution timestamp, suffixed -1/-2/... if a run from the same
+    second already exists (so rapid successive runs never clobber each other)."""
+    base = datetime.now().strftime("%Y%m%d-%H%M%S")
+    d = os.path.join(results_dir, name)
+    cand, i = base, 1
+    while os.path.exists(os.path.join(d, cand + ".json")):
+        cand, i = f"{base}-{i}", i + 1
+    return cand
+
+
 def _cluster_from_env(rec: RunRecord) -> Cluster:
     gpu = rec.env.get("gpu") or "H100-SXM-80GB"
     if gpu not in GPUS:
@@ -65,7 +76,7 @@ def _cmd_run(args) -> None:
     if not tele.available:
         tele = NullTelemetry()
     result = run_benchmark(engine, config, QWEN3_235B, cluster, telemetry=tele)
-    runid = datetime.now().strftime("%Y%m%d-%H%M%S")     # CLI-only clock (run identity)
+    runid = _unique_runid(args.results_dir, config.name)   # CLI-only clock (run identity)
     driver_version = "unknown"
     try:
         if isinstance(tele, NvmlTelemetry) and tele.available:

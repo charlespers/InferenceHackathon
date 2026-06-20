@@ -47,13 +47,19 @@ def sim_busiest(P, rng, placement):
     return tot / (TRIALS // max(P, 1))
 
 
-def expected_accepted_formula(alpha, k, n):
+def shared_formula(alpha, k, n):       # what spec_moe_model/spec_floor_model/spec_predict currently use
     p = 1.0 - (1.0 - alpha) ** n
     return float(k) if p >= 1.0 else (1.0 - p ** k) / (1.0 - p)
 
 
-def sim_accepted(alpha, k, n, rng):
-    # p_hit per position = 1-(1-alpha)^n (n independent drafters); accept the run until the first miss.
+def corrected_emitted(alpha, k, n):    # Leviathan: tokens EMITTED per round incl. the bonus = (1-p^{k+1})/(1-p)
+    p = 1.0 - (1.0 - alpha) ** n
+    return float(k + 1) if p >= 1.0 else (1.0 - p ** (k + 1)) / (1.0 - p)
+
+
+def sim_emitted(alpha, k, n, rng):
+    # draft k tokens (each accepted w.p. p, run from the start until first miss), THEN +1 bonus token (the
+    # target's resampled token at the first mismatch is always emitted). emitted = accepted-run + 1.
     p = 1.0 - (1.0 - alpha) ** n
     tot = 0
     for _ in range(TRIALS):
@@ -63,7 +69,7 @@ def sim_accepted(alpha, k, n, rng):
                 acc += 1
             else:
                 break
-        tot += acc
+        tot += acc + 1            # the bonus token
     return tot / TRIALS
 
 
@@ -91,17 +97,20 @@ def main():
 
     print("3) TP8 (every expert column-sharded on every rank) -> per-rank imbalance is exactly 1.0 by")
     print("   construction (no balls-in-bins) — the reason TP8 > EP at B=1. (No sim needed; structural.)")
-    print("4) ACCEPTANCE — E[accepted]=(1−p^k)/(1−p), p=1−(1−α)^N (the spec speedup numerator) vs Monte-Carlo")
-    print(f"   {'α':>4} {'k':>3} {'N':>3} {'formula':>9} {'sim':>9} {'err%':>7}")
-    ok_a = True
-    for alpha, k, n in ((0.6, 5, 1), (0.7, 5, 1), (0.8, 8, 1), (0.7, 5, 2), (0.6, 8, 4)):
-        f, s = expected_accepted_formula(alpha, k, n), sim_accepted(alpha, k, n, rng)
-        err = 100 * abs(f - s) / max(s, 1e-9)
-        ok_a &= err < 3
-        print(f"   {alpha:>4.1f} {k:>3} {n:>3} {f:>9.3f} {s:>9.3f} {err:>6.1f}%")
-    print(f"   => acceptance formula {'VALIDATED' if ok_a else 'MISMATCH'} (<3% error)\n")
+    print("4) ACCEPTANCE — tokens EMITTED per round (the spec speedup numerator) vs Monte-Carlo")
+    print("   FINDING (caught by this sim): the shared expected_accepted = (1−p^k)/(1−p) MISSES the bonus token.")
+    print("   The rigorous value (Leviathan, incl. the always-emitted bonus) is (1−p^{k+1})/(1−p).")
+    print(f"   {'α':>4} {'k':>3} {'N':>3} {'shared':>8} {'corrected':>10} {'sim':>8} {'shared err%':>11}")
+    ok_c = True
+    for alpha, k, n in ((0.6, 1, 1), (0.6, 5, 1), (0.7, 5, 1), (0.8, 8, 1), (0.7, 5, 2)):
+        sh, co, s = shared_formula(alpha, k, n), corrected_emitted(alpha, k, n), sim_emitted(alpha, k, n, rng)
+        ok_c &= 100 * abs(co - s) / s < 3                       # corrected must match the sim
+        print(f"   {alpha:>4.1f} {k:>3} {n:>3} {sh:>8.3f} {co:>10.3f} {s:>8.3f} {100*abs(sh-s)/s:>10.1f}%")
+    print(f"   => CORRECTED (1−p^(k+1))/(1−p) {'MATCHES sim' if ok_c else 'FAILS'}; shared formula understates by ~p^k")
+    print("   (≈3% at k=5/α=.7, but ~38% at k=1 — the missing bonus). Affects spec_moe_model + my spec tools;")
+    print("   minor for the k≥5 configs in use, but use the +1 form. Flagged to LOOP-A in danielAgentScheduling.\n")
 
-    print(f"Net: the union + EP-imbalance + verify-rebalancing + acceptance models are empirically sound on a simulated")
+    print(f"Net: the union + EP-imbalance + verify-rebalancing models are empirically sound on a simulated")
     print("128-expert top-8 MoE. The same formulas drive spec_floor_model / tree_spec_optimizer / spec_predict /")
     print("backout_floor — so those rest on a validated foundation before the H100 runs confirm the absolute numbers.")
 

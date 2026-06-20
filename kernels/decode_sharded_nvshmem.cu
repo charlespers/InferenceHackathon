@@ -66,12 +66,23 @@
 //        kernels/decode_sharded_nvshmem.cu \
 //        -L /root/nv12/nvidia/nvshmem/lib -lnvshmem_host -lnvshmem_device -lnvidia-ml \
 //        -o /tmp/dsh
-//   (recdouble fallback: add -DAR_RECDOUBLE)
+//   (recdouble fallback: add -DAR_RECDOUBLE;  disable CUDA-graph capture entirely: add -DDSH_DISABLE_GRAPH)
+//
+// CUDA-GRAPH LAUNCH-OVERHEAD KILL (default ON; mirrors the single-GPU decode_step.cu 8.4->30.9 tok/s fix):
+//   The 94-layer host-driven loop fires ~850 launches/token (7 compute kernels + 2 collectives per layer),
+//   so at B=1 it is LAUNCH-BOUND (compute-only ~22.5 ms vs a ~2 ms bandwidth ideal).  We CAPTURE the per-
+//   layer COMPUTE kernels into TWO CUDA graphs and replay them 94x; the 2 NVSHMEM all-reduces/layer use
+//   nvshmemx_collective_launch (a cooperative launch that CANNOT be stream-captured) so they stay HOST-
+//   launched between the graph replays, EXACTLY where they were.  Per layer: replay graph_A (attention
+//   K1/K2/K3) -> AR#1 -> residual_add -> replay graph_B (router K4 + experts K5a/K5b) -> AR#2 ->
+//   residual_add.  This run benches BOTH the EAGER (per-launch) and GRAPHED (replay) paths and reports
+//   us/token + tok/s + the compute-only delta.  Run-time off-switch: env DSH_GRAPH=0.
 //
 // ================================ RUN (8 PEs, one process per GPU) ==============================
 //   LD_LIBRARY_PATH=/root/nv12/nvidia/nvshmem/lib:$LD_LIBRARY_PATH \
 //   NVSHMEM_REMOTE_TRANSPORT=none NVSHMEM_DISABLE_IB_NATIVE=1 NVSHMEM_BOOTSTRAP=MPI \
 //   mpirun -np 8 --allow-run-as-root /tmp/dsh [ctx_len=4096] [iters=200] [HBM_GBs=3350]
+//   (eager-only: prefix DSH_GRAPH=0)
 //
 // IP: public NVSHMEM/CUDA only; the recursive-doubling and put+barrier all-to-all/one-shot reductions
 //   are standard PGAS idioms.  Reuses the in-repo k1/k2/k3/k4/k5 warp-per-row fp8 GEMV idioms and the
@@ -635,6 +646,22 @@ struct PEState {
   // residual ping-pong (full [HIDDEN] on every PE after each all-reduce) — PLAIN device memory.
   float *h_a = nullptr, *h_b = nullptr;
 
+  // ---- CUDA-graph capture of the per-layer COMPUTE segments (launch-overhead kill) ----------------
+  //   The 2 NVSHMEM all-reduces/layer use nvshmemx_collective_launch (a cooperative launch) which
+  //   CANNOT be stream-captured, so they stay HOST-launched between graph replays.  We capture only the
+  //   plain <<<>>> compute kernels of each layer into TWO segment graphs and replay them 94x:
+  //     graph_A = attention compute (K1 qkv + K1 epilogue + K2 partial + K2 reduce + K3 O-proj)
+  //     graph_B = MoE compute       (K4 router + K5a gate/up + K5b down)
+  //   Because the latency proxy reuses ONE layer's dummy weights for ALL 94 layers, ONE capture of each
+  //   segment is replay-correct for every layer.  Captured kernels read/write FIXED device pointers, so
+  //   the residual ping-pong is bridged OUTSIDE the graph by the (host-launched) residual_add into the
+  //   fixed graph-input buffers g_in (attn) / g_mid (MoE).  ar_acc is a fixed symmetric pointer (fine).
+  cudaGraph_t     graph_A = nullptr, graph_B = nullptr;   // captured compute segments
+  cudaGraphExec_t exec_A  = nullptr, exec_B  = nullptr;   // instantiated once, replayed 94x
+  bool            graphs_built = false;
+  float          *g_in  = nullptr;   // [HIDDEN] FIXED attn-compute input  (graph_A reads this)
+  float          *g_mid = nullptr;   // [HIDDEN] FIXED MoE-compute input   (graph_B reads this)
+
   // SYMMETRIC NVSHMEM buffers for the all-reduce (same VA on every PE).
   float *ar_acc = nullptr;     // [AR_N] partial-in / reduced-out (the all-reduce in/out)
   float *ar_recv = nullptr;    // [NPES*AR_N] one-shot per-source slots (recdouble uses the head [AR_N])
@@ -718,6 +745,15 @@ static void alloc_pe(PEState& S, int ctx_len) {
   CK(cudaMalloc(&S.h_b, HIDDEN * sizeof(float)));
   fill_f32(S.h_a, HIDDEN, 99u, 1.0f, false);
   CK(cudaMemset(S.h_b, 0, HIDDEN * sizeof(float)));
+
+  // ---- FIXED compute-segment input buffers for the captured graphs (plain) ----
+  //   graph_A reads g_in (attn RMSNorm input), graph_B reads g_mid (post-attn residual / router input).
+  //   The host glue copies the live residual into these BEFORE each replay so the captured kernels see
+  //   the right data through their baked-in (fixed) pointers.
+  CK(cudaMalloc(&S.g_in,  HIDDEN * sizeof(float)));
+  CK(cudaMalloc(&S.g_mid, HIDDEN * sizeof(float)));
+  CK(cudaMemset(S.g_in,  0, HIDDEN * sizeof(float)));
+  CK(cudaMemset(S.g_mid, 0, HIDDEN * sizeof(float)));
 
   // ---- K1 SHARD ----
   CK(cudaMalloc(&S.w_in_norm, HIDDEN * sizeof(float)));   fill_f32(S.w_in_norm, HIDDEN, 1u, 0.5f, true);
@@ -860,34 +896,114 @@ static void launch_allreduce(PEState& S, cudaStream_t s) {
 }
 
 // =================================================================================================
+// COMPUTE SEGMENTS (graph-capturable): the plain <<<>>> kernels of one layer, grouped into the two
+// segments that bracket the two NVSHMEM all-reduces.  Every kernel here is an ordinary stream launch
+// (or a cudaMemsetAsync, which IS capturable) — NO nvshmemx_collective_launch, NO cudaMalloc — so the
+// whole segment can be recorded with cudaStreamBeginCapture/EndCapture and replayed with one
+// cudaGraphLaunch.  These are ALSO the bodies the eager path calls directly (single source of truth).
+//
+//   attn segment: K1 (qkv GEMV + epilogue) -> K2 (flash-decode partial + reduce) -> zero ar_acc ->
+//                 K3 (O-proj) writes the PARTIAL attention output into the symmetric ar_acc.
+//   moe  segment: zero ar_acc -> K4 router (reads the post-attn residual `in`) -> K5a gate/up ->
+//                 K5b down writes the PARTIAL MoE-down output (atomicAdd) into ar_acc.
+//
+// Both read their hidden input through the pointer `in`: in the EAGER path that is the live residual
+// ping-pong buffer; in the GRAPHED path it is the FIXED g_in / g_mid (the captured graph baked those
+// pointers in, and the host glue copies the live residual into them before each replay).
+// =================================================================================================
+static void dsh_attn_compute(PEState& S, const float* in, cudaStream_t s) {
+  dsh_k1_launch(S, in, s);
+  dsh_k2_launch(S, s);
+  CK(cudaMemsetAsync(S.ar_acc, 0, AR_N * sizeof(float), s));   // pre-zero partial target (capturable)
+  dsh_k3_launch(S, S.ar_acc, s);                              // ar_acc <- pure partial O-proj
+}
+static void dsh_moe_compute(PEState& S, const float* in, cudaStream_t s) {
+  CK(cudaMemsetAsync(S.ar_acc, 0, AR_N * sizeof(float), s));   // accumulate partial from 0 (capturable)
+  dsh_k4_router<<<1, 256, (size_t)HIDDEN*sizeof(float), s>>>(
+      in, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w);
+  dsh_k5a_gateup<<<S.k5_ctasA, S.k5_block, S.k5_smemA, s>>>(
+      in, S.sel_idx, S.Wgu_d, S.Wgu_scale_d, S.a_glb, TOP_K);
+  dsh_k5b_down<<<S.k5_ctasB, S.k5_block, S.k5_smemB, s>>>(
+      S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.ar_acc, TOP_K);
+}
+
+// =================================================================================================
+// Capture the two compute segments ONCE into graph_A / graph_B and instantiate.  Called in warm-up
+// (after alloc_pe + a real eager step, so modules/func-attrs are resolved and NO lazy alloc happens
+// inside the captured region).  Capture is on S.stream — the SAME stream the kernels run/replay on —
+// and brackets ONLY the compute kernels (no collective_launch, no cudaMalloc inside).  Returns false
+// on any CUDA error so the caller falls back to the eager path.
+// =================================================================================================
+static bool build_segment_graphs(PEState& S) {
+  cudaStream_t s = S.stream;
+  cudaError_t e;
+
+  // graph_A: attention compute reading the FIXED g_in.
+  e = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+  if (e != cudaSuccess) { printf("PE %d: beginCapture(A) %s\n", S.pe, cudaGetErrorString(e)); return false; }
+  dsh_attn_compute(S, S.g_in, s);
+  e = cudaStreamEndCapture(s, &S.graph_A);
+  if (e != cudaSuccess) { printf("PE %d: endCapture(A) %s\n", S.pe, cudaGetErrorString(e)); return false; }
+  e = cudaGraphInstantiate(&S.exec_A, S.graph_A, nullptr, nullptr, 0);
+  if (e != cudaSuccess) { printf("PE %d: instantiate(A) %s\n", S.pe, cudaGetErrorString(e)); return false; }
+
+  // graph_B: MoE compute reading the FIXED g_mid.
+  e = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+  if (e != cudaSuccess) { printf("PE %d: beginCapture(B) %s\n", S.pe, cudaGetErrorString(e)); return false; }
+  dsh_moe_compute(S, S.g_mid, s);
+  e = cudaStreamEndCapture(s, &S.graph_B);
+  if (e != cudaSuccess) { printf("PE %d: endCapture(B) %s\n", S.pe, cudaGetErrorString(e)); return false; }
+  e = cudaGraphInstantiate(&S.exec_B, S.graph_B, nullptr, nullptr, 0);
+  if (e != cudaSuccess) { printf("PE %d: instantiate(B) %s\n", S.pe, cudaGetErrorString(e)); return false; }
+
+  S.graphs_built = true;
+  return true;
+}
+
+// =================================================================================================
 // Enqueue ONE sharded decode layer on this PE's stream.  TWO NVSHMEM all-reduces stitch the partials.
 //   IDENTICAL control flow + barrier count on every PE -> the collective kernels' device barriers are
 //   hit in lockstep; no PE can race ahead into a barrier that another PE will not reach.
+//
+//   EAGER (graphed=false): the compute segments are issued as individual <<<>>> launches.
+//   GRAPHED (graphed=true): each compute segment is ONE cudaGraphLaunch of a pre-instantiated graph.
+//     Because the captured graphs read the FIXED g_in / g_mid, the host glue copies the live residual
+//     into g_in before graph_A and into g_mid (via the residual_add target) before graph_B.  The two
+//     collectives + residual_adds stay HOST-launched between the two replays, EXACTLY as in eager — so
+//     the per-PE collective sequence (2 all-reduces/layer, same barrier counts, same order) is bit-for-
+//     bit identical to eager and cannot deadlock.  All 8 PEs run identical control flow either way.
+//
+//   Ordering is preserved by the single stream: graph_A's writes to ar_acc complete before AR#1 (it is
+//   enqueued after on s); AR#1 + residual_add complete before graph_B replays (graph_B reads g_mid,
+//   which residual_add wrote on the same stream).  Residual is added ONCE per all-reduce, as before.
 // =================================================================================================
-static float* enqueue_layer(PEState& S, float* h_src, float* h_dst) {
+static float* enqueue_layer(PEState& S, float* h_src, float* h_dst, bool graphed) {
   cudaStream_t s = S.stream;
 
   // ---- attention: K1 -> K2 -> K3 (O-proj) -> PARTIAL hidden in the SYMMETRIC ar_acc ----
-  dsh_k1_launch(S, h_src, s);
-  dsh_k2_launch(S, s);
-  CK(cudaMemsetAsync(S.ar_acc, 0, AR_N * sizeof(float), s));   // pre-zero partial target
-  dsh_k3_launch(S, S.ar_acc, s);                              // ar_acc <- pure partial O-proj
+  if (graphed) {
+    // copy the live residual into the fixed graph-input buffer, then replay graph_A.
+    CK(cudaMemcpyAsync(S.g_in, h_src, HIDDEN * sizeof(float), cudaMemcpyDeviceToDevice, s));
+    CK(cudaGraphLaunch(S.exec_A, s));                          // K1+K2+memset+K3 (reads g_in -> ar_acc)
+  } else {
+    dsh_attn_compute(S, h_src, s);                             // identical kernels, individual launches
+  }
 
   // ---- AR#1: all-reduce(SUM) the partial O-proj across the 8 PEs -> full O-proj in ar_acc ----
   launch_allreduce(S, s);
   // full post-attn residual = h_src + reduced O-proj  (added ONCE, locally, on every PE).
+  // In the graphed path we land it in BOTH h_dst (the residual carrier) and g_mid (graph_B's fixed
+  // input); doing it in two adds keeps the math identical and avoids an extra copy on the hot path.
   dsh_residual_add<<<32, 256, 0, s>>>(h_src, S.ar_acc, h_dst);
+  if (graphed)
+    dsh_residual_add<<<32, 256, 0, s>>>(h_src, S.ar_acc, S.g_mid);  // g_mid = post-attn residual
 
-  // ---- K4 router (REPLICATED) on the full post-attn residual -> sel_idx[8], sel_w[8] ----
-  dsh_k4_router<<<1, 256, (size_t)HIDDEN*sizeof(float), s>>>(
-      h_dst, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w);
-
-  // ---- K5: sharded gate+up (192) then sharded down -> PARTIAL MoE-down hidden in ar_acc ----
-  CK(cudaMemsetAsync(S.ar_acc, 0, AR_N * sizeof(float), s));   // accumulate partial from 0
-  dsh_k5a_gateup<<<S.k5_ctasA, S.k5_block, S.k5_smemA, s>>>(
-      h_dst, S.sel_idx, S.Wgu_d, S.Wgu_scale_d, S.a_glb, TOP_K);
-  dsh_k5b_down<<<S.k5_ctasB, S.k5_block, S.k5_smemB, s>>>(
-      S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.ar_acc, TOP_K);
+  // ---- K4 router (REPLICATED) + K5 experts -> PARTIAL MoE-down hidden in ar_acc ----
+  if (graphed) {
+    CK(cudaGraphLaunch(S.exec_B, s));                          // memset+K4+K5a+K5b (reads g_mid -> ar_acc)
+  } else {
+    dsh_moe_compute(S, h_dst, s);                              // identical kernels, individual launches
+  }
 
   // ---- AR#2: all-reduce(SUM) the partial MoE-down across PEs -> full MoE contribution ----
   launch_allreduce(S, s);
@@ -899,12 +1015,14 @@ static float* enqueue_layer(PEState& S, float* h_src, float* h_dst) {
 
 // Enqueue the FULL step: 94 layers + final norm + sharded lm_head + argmax + 1 head all-reduce-max.
 //   Per token: 2 all-reduces/layer x 94 = 188 combine collectives (+ the optional head reduce).
-static void enqueue_step(PEState& S) {
+//   `graphed` selects per-layer compute via graph replays (true) vs individual <<<>>> launches (false);
+//   the all-reduce/residual sequence is IDENTICAL in both, so the 8-PE collective lockstep is unchanged.
+static void enqueue_step(PEState& S, bool graphed) {
   cudaStream_t s = S.stream;
   float* cur = S.h_a;
   float* nxt = S.h_b;
   for (int layer = 0; layer < N_LAYERS; ++layer) {
-    float* out = enqueue_layer(S, cur, nxt);
+    float* out = enqueue_layer(S, cur, nxt, graphed);
     cur = out;
     nxt = (cur == S.h_a) ? S.h_b : S.h_a;
   }
@@ -969,6 +1087,17 @@ int main(int argc, char** argv) {
   const int    IT      = (argc > 2) ? atoi(argv[2]) : 200;
   const double PEAK    = (argc > 3) ? atof(argv[3]) : 3350.0;   // GB/s per H100 HBM3
   const int    WARM    = 20;
+
+  // ---- GRAPHED vs EAGER selection: we time BOTH in one run for the comparison the task asks for.
+  //   want_graph gates whether we build+time the captured-compute path; the EAGER path always runs as
+  //   the fallback/baseline.  Disable graph at COMPILE time with -DDSH_DISABLE_GRAPH, or at RUN time
+  //   with env DSH_GRAPH=0 (handy if a driver rejects capture on this build — eager still benches).
+#ifdef DSH_DISABLE_GRAPH
+  bool want_graph = false;
+#else
+  bool want_graph = true;
+  { const char* g = getenv("DSH_GRAPH"); if (g && (g[0]=='0')) want_graph = false; }
+#endif
 
   // ---- NVSHMEM bootstrap (multi-process; one PE per process, one GPU per PE; MPI bootstrap). ----
   nvshmem_init();
@@ -1039,23 +1168,75 @@ int main(int argc, char** argv) {
   if (local_bad) { nvshmem_global_exit(2); }
   nvshmem_barrier_all();
 
-  // ---- warm up once OUTSIDE timing (lazy module load, collective_launch channel setup). ----
-  enqueue_step(S);
+  // ---- warm up the EAGER path once OUTSIDE timing (lazy module load, collective_launch channel
+  //      setup, func-attr resolve) so nothing lazy happens inside the later graph capture. ----
+  enqueue_step(S, /*graphed=*/false);
   CK(cudaStreamSynchronize(S.stream));
   nvshmem_barrier_all();
 
+  // ---- CAPTURE the per-layer compute segments into graph_A/graph_B ONCE (after warm-up, before the
+  //      timed loop).  Capture brackets only the plain <<<>>> compute kernels on S.stream — NO
+  //      collective_launch, NO cudaMalloc inside — so it is capture-valid.  If capture fails on this
+  //      build, fall back to eager-only so the bench still produces numbers (and stays deadlock-free:
+  //      EVERY PE makes the same fallback decision because capture is a purely-local stream operation
+  //      that does not depend on peer data — but to be safe against a split decision we AND across PEs).
+  if (want_graph) {
+    bool ok = build_segment_graphs(S);
+    int local_ok = ok ? 1 : 0;
+    bool all_ok;
+    {
+      // collective AGREEMENT across PEs: reuse the proven SUM all-reduce on a [HIDDEN] payload whose
+      // first element carries this PE's capture-success flag.  If ANY PE failed to capture, ALL fall
+      // back to eager (identical control flow on every PE -> no PE replays a graph while another issues
+      // individual launches, and the collective sequence stays identical => no deadlock).
+      std::vector<float> one(AR_N, 0.f); one[0] = (float)local_ok;
+      CK(cudaMemcpy(S.ar_acc, one.data(), sizeof(float)*AR_N, cudaMemcpyHostToDevice));
+      launch_allreduce(S, S.stream);
+      CK(cudaStreamSynchronize(S.stream));
+      nvshmem_barrier_all();
+      float summed = 0.f; CK(cudaMemcpy(&summed, S.ar_acc, sizeof(float), cudaMemcpyDeviceToHost));
+      all_ok = ((int)(summed + 0.5f) == NPES_EXPECT);   // every PE captured successfully
+    }
+    if (!all_ok) {
+      if (mype == 0) printf("  [graph] capture unavailable on >=1 PE; falling back to EAGER-only bench.\n");
+      want_graph = false;
+    } else if (mype == 0) {
+      size_t na = 0, nb = 0;
+      cudaGraphGetNodes(S.graph_A, nullptr, &na);
+      cudaGraphGetNodes(S.graph_B, nullptr, &nb);
+      printf("  [graph] captured graph_A=%zu nodes (attn compute), graph_B=%zu nodes (MoE compute);"
+             " replayed %dx/token.  Collectives (%d/token) stay HOST-launched.\n",
+             na, nb, N_LAYERS, ar_per_step);
+    }
+  }
+
   cudaEvent_t ev0, ev1; CK(cudaEventCreate(&ev0)); CK(cudaEventCreate(&ev1));
 
-  // ---- (a) FULL sharded step timing.  Each PE times its own stream; nvshmem_barrier_all between
-  //          iters keeps the 8 PEs in lockstep so we measure the SLOWEST PE (the real B=1 cost). ----
-  for (int i = 0; i < WARM; ++i) { enqueue_step(S); CK(cudaStreamSynchronize(S.stream)); }
+  // ---- (a) EAGER full sharded step timing (individual <<<>>> launches — the original path).  Each PE
+  //          times its own stream; nvshmem_barrier_all between iters keeps the 8 PEs in lockstep so we
+  //          measure the SLOWEST PE (the real B=1 cost). ----
+  for (int i = 0; i < WARM; ++i) { enqueue_step(S, false); CK(cudaStreamSynchronize(S.stream)); }
   nvshmem_barrier_all();
   CK(cudaEventRecord(ev0, S.stream));
-  for (int i = 0; i < IT; ++i) { enqueue_step(S); CK(cudaStreamSynchronize(S.stream)); }
+  for (int i = 0; i < IT; ++i) { enqueue_step(S, false); CK(cudaStreamSynchronize(S.stream)); }
   CK(cudaEventRecord(ev1, S.stream));
   CK(cudaEventSynchronize(ev1));
-  float ms_full = 0.f; CK(cudaEventElapsedTime(&ms_full, ev0, ev1)); ms_full /= IT;
+  float ms_eager = 0.f; CK(cudaEventElapsedTime(&ms_eager, ev0, ev1)); ms_eager /= IT;
   nvshmem_barrier_all();
+
+  // ---- (a') GRAPHED full sharded step timing (per-layer compute via 2 graph replays + 2 host
+  //           collectives).  IDENTICAL collective sequence to eager -> still lockstep across 8 PEs. ----
+  float ms_graph = 0.f;
+  if (want_graph) {
+    for (int i = 0; i < WARM; ++i) { enqueue_step(S, true); CK(cudaStreamSynchronize(S.stream)); }
+    nvshmem_barrier_all();
+    CK(cudaEventRecord(ev0, S.stream));
+    for (int i = 0; i < IT; ++i) { enqueue_step(S, true); CK(cudaStreamSynchronize(S.stream)); }
+    CK(cudaEventRecord(ev1, S.stream));
+    CK(cudaEventSynchronize(ev1));
+    CK(cudaEventElapsedTime(&ms_graph, ev0, ev1)); ms_graph /= IT;
+    nvshmem_barrier_all();
+  }
 
   // ---- (b) all-reduce-only timing: same 189 collectives/step, NO compute kernels, to isolate the
   //          combine overhead.  Same collective_launch sequence -> same lockstep barriers. ----
@@ -1073,26 +1254,46 @@ int main(int argc, char** argv) {
     auto tokps = [](float ms) { return 1.0e3 / ms; };
     auto gbps  = [&](float ms) { return b_token / 1e6 / ms; };
     printf("\n  %-30s %12s %12s %12s %12s\n", "metric", "us/token", "tok/s", "GB/s/GPU", "%HBMpeak");
-    printf("  %-30s %12.2f %12.1f %12.1f %11.1f%%\n", "sharded full step (real)",
-           ms_full*1e3, tokps(ms_full), gbps(ms_full), 100.0*gbps(ms_full)/PEAK);
+    printf("  %-30s %12.2f %12.1f %12.1f %11.1f%%\n", "EAGER full step (per-launch)",
+           ms_eager*1e3, tokps(ms_eager), gbps(ms_eager), 100.0*gbps(ms_eager)/PEAK);
+    if (want_graph)
+      printf("  %-30s %12.2f %12.1f %12.1f %11.1f%%\n", "GRAPHED full step (replays)",
+             ms_graph*1e3, tokps(ms_graph), gbps(ms_graph), 100.0*gbps(ms_graph)/PEAK);
     printf("  %-30s %12.2f %12s %12s %12s\n", "  all-reduces only (189)", ms_ar*1e3, "-", "-", "-");
     printf("  %-30s %12.2f\n", "  -> per-all-reduce", ms_ar*1e3 / ar_per_step);
-    printf("  %-30s %12.2f  (%.1f%% of the step)\n", "  -> AR overhead / token",
-           ms_ar*1e3, 100.0 * ms_ar / ms_full);
-    printf("  %-30s %12.2f\n", "  compute-only (full - AR)", (ms_full - ms_ar)*1e3);
+    printf("  %-30s %12.2f  (%.1f%% of EAGER step)\n", "  -> AR overhead / token",
+           ms_ar*1e3, 100.0 * ms_ar / ms_eager);
+    printf("  %-30s %12.2f\n", "  EAGER compute-only (full-AR)", (ms_eager - ms_ar)*1e3);
+    if (want_graph) {
+      printf("  %-30s %12.2f\n", "  GRAPHED compute-only (full-AR)", (ms_graph - ms_ar)*1e3);
+      const float dcompute = (ms_eager - ms_graph) * 1e3;   // compute-only delta = step delta (AR fixed)
+      printf("\n  graph WIN: step %.2f -> %.2f us/token (%.1f%% faster) | compute-only %.2f -> %.2f us"
+             " (launch overhead killed) | %.1f -> %.1f tok/s\n",
+             ms_eager*1e3, ms_graph*1e3, 100.0*(ms_eager-ms_graph)/ms_eager,
+             (ms_eager-ms_ar)*1e3, (ms_graph-ms_ar)*1e3, tokps(ms_eager), tokps(ms_graph));
+      printf("  the 2 NVSHMEM all-reduces/layer (%.2f us/token) are UNCHANGED and now DOMINATE the"
+             " graphed step (delta %.2f us = the per-token launch overhead the graph removed).\n",
+             ms_ar*1e3, dcompute);
+    }
 
     const double ideal_ms = (b_weight_only / 1e9) / (PEAK * 0.45 / 1e3);
     printf("\n  single-GPU proxy was ~30.9 tok/s; sharded weight-only ideal (per-GPU %.2f GB @ ~45%% peak)"
            " ~ %.0f tok/s (~%.2f ms); the NVSHMEM all-reduces + replicated-KV read add the overhead above.\n",
            b_weight_only/1e9, 1.0e3 / ideal_ms, ideal_ms);
-    printf("  all-reduce choice: %s.  Expect ~250-310 tok/s (one-shot, 1 barrier/AR); recdouble fallback"
-           " (3 sub-rounds) is ~3x more barriers -> comms-bound.\n", AR_NAME);
+    printf("  all-reduce choice: %s.  Eager is launch-bound (~%d compute launches/token); graphing the\n"
+           "  per-layer compute into 2 replays/layer collapses that to ~%d compute dispatches/token and\n"
+           "  leaves the %d host-launched collectives as the floor.  Expect graphed ~115-125 tok/s.\n",
+           AR_NAME, 7 * N_LAYERS, 2 * N_LAYERS, ar_per_step);
     printf("== done ==\n");
     fflush(stdout);
   }
 
   nvshmem_barrier_all();
   CK(cudaEventDestroy(ev0)); CK(cudaEventDestroy(ev1));
+  if (S.exec_A)  cudaGraphExecDestroy(S.exec_A);
+  if (S.exec_B)  cudaGraphExecDestroy(S.exec_B);
+  if (S.graph_A) cudaGraphDestroy(S.graph_A);
+  if (S.graph_B) cudaGraphDestroy(S.graph_B);
   nvshmem_free(S.ar_acc); nvshmem_free(S.ar_recv);
   CK(cudaStreamDestroy(S.stream));
   nvshmem_finalize();

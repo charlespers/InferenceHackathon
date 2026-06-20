@@ -142,20 +142,44 @@ export function ChatPane({ base, onTurn }: Props) {
         /* ── Empty state: logo + tagline + input all centered ── */
         <div className="flex-1 flex flex-col items-center justify-center gap-6 px-8 pb-8">
           <Logo className="w-44 h-44 opacity-60" />
-          <p className="font-chat text-sm text-neutral-500 dark:text-neutral-600 tracking-wide select-none">
-            {"ask anything".split("").map((ch, i, arr) => {
-              const t = Math.pow(i / (arr.length - 1), 2); // quadratic — slow start, fast end
-              return (
-                <span key={i} style={{
-                  display: "inline-block",
-                  opacity: 1 - t * 0.52,
-                  transform: `scaleX(${1 + t * 6.0})`,
-                  transformOrigin: "left center",
-                  letterSpacing: `${t * 38}px`,
-                  marginRight: ch === " " ? "10px" : undefined,
-                }}>{ch}</span>
-              );
-            })}
+          <p className="font-chat text-4xl text-neutral-500 dark:text-neutral-400 select-none" style={{ overflow: "visible" }}>
+            {(() => {
+              // 7 irregular polygonal shards per letter — jagged fracture lines across 3 rows.
+              // At f≈0 they overlap perfectly (normal letter); at f→1 each piece drifts independently.
+              const shards = [
+                { clip: "polygon(0% 0%, 48% 0%, 42% 36%, 0% 32%)",                dx: -3, dy: -5, rot: -7 },
+                { clip: "polygon(48% 0%, 100% 0%, 100% 34%, 42% 36%)",            dx:  2, dy: -6, rot:  5 },
+                { clip: "polygon(0% 32%, 42% 36%, 37% 64%, 0% 60%)",              dx: -5, dy:  0, rot:  6 },
+                { clip: "polygon(42% 36%, 72% 33%, 66% 64%, 37% 64%)",            dx:  0, dy: -4, rot: -5 },
+                { clip: "polygon(72% 33%, 100% 34%, 100% 67%, 66% 64%)",          dx:  6, dy:  1, rot:  8 },
+                { clip: "polygon(0% 60%, 37% 64%, 31% 100%, 0% 100%)",            dx: -4, dy:  5, rot: -6 },
+                { clip: "polygon(37% 64%, 100% 67%, 100% 100%, 31% 100%)",        dx:  3, dy:  6, rot:  5 },
+              ];
+              return "Typhoon".split("").map((ch, i, arr) => {
+                const t = i / (arr.length - 1);
+                const f = Math.min(Math.pow(t, 2.6), 0.65); // cap so even last letter doesn't fully scatter
+                return (
+                  <span key={i} style={{
+                    display: "inline-block",
+                    position: "relative",
+                    marginRight: `${4 + f * 8}px`,
+                    opacity: Math.max(0.8, 1 - f * 0.15),
+                  }}>
+                    <span style={{ visibility: "hidden" }}>{ch}</span>
+                    {shards.map((s, si) => (
+                      <span key={si} style={{
+                        position: "absolute",
+                        inset: 0,
+                        clipPath: s.clip,
+                        transform: `translate(${s.dx * f * 2.4}px, ${s.dy * f * 2.1}px) rotate(${s.rot * f * 0.55}deg)`,
+                        transformOrigin: "center center",
+                        filter: undefined,
+                      }}>{ch}</span>
+                    ))}
+                  </span>
+                );
+              });
+            })()}
           </p>
           <div className="w-full max-w-lg rounded-xl px-4 py-3
                           border border-black/30 dark:border-white/[0.08]

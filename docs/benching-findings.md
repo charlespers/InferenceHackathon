@@ -76,6 +76,29 @@ drafters at fp8 target):
 - This is the single largest lever but the highest effort (draft models + tree
   verify). Acceptance rate α is the key unknown — re-run with the measured α.
 
+## Measured reality check (from `results/`)
+
+Applying the suite's stats to the committed on-box A/B runs (small dev instance at
+`localhost:8077`, decode=64, 2 samples each):
+
+| run | decode tok/s (95% CI) | % of roofline | regime |
+|-----|----------------------|--------------:|--------|
+| `ab_baseline` | 13.21 (13.19–13.23) | ~2.5% | launch/host-bound |
+| `ab_adaptive` | 9.64 (9.61–9.67) | ~1.8% | launch/host-bound |
+
+The 95% CIs are **disjoint** → adaptive top-k is **significantly slower (−27%)** in
+this measurement (`means_differ` = True; `gate --baseline` would fail it). Both runs
+are at **~2% of the analytical roofline**, i.e. the path is dominated by
+launch/host/comms, not memory bandwidth.
+
+**Implication (roofline lens):** byte-saving levers — adaptive top-k, int4, KV
+quant — only pay off once you're in the memory-bound regime (high % of floor). At
+2% of floor the per-token *fixed* overhead dominates, so the first lever is the
+serving **fast-path** (CUDA graphs, host overhead, comms), which the suite labels
+`kernel_gap`. Re-evaluate adaptive top-k after the fast-path lands and % of floor
+climbs. (Dev-box numbers; not the 8×H100 production path — but the regime
+conclusion is layout-independent.)
+
 ## Method notes
 
 - Decode = memory-bound (MBU); prefill = compute-bound (MFU) — reported separately.

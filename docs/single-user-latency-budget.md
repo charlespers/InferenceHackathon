@@ -33,6 +33,11 @@ direct K5 territory (vLLM `fused_moe` ~0.16 vs the tuned 0.46).
 | TTFT (cached / fresh) | 777 ms | **~10 / ~40 ms** | ~20–80× |
 | **perceived (128 tok)** | **2271 ms** | **~410–550 ms** | **~4–5×** |
 
+**UPDATE — with the convergent answer (EAGLE3 spec, τ≈3.5 vs n-gram's ~2):** the cheap-wins stack
+(prefix-cache + EAGLE3 + TP8 + comms LL) → **~508 tok/s / 259 ms perceived (~8.8×)**; **+ the K5 kernel
+(eff 0.46) + tuned comms (6µs) → ~754 tok/s / 174 ms (~13×)** (`tools/latency_budget.py --spec-tau 3.5`).
+EAGLE3's accept length (~3.5) drives the bigger multiplier; that's why the team converged on it.
+
 ## The order that gets there (data-grounded, cheap-first)
 1. **Prefix caching** — free, ~50–100× TTFT for repeated/structured prompts. Ship now (`E-ttft`).
 2. **`E-attr`** — split the 7 ms floor; tells you whether comms (E0b) or kernels (K5) is the bigger decode win.

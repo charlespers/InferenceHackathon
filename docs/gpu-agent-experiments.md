@@ -89,6 +89,19 @@ Record: does it launch (vs the block-128 192-crash)? TPOT/tok-s vs bf16-TP8 (85.
 **Predicted floor 262 (16µs) → 638 (tuned comms).** This + E0b comms tuning is the highest-ceiling combo
 without a requant. If dynamic fp8 fails/regresses, fall back to a block-64 FP8 requant (192/64=3).
 
+### E-ttft — Prefix caching + TTFT attribution  ⟵ cheap, big single-user-latency win (untouched)
+Measured TTFT is **777ms** (~20–300× the ~5–40ms prefill physics) — overhead-bound, the other half of
+single-user latency (34% of TTFT+128·TPOT). See `docs/ttft-analysis.md`.
+```bash
+# A) prefix caching (the headline lever; turn-2 repeat = cache hit -> TTFT ~ first decode step):
+vllm serve /alloc/data/Qwen3-235B-A22B --tensor-parallel-size 8 --dtype bfloat16 --enable-prefix-caching ...
+#    measure TTFT on a fresh prompt vs an immediate repeat.
+# B) TTFT vs prompt length (--decode 1): intercept=fixed/eager overhead, slope=real prefill/token.
+for P in 16 128 512 2048 8192; do python3 bench/measure.py --base ... --ctx $P --decode 1; done
+```
+Record fresh-vs-cached TTFT + the length curve. **Prefix caching is a likely ~50–100× TTFT cut for
+repeated/structured prompts — ship it.** Flat huge intercept → prefill runs eager (graph/compile it).
+
 ### E1 — End-to-end B=1 engine baseline (FP8 + expert-parallel)  ⟵ now lower priority than E0b/E2b
 Goal: the headline real single-user tok/s + which term dominates.
 ```bash

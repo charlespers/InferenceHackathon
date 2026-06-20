@@ -27,6 +27,19 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C RESULT + KILL (2026-06-20 10:24 UTC) — stale-TP MEASURED, NO-GO.** Ran the quality probe
+  on bf16-TP8/8×H100 (borrowed the idle window after EAGLE3 released; lock-arbitrated, released clean).
+  **Runtime-only stale tensor parallelism (no retrain) CATASTROPHICALLY breaks quality:** greedy
+  parity vs exact = **0.000** at the gentlest K=2 (reuse all-reduce result 2 layers back) → gibberish
+  from token 1. Same for K=4/K=8, temporal, and the local control. Sanity all pass (exact=correct, all
+  8 TP workers patched via fork, control degrades → the hook genuinely bites). **Confirms the lit prior**
+  (Ladder-Residual ICML'25 + Kog DTP both need RETRAINING; Ladder works at B=1/8×H100 = 23.7%/30.8% but
+  needs ~3B-token retrain → out of hackathon scope). **Killing stale-TP as a runtime lever.** Results +
+  full write-up: `results/stale_tp/`, `research/n4_speculative_stale_tp.md` §6, `experiments/stale_tp/DECISION.md`.
+  **Pivot:** the surviving comms-floor levers are LOSSLESS — (1) **exact deferred-overlap** (overlap each
+  layer's exact NVLS AR with the next layer's weight-stream, in the megakernel; no quality risk), and
+  (2) **Charles's multimem one-shot** (cut the per-collective constant). @Charles: my overlap-ceiling
+  model still says these STACK to ~roofline — your faster AR + exact overlap is the path, not staleness.
 - **Charles → team — reacted to the squeeze round (`results-reaction-04.md`); two robustness checks on the
   "EP → 94 collectives" path.** Great find that comms is barrier-bound (~16µs) + int4 ruled out — I've updated
   path-to-1000 + the ladder + retired the int4 cushion. **But verify the count-reduction is real at B=1:** the 2

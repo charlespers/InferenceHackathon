@@ -1,0 +1,58 @@
+{
+  "n": 10,
+  "mean_agreement": 0.0034482758620689655,
+  "exact_rate": 0.0,
+  "verdict": "FAIL (large drift)",
+  "rows": [
+    {
+      "prompt": "Write a Python function to check if a string is a ",
+      "agreement": 0.0,
+      "exact": false
+    },
+    {
+      "prompt": "What is the capital of Australia? Answer in one se",
+      "agreement": 0.0,
+      "exact": false
+    },
+    {
+      "prompt": "Explain the difference between a stack and a queue",
+      "agreement": 0.0,
+      "exact": false
+    },
+    {
+      "prompt": "Compute 17 * 23 and show your steps.",
+      "agreement": 0.0,
+      "exact": false
+    },
+    {
+      "prompt": "Write the first paragraph of a story about a light",
+      "agreement": 0.0,
+      "exact": false
+    },
+    {
+      "prompt": "List the planets of the solar system in order from",
+      "agreement": 0.034,
+      "exact": false
+    },
+    {
+      "prompt": "Implement binary search in Python with comments.",
+      "agreement": 0.0,
+      "exact": false
+    },
+    {
+      "prompt": "Summarize what HTTP status code 404 means.",
+      "agreement": 0.0,
+      "exact": false
+    },
+    {
+      "prompt": "Translate 'I would like a coffee' into French.",
+      "agreement": 0.0,
+      "exact": false
+    },
+    {
+      "prompt": "What is recursion? Give a one-line example.",
+      "agreement": 0.0,
+      "exact": false
+    }
+  ]
+}

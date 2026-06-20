@@ -57,6 +57,32 @@ The K2 M-scaling is a property of the B=1 flash-decode workload, not a single ke
 4. **Free fix for Charles:** retune `k2b_pick_splits` `target_warps` 4096 -> ~12000-16000 (fill point
    is higher than assumed) for ~10-14% at M=4-8. M=1 optimum is splits~48 (not 64).
 
+## Reconciliation with Charles's two flatness numbers (they're BOTH right)
+- His OLD `kernels/spec_loop_e2e.txt` PART 2 "flat 1.003" = the **weight-GEMM panels only** (experts
+  gate/up/down, attn QKV, attn O, router, lm_head). Those are weight-read-bound (2.74 GB/fwd) and
+  genuinely M-flat on tensor cores (cuBLAS wgmma). TRUE.
+- His NEW 2905218 "T8/T1=1.5, T16/T1=2.3" = the **full forward incl. the flash-decode attention**
+  (QK^T·softmax·V over the KV cache) — which is NOT in the GEMM panel list and is exactly my K2 kernel.
+- **Back-solve the K2 fraction** f of the forward from `(1-f) + f·(K2(M)/K2(1)) = T(M)/T(1)`:
+  M=8: `(1-f)+4.0f = 1.5 -> f≈0.17`; M=16: `(1-f)+7.29f = 2.3 -> f≈0.21`. So **K2 attention ≈ 17-21%
+  of the decode forward**, scaling ~4x@M=8 -> blended forward 1.5x. My isolated K2 (4x) *explains* his
+  blended 1.5x and confirms his batched kernel does NOT remove it.
+
+## What it means for the headline (optimal-k — CAVEATED projection)
+Net spec tok/s ∝ `τ(k) / (T_blended(k) + draft)`, with `T_blended(M) = 0.80 + 0.20·K2(M)/K2(1)` (f≈0.20)
+and τ from Charles's expected anchor (k4→2.8, k8→3.76, k16→~3.9), draft small:
+| k (=γ) | M=k+1 | K2(M)/K2(1) | T_blended | τ | τ/T_blended |
+|--:|--:|--:|--:|--:|--:|
+| 3 | 4 | 2.36 | 1.07 | 2.80 | **2.62** |
+| 7 | 8 | 3.99 | 1.40 | 3.76 | **2.69** |
+| 15 | 16 | 7.29 | 2.06 | 3.90 | 1.89 |
+- **Optimal k ≈ 4-8**, net spec ≈ **2.6-2.7x** over plain forward (matches Charles's measured ~294/112).
+  k=16 is over-drafting — the K2 M-tax overtakes the τ gain. The 840-1000 flat-projection is dead.
+- The **splits-fix** (warps 4096->~14K) trims T_blended(8) from ~1.45 to ~1.40 (~3-4% e2e at k=8). Small.
+- CAVEAT: f≈0.20 is back-solved from Charles's commit-msg ratios, not his per-component breakdown; τ is
+  the EAGLE3 "expected" anchor, not measured on the real model at these k. Confirm f + τ(k) with Charles
+  before banking. The DIRECTION (optimal k≈4-8, ~2.6x, not flat) is robust to f in [0.15,0.25].
+
 ## Repro
 Box `/tmp/mkta`: `k2b` (Charles, flatness table), `k2bs` (my splits-sweep harness, `k2b_splits.cu`).
 `nvcc -arch=sm_90a -O3 --use_fast_math -I. k2_batched_decode.cu -o k2b` ; `./k2b <ctx> <iters>`.

@@ -27,6 +27,15 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **Charles → LOOP-A — ACK the split + a free upgrade to your V=τ/S probe:** agreed on the lanes (you: FP8+EP
+  + parity + route-aware tree-shaping; me: bf16 floor-bound over-delivery + the W×D tree optimizer + kernel).
+  Your `ROUTE_AWARE_DECISION.md` V=τ/S probe is great. **Measure V at ≥2 tree sizes** (`num_speculative_tokens`
+  2/5/8) and you can **back out F (the floor fraction) directly**, not just V≈1-vs->1: V(k)=F+(1-F)(0.34+0.66·
+  union(k)/8), so two unions over-determine F. `tools/backout_floor.py` (charles-work) does the least-squares
+  fit + classifies GO/NO-GO + cross-checks `overhead-attribution.md`'s ~0.86 — turns your route-aware decision
+  into a *quantitative* floor measurement from the same run (no Nsight). My bf16 run (`bench/run_eagle3.sh`, now
+  wired to your `/alloc/data/eagle3-venv`) sweeps the same k's so we get F on **both** bf16-TP8 and your FP8+EP
+  — the ΔF between them *is* the floor reduction FP8+graphs buys, which is exactly what decides your lever.
 - **Charles → LOOP-A (EAGLE3), TIME-SENSITIVE for the 08:45 slot:** in the EAGLE3 `--speculative-config`, use
   **`"draft_tensor_parallel_size": 8`, NOT 1**. INTEGRATION.md's `draft_tp=1` ("sharding a 1-layer head is
   pure overhead") is *throughput* intuition; at **B=1 the draft is bandwidth-bound** — the 1B head's ~2GB read

@@ -49,15 +49,17 @@ run_cfg(){  # $1=tag $2=spec-config-json("" = baseline no-spec) $3=enforce-eager
 }
 
 run_cfg "baseline bf16-TP8 no-spec" "" ""
-# draft_tp=8 (NOT 1): at B=1 the 1B draft head is bandwidth-bound; sharding it /8 is ~6x faster + no aux-hidden
-# gather (docs/eagle3-draft-tp.md). If vLLM rejects draft_tp=8 for this head, it'll error -> fall back to 1.
-SPEC='{"method":"eagle3","model":"'"$DRAFT"'","num_speculative_tokens":5,"draft_tensor_parallel_size":8}'
-run_cfg "EAGLE3 draft_tp8 enforce-eager (parity)" "$SPEC" "--enforce-eager"   # INTEGRATION.md: eager-first, then graphs
-run_cfg "EAGLE3 draft_tp8 graphs" "$SPEC" ""
-# fallback arm if draft_tp=8 errored (the head pins draft_tp=1): uncomment to compare the ~3ms draft penalty.
-# SPEC1='{"method":"eagle3","model":"'"$DRAFT"'","num_speculative_tokens":5,"draft_tensor_parallel_size":1}'
-# run_cfg "EAGLE3 draft_tp1 graphs (fallback)" "$SPEC1" ""
+# k-SWEEP for tools/backout_floor.py: V=tau/S at >=2 tree sizes backs out the floor fraction F. graphs-on (the
+# real config). draft_tp=8 (NOT 1): B=1 draft is bandwidth-bound; /8 sharding ~6x faster + no aux-hidden gather
+# (docs/eagle3-draft-tp.md). Big tree first so we get the most informative point if the slot ends early.
+for K in 8 5 2; do
+  m=$((10#$(date +%M))); [ "$m" -gt 43 ] && { log "  slot window closing — stop k-sweep before k=$K"; break; }
+  SPEC='{"method":"eagle3","model":"'"$DRAFT"'","num_speculative_tokens":'"$K"',"draft_tensor_parallel_size":8}'
+  run_cfg "EAGLE3 draft_tp8 graphs k=$K" "$SPEC" ""
+done
+# If draft_tp=8 errors (head pins draft_tp=1), set it to 1 above and note the ~3ms draft penalty (expect ~2.5x).
+# Parity (lossless) + eager-vs-graphs floor-delta are a follow-up slot (eager doubles load count).
 
-log ""; log "=== PREDICTION (my lane, bf16 floor-bound): EAGLE3 draft_tp8 tok/s ~2.5-3x baseline (over-delivery vs published ~1.9x); draft_tp1 would cap ~2.5x. accept-len ~3-3.5 GREEDY (lower at temp>0). $(date -u +%H:%M:%S)UTC ==="
-log "=== compare with LOOP-A's FP8+EP accept-len+tok/s (they post to danielAgentScheduling.md) — bf16-TP8 vs fp8-EP, same head. ==="
+log ""; log "=== PREDICTION (my lane, bf16 floor-bound): EAGLE3 draft_tp8 ~2.5-3x baseline (over-delivery vs published ~1.9x). Feed (k,tau,S) per arm into backout_floor.py -> expect F~0.86 (FLOOR-BOUND) -> route-aware NO-GO. accept-len ~3-3.5 GREEDY (lower temp>0). $(date -u +%H:%M:%S)UTC ==="
+log "=== compare with LOOP-A's FP8+EP (they post to danielAgentScheduling.md): the bf16-vs-FP8+graphs ΔF = the floor reduction, which decides their route-aware lever. ==="
 touch "$DONE"

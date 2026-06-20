@@ -83,7 +83,13 @@
 #include <cuda_runtime.h>
 #include <nccl.h>
 #include "common.cuh"
+#include "nvls_engine.cuh"     // NVLS multimem in-switch all-reduce (replaces NCCL for the 188 layer ARs)
 using namespace q3;
+
+// ---- NVLS toggle: build with -DUSE_NVLS=0 to fall back to the NCCL all-reduces (A/B comparison). ---
+#ifndef USE_NVLS
+#define USE_NVLS 1
+#endif
 
 // ---- Pull in the existing validated kernels as ONE translation unit (same recipe as decode_step.cu).
 #define K5_NO_MAIN
@@ -237,6 +243,8 @@ struct RankState {
   int rank = 0, dev = 0;
   cudaStream_t stream = nullptr;
   ncclComm_t   comm   = nullptr;
+  NvlsCtx*     nvls   = nullptr;   // NVLS multimem AR context (null -> NCCL fallback).  attn_partial/
+                                   // moe_partial are repointed to nvls->uc halves when NVLS is active.
 
   // residual ping-pong (full [HIDDEN] on every rank after each all-reduce).
   float *h_a = nullptr, *h_b = nullptr;
@@ -609,6 +617,22 @@ static inline void tp8_k4_launch(const float* h, const float* w_post_norm,
 //   matches them across ranks.  We bracket each with ncclGroupStart/End so the 8 per-rank launches are
 //   coalesced into one collective.  Because K3/K5b produce a PARTIAL hidden, we all-reduce(SUM) the
 //   partial, then add the residual locally (so the residual is added exactly once, not 8x).
+// AR dispatch: NVLS multimem in-switch reduce when wired, else the original NCCL all-reduce.  `buf`
+// MUST be the NVLS unicast view (S.attn_partial / S.moe_partial are repointed to it in alloc_rank when
+// NVLS is active), and `elt_off` selects which packed half (NVLS_OFF_ATTN / NVLS_OFF_MOE).  The
+// SUM is identical to NCCL's (exact fp32 add in the switch), so the correctness gate is preserved.
+static inline void ar_sum_hidden(RankState& S, float* buf, int nvls_off, cudaStream_t s) {
+#if USE_NVLS
+  if (S.nvls && S.nvls->ready) {
+    nvls_allreduce_launch(*S.nvls, nvls_off, s);
+    return;
+  }
+#endif
+  NK(ncclGroupStart());
+  NK(ncclAllReduce(buf, buf, HIDDEN, ncclFloat32, ncclSum, S.comm, s));
+  NK(ncclGroupEnd());
+}
+
 static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
   cudaStream_t s = S.stream;
 
@@ -629,9 +653,7 @@ static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
   tp8_k3_launch(S, s);
 
   // ---- AR#1: all-reduce(SUM) the partial O-proj output across the 8 ranks -> full O-proj ----
-  NK(ncclGroupStart());
-  NK(ncclAllReduce(S.attn_partial, S.attn_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s));
-  NK(ncclGroupEnd());
+  ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);
   // full post-attn residual = h_src + reduced O-proj   (added once, locally, on every rank).
   tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_partial, h_dst);
 
@@ -647,9 +669,7 @@ static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
       S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.moe_partial, TOP_K);
 
   // ---- AR#2: all-reduce(SUM) the partial MoE-down across ranks -> full MoE contribution ----
-  NK(ncclGroupStart());
-  NK(ncclAllReduce(S.moe_partial, S.moe_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s));
-  NK(ncclGroupEnd());
+  ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);
   // residual += full MoE contribution (h_dst already holds the post-attn residual; add MoE on top).
   tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_partial, h_dst);
 
@@ -756,13 +776,9 @@ static void replay_tp8_step_kgraph(RankState& S) {
   cudaStream_t s = S.stream;
   for (int layer = 0; layer < N_LAYERS; ++layer) {
     CK(cudaGraphLaunch(S.exec_segA, s));                          // K1,K2,K3 -> attn_partial
-    NK(ncclGroupStart());
-    NK(ncclAllReduce(S.attn_partial, S.attn_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s)); // eager AR#1
-    NK(ncclGroupEnd());
+    ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);          // AR#1 (NVLS or NCCL)
     CK(cudaGraphLaunch(S.exec_segB, s));                          // resid,K4,K5 -> moe_partial
-    NK(ncclGroupStart());
-    NK(ncclAllReduce(S.moe_partial, S.moe_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s));    // eager AR#2
-    NK(ncclGroupEnd());
+    ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);            // AR#2 (NVLS or NCCL)
   }
   CK(cudaGraphLaunch(S.exec_seghead, s));                         // resid,norm,lm_head,argmax
   NK(ncclGroupStart());
@@ -1156,7 +1172,15 @@ static void alloc_rank(RankState& S, int ctx_len) {
   // ---- K3 SHARD: Wo[HIDDEN, Q_DIM_RANK=1024] column-slice for this rank's heads ----
   CK(cudaMalloc(&S.Wo, (size_t)HIDDEN * Q_DIM_RANK * sizeof(fp8)));  fill_fp8(S.Wo, (size_t)HIDDEN*Q_DIM_RANK, 30u + S.rank);
   CK(cudaMalloc(&S.Wo_scale, HIDDEN * sizeof(float)));               fill_f32(S.Wo_scale, HIDDEN, 31u, 0.02f, true);
+  // attn_partial: when NVLS is wired, point it at the MC-bound unicast buffer's ATTN half (so K3 writes
+  // there, the multimem reduce sums in-switch, and the residual-add reads the reduced result).  Else a
+  // plain cudaMalloc (NCCL reduces it).  moe_partial below points at the MOE half the same way.
+#if USE_NVLS
+  if (S.nvls && S.nvls->ready) S.attn_partial = S.nvls->uc + NVLS_OFF_ATTN;
+  else                         CK(cudaMalloc(&S.attn_partial, HIDDEN * sizeof(float)));
+#else
   CK(cudaMalloc(&S.attn_partial, HIDDEN * sizeof(float)));
+#endif
 
   // ---- K4 REPLICATED ----
   CK(cudaMalloc(&S.w_post_norm, HIDDEN * sizeof(float)));       fill_f32(S.w_post_norm, HIDDEN, 40u, 0.5f, true);
@@ -1192,7 +1216,12 @@ static void alloc_rank(RankState& S, int ctx_len) {
   CK(cudaMalloc(&S.Wgu_scale_d, N_EXPERTS * sizeof(float*))); CK(cudaMemcpy(S.Wgu_scale_d, Sgu_full.data(), N_EXPERTS*sizeof(float*), cudaMemcpyHostToDevice));
   CK(cudaMalloc(&S.Wd_scale_d,  N_EXPERTS * sizeof(float*))); CK(cudaMemcpy(S.Wd_scale_d,  Sd_full.data(),  N_EXPERTS*sizeof(float*), cudaMemcpyHostToDevice));
   CK(cudaMalloc(&S.a_glb, (size_t)TOP_K * MOE_INTER_RANK * sizeof(float)));
+#if USE_NVLS
+  if (S.nvls && S.nvls->ready) S.moe_partial = S.nvls->uc + NVLS_OFF_MOE;
+  else                         CK(cudaMalloc(&S.moe_partial, HIDDEN * sizeof(float)));
+#else
   CK(cudaMalloc(&S.moe_partial, HIDDEN * sizeof(float)));
+#endif
 
   // K5 plan: MULTIPLE-ROWS-PER-WARP (RA gate+up, RB down) — the measured win on the TP=8 192-shard
   // (k5_sharded_bench.cu: R=1/block=256 -> 15% MBU; RA=2/RB=8/block=512 -> ~34% MBU, 2.2x).  Grid is
@@ -1287,9 +1316,7 @@ static void sharded_one_layer_capture(std::vector<RankState>& R,
     tp8_k2_launch(S, s);
     CK(cudaMemsetAsync(S.attn_partial, 0, HIDDEN * sizeof(float), s));
     tp8_k3_launch(S, s);
-    NK(ncclGroupStart());
-    NK(ncclAllReduce(S.attn_partial, S.attn_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s));
-    NK(ncclGroupEnd());
+    ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);                  // AR#1 (NVLS or NCCL)
     tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_partial, h_dst);   // r1 = h_src + AR(O-proj)
     if (S.rank == 0) CK(cudaMemcpyAsync(r1_out_host, h_dst, HIDDEN * sizeof(float),
                                         cudaMemcpyDeviceToHost, s));
@@ -1301,9 +1328,7 @@ static void sharded_one_layer_capture(std::vector<RankState>& R,
         h_dst, S.sel_idx, S.Wgu_d, S.Wgu_scale_d, S.a_glb, TOP_K);
     tp8_k5b_down<<<S.k5.ctasB, S.k5.block, S.k5.smemB, s>>>(
         S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.moe_partial, TOP_K);
-    NK(ncclGroupStart());
-    NK(ncclAllReduce(S.moe_partial, S.moe_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s));
-    NK(ncclGroupEnd());
+    ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);                    // AR#2 (NVLS or NCCL)
     tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_partial, h_dst);    // r2 = r1 + AR(MoE)
     if (S.rank == 0) CK(cudaMemcpyAsync(r2_out_host, h_dst, HIDDEN * sizeof(float),
                                         cudaMemcpyDeviceToHost, s));
@@ -1696,9 +1721,23 @@ int main(int argc, char** argv) {
   for (int r = 0; r < TP; ++r) devs[r] = r;
   NK(ncclCommInitAll(comms.data(), TP, devs.data()));   // 8 ranks on 1 process
 
+  // ---- NVLS: wire the in-switch multimem all-reduce over the 8 GPUs (before per-rank alloc, so the
+  //      AR buffers attn_partial/moe_partial can be repointed onto the multicast-bound memory).  If
+  //      multicast isn't supported (no NVSwitch / driver), nvls_engine_setup returns false and the
+  //      engine transparently falls back to the NCCL all-reduces (ar_sum_hidden dispatch). -----------
+  std::vector<NvlsCtx> nvls;
+  bool nvls_on = false;
+#if USE_NVLS
+  nvls_on = nvls_engine_setup(nvls, TP);
+  if (!nvls_on) printf("NVLS unavailable -> falling back to NCCL all-reduces.\n");
+#else
+  printf("NVLS disabled at build (USE_NVLS=0) -> NCCL all-reduces.\n");
+#endif
+
   // ---- per-rank state + stream ----
   for (int r = 0; r < TP; ++r) {
     R[r].rank = r; R[r].dev = r; R[r].comm = comms[r];
+    if (nvls_on) R[r].nvls = &nvls[r];
     CK(cudaSetDevice(r));
     CK(cudaStreamCreate(&R[r].stream));
     alloc_rank(R[r], ctx_len);
@@ -1778,13 +1817,12 @@ int main(int argc, char** argv) {
   CK(cudaSetDevice(0)); CK(cudaEventSynchronize(ev1));
   CK(cudaEventElapsedTime(&ms_full, ev0, ev1)); ms_full /= IT;
 
-  // ---- (b) all-reduce-only timing: same 189 collectives/step, NO kernels, to isolate AR overhead --
+  // ---- (b) all-reduce-only timing: same 189 collectives/step, NO kernels, to isolate AR overhead.
+  //      Uses the SAME dispatch as the engine (NVLS when wired, else NCCL) so this measures the comms
+  //      cost actually being shipped — the before->after the report cites. ---------------------------
   auto enqueue_ar_only = [](RankState& S, int n) {
-    for (int l = 0; l < n; ++l) {
-      NK(ncclGroupStart());
-      NK(ncclAllReduce(S.attn_partial, S.attn_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, S.stream));
-      NK(ncclGroupEnd());
-    }
+    for (int l = 0; l < n; ++l)
+      ar_sum_hidden(S, S.attn_partial, (l & 1) ? NVLS_OFF_MOE : NVLS_OFF_ATTN, S.stream);
   };
   float ms_ar = 0.f;
   {

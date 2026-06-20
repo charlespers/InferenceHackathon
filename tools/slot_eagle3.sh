@@ -58,8 +58,12 @@ launch_measure () {
         --decode 64 --repeats 3 --out "$OUT/m_$label.json" >> "$LOG" 2>&1
     $PY "$TOOLS/quality_probe.py" --base http://localhost:$PORT --model qwen3 \
         --tokens 96 --out "$OUT/q_$label.json" >> "$LOG" 2>&1
-    echo "--- $label spec/accept metrics (from server log) ---" >> "$LOG"
+    echo "--- $label spec/accept metrics (server log) ---" >> "$LOG"
     grep -iE 'accept|draft|spec|efficien' "$OUT/vllm_$label.log" | tail -8 >> "$LOG"
+    # vLLM v1 reports spec counters via Prometheus, not always stdout — scrape both.
+    curl -s -m5 http://localhost:$PORT/metrics 2>/dev/null \
+      | grep -iE 'spec_decode|accept|draft|num_emitted' > "$OUT/metrics_$label.txt" 2>/dev/null
+    echo "  scraped $(wc -l < "$OUT/metrics_$label.txt" 2>/dev/null || echo 0) spec metric lines -> metrics_$label.txt" >> "$LOG"
   fi
   kill $vpid 2>/dev/null; sleep 20    # free HBM before the next launch
 }
@@ -95,7 +99,7 @@ if [ -f "$OUT/q_baseline_fp8.json" ] && [ -f "$OUT/q_eagle3_eager.json" ]; then
 fi
 
 # Share results to origin/djamoils-results (box can't push main; results/* gitignored)
-RES=$(ls "$OUT"/m_*.json "$OUT"/parity_gate.json "$OUT"/q_*.json 2>/dev/null)
+RES=$(ls "$OUT"/m_*.json "$OUT"/parity_gate.json "$OUT"/q_*.json "$OUT"/metrics_*.txt 2>/dev/null)
 if [ -n "$RES" ]; then
   REPO=/alloc/data/InferenceHackathon
   git -C "$REPO" fetch origin -q 2>/dev/null

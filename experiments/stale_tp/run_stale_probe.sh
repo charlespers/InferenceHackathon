@@ -83,9 +83,14 @@ if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
   # launch ONCE with stale_tp installed; ctl starts as exact (enable=false)
   write_ctl false layer proxy 1
   echo "=== launch bf16-TP8 + stale_tp ($(date -u)) ===" >> "$LOG"
+  # NO '--' separator (it makes every arg positional -> argparse error). Pass MODEL as
+  # the positional model_tag (like `vllm serve MODEL`). VLLM_WORKER_MULTIPROC_METHOD=fork
+  # so forked TP workers INHERIT the main-process monkeypatch (the all-reduce runs in the
+  # workers); avoids a plugin install that would contaminate teammates' vLLM launches.
   STALE_TP_CTL=$CTL STALE_TP_ENABLE=0 STALE_TP_PERIOD=188 STALE_TP_DEBUG=1 \
-  $PYV -c "import sys; sys.path.insert(0,'$TOOLSRC'); import stale_tp; stale_tp.install(); import runpy; runpy.run_module('vllm.entrypoints.openai.api_server', run_name='__main__')" -- \
-      --model "$MODEL" --served-model-name qwen3 \
+  VLLM_WORKER_MULTIPROC_METHOD=fork \
+  $PYV -c "import sys; sys.path.insert(0,'$TOOLSRC'); import stale_tp; stale_tp.install(); import runpy; runpy.run_module('vllm.entrypoints.openai.api_server', run_name='__main__')" \
+      "$MODEL" --served-model-name qwen3 \
       --tensor-parallel-size 8 --max-num-seqs 1 --max-model-len 8192 \
       --no-enable-prefix-caching --enforce-eager --gpu-memory-utilization 0.9 \
       --port $PORT > "$OUT/vllm_stale.log" 2>&1 &

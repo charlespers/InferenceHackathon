@@ -114,6 +114,14 @@ def gen(recs, path):
     recs = [r for r in recs if r.get("best_tok_s")]
     if not recs:
         sys.exit("no parseable CTX blocks in log")
+    # dedup by context: when the sweep emits several reps per ctx, keep the least-contended
+    # (highest tok/s) one — robust best-of-N done in Python, not fragile bash parsing.
+    byctx = {}
+    for r in recs:
+        cur = byctx.get(r["ctx"])
+        if cur is None or r["best_tok_s"] > cur["best_tok_s"]:
+            byctx[r["ctx"]] = r
+    recs = [byctx[c] for c in sorted(byctx)]
     peak = max(r["best_tok_s"] for r in recs)
     fastest = min(recs, key=lambda r: r["ctx"])
     detail = next((r for r in recs if r["ctx"] == 4096), recs[0])  # per-kernel detail @4k

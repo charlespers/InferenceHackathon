@@ -19,3 +19,11 @@ linearly in M. A FUSED FlashAttention kernel (scores in SRAM, never spilled) rem
 ABSOLUTES @M=8 ctx4096: TC+softmax 94us vs warp-shuffle k2b-best 165us (TC ~1.75x faster AND flatter).
 At M=1: TC+softmax 74us vs warp k2b 41us (warp wins -> confirms regime split: warp@M=1, fused-TC@M=k).
 CONCLUSION: build a FUSED TC flash-decode verify (FA-style, fp8 KV, tree/causal mask) — not a cuBLAS split.
+
+CORRECTION (honesty): I attributed the 1.0x->1.3x residual to the "HBM round-trip" of materializing
+scores. The arithmetic refutes that as the MAIN cause: scores @M=8/ctx4096 = 64*8*4096*2B = 4MB, round-
+trip (GEMM1 write + softmax r/w + GEMM2 read) ~16MB/iter @3350GB/s = ~5us — small vs the +20us residual.
+The bulk of the residual is the SEPARATE NAIVE SOFTMAX KERNEL: uncoalesced stride-M reads (S is [M x ctx]
+col-major, ldc=M -> consecutive t are M apart) + 3 passes, scaling with the M warp count. A FUSED FA kernel
+computes softmax INLINE during the GEMM accumulation (no separate pass, no stride-M spill) -> removes this
+residual and should approach the GEMM-only ~1.0x. Net conclusion unchanged (FUSE it), mechanism corrected.

@@ -19,12 +19,13 @@ echo "min GPU free ${freemb}MB" >> "$LOG"
 RESULTS=()
 
 run_mode () {  # $1=label  $2=ENABLE
-  local mode=$1 en=$2
-  echo "=== launch vLLM mode=$mode ENABLE=$en $(date -u) ===" >> "$LOG"
-  ADAPTIVE_TOPK_ENABLE=$en ADAPTIVE_TOPK_K=4 ADAPTIVE_TOPK_THRESH=0.9 ADAPTIVE_TOPK_DEBUG=1 \
-    python3 -c "import experiments.adaptive_topk.vllm_adaptive_moe as m; m.install(); \
-import runpy; runpy.run_module('vllm.entrypoints.openai.api_server', run_name='__main__')" \
-    -- --model "$MODEL" --served-model-name qwen3 --tensor-parallel-size 8 \
+  local mode=$1 en=$2 plug=""
+  [ "$en" = "1" ] && plug="adaptive_topk"   # load the plugin only for adaptive
+  echo "=== launch vLLM mode=$mode ENABLE=$en plugin='$plug' $(date -u) ===" >> "$LOG"
+  VLLM_PLUGINS=$plug ADAPTIVE_TOPK_ENABLE=$en ADAPTIVE_TOPK_K=4 ADAPTIVE_TOPK_THRESH=0.9 \
+  ADAPTIVE_TOPK_DEBUG=1 \
+    python3 -m vllm.entrypoints.openai.api_server \
+       --model "$MODEL" --served-model-name qwen3 --tensor-parallel-size 8 \
        --enable-expert-parallel --max-num-seqs 1 --dtype bfloat16 --max-model-len 8192 \
        --enforce-eager --gpu-memory-utilization 0.9 --port $PORT \
     > /alloc/data/vllm_$mode.log 2>&1 &
@@ -48,6 +49,8 @@ import runpy; runpy.run_module('vllm.entrypoints.openai.api_server', run_name='_
 
 if [ "$freemb" -gt 65000 ]; then
   run_mode baseline 0
+  echo "pip install -e adaptive_topk plugin ..." >> "$LOG"
+  pip install -e experiments/adaptive_topk -q >> "$LOG" 2>&1
   [ $((10#$(date +%M))) -lt 56 ] && run_mode adaptive 1 \
     || echo "skip adaptive (out of slot time)" >> "$LOG"
 else
@@ -61,7 +64,7 @@ if [ ${#RESULTS[@]} -gt 0 ]; then
   if git -C "$REPO" worktree add -f /tmp/reswt origin/main >/dev/null 2>&1; then
     mkdir -p /tmp/reswt/results
     cp "${RESULTS[@]}" /tmp/reswt/results/ 2>/dev/null
-    ( cd /tmp/reswt; git add results 2>/dev/null
+    ( cd /tmp/reswt; git add -f results 2>/dev/null
       git -c user.email=djamoils25@gmail.com -c user.name="djamoils-box" \
         commit -q -m "results: adaptive top-k A/B slot $(date -u)" 2>/dev/null \
         && git push -q -f origin HEAD:djamoils-results 2>>"$LOG" \

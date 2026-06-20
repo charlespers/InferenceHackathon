@@ -96,10 +96,18 @@ int main(int argc, char** argv) {
   }
 
   // ---- one "layer" of compute: K1 -> K2 -> K3, K3's output copied into the target WideBuf slot ----
+  //   USE_GEMM: the FAST cuBLASLt fp8 attention prologue (matches the engine's enqueue_tp8_layer), so
+  //   the hidden-behind window is the REAL (fast) compute, not the slow GEMV — the honest overlap number.
   auto run_k1k2k3 = [&](int r, float* out_buf, cudaStream_t s) {
+#if USE_GEMM
+    gemm_k1_launch(R[r], R[r].h_a, s);
+    tp8_k2_launch(R[r], s);
+    gemm_k3_launch(R[r], s);
+#else
     tp8_k1_launch(R[r], R[r].h_a, s);
     tp8_k2_launch(R[r], s);
     tp8_k3_launch(R[r], s);
+#endif
     // tp8_k3_launch's real output lives in R[r].attn_partial (decode_step_tp8.cu's own buffer);
     // copy it into this layer's ping-pong slot so the AR has a stable, non-aliased target.
     CK(cudaMemcpyAsync(out_buf, R[r].attn_partial, HIDDEN * sizeof(float),

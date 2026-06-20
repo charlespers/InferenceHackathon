@@ -402,6 +402,11 @@ struct RankState {
   float *block_max = nullptr;  int *block_arg = nullptr;
   float *rank_max = nullptr;   int *rank_arg = nullptr;      // [1] each (this rank's best)
 
+  // per-layer fusion flags (set by enqueue_tp8_step): k1_prequant -> K1's input was already
+  // RMSNorm-quantized by the previous layer's fused post-MoE residual; fuse_next_k1 -> this layer's
+  // post-MoE residual should also produce the NEXT layer's K1 quant (false on the last layer).
+  bool k1_prequant = false, fuse_next_k1 = false;
+
   K5Launch k5;                                               // K5 plan for nslot=TOP_K, inter=192
 
 #if USE_GEMM
@@ -648,6 +653,44 @@ extern "C" __global__ void tp8_residual_add_quant(
   for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) Xq[i] = (__nv_fp8_e4m3)(yqbuf[i] * inv);
 }
 
+// FUSED residual_add + RMSNorm + fp8 quant.  Produces y[i]=h_src[i]+reduced[i] (fp32 -> h_dst, the
+// residual base the NEXT add needs) AND RMSNorm(y)->fp8 Xq with per-tensor amax scale (the GEMM input
+// for the immediately-following projection).  Collapses {tp8_residual_add ; gemm_rmsnorm_quant} into a
+// SINGLE launch (one fewer/layer).  Byte-identical to running the two separately: same fp32 add, same
+// RMSNorm (ss over y, rsqrt(ss/HIDDEN+eps)), same amax/448 e4m3 quant.  ONE CTA (clean block reduces).
+extern "C" __global__ void tp8_residual_rmsnorm_quant(
+    const float* __restrict__ h_src, const float* __restrict__ reduced,
+    const float* __restrict__ w_norm, float* __restrict__ h_dst,
+    __nv_fp8_e4m3* __restrict__ Xq, float* __restrict__ act_scale) {
+  extern __shared__ float yrq[];                        // [HIDDEN] residual y (fp32)
+  float ss = 0.f;
+  for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) {
+    float v = h_src[i] + reduced[i]; h_dst[i] = v; yrq[i] = v; ss += v * v;
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, o);
+  __shared__ float wss[32]; const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+  if (lane == 0) wss[wid] = ss; __syncthreads();
+  __shared__ float rinv_sh;
+  if (threadIdx.x == 0) { float s = 0.f; int nw = (blockDim.x + 31) >> 5; for (int i = 0; i < nw; i++) s += wss[i];
+                          rinv_sh = rsqrtf(s / HIDDEN + RMS_EPS); }
+  __syncthreads();
+  const float rinv = rinv_sh;
+  // RMSNorm into yrq (overwrite) + per-thread amax of the normed value.
+  float amax = 0.f;
+  for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) { float v = yrq[i] * rinv * w_norm[i]; yrq[i] = v; amax = fmaxf(amax, fabsf(v)); }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, o));
+  __shared__ float amx[32];
+  if (lane == 0) amx[wid] = amax; __syncthreads();
+  __shared__ float inv_sh;
+  if (threadIdx.x == 0) { float a = 0.f; int nw = (blockDim.x + 31) >> 5; for (int i = 0; i < nw; i++) a = fmaxf(a, amx[i]);
+                          float sc = (a > 0.f) ? (a / 448.0f) : 1.0f; act_scale[0] = sc; inv_sh = 1.0f / sc; }
+  __syncthreads();
+  const float inv = inv_sh;
+  for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) Xq[i] = (__nv_fp8_e4m3)(yrq[i] * inv);
+}
+
 #if USE_GEMM
 // forward decls of the existing kernels the GEMM helpers reuse (defined later in this TU).
 extern "C" __global__ void tp8_k1_epilogue(
@@ -689,6 +732,15 @@ static void gemm_k1_launch(RankState& S, const float* h, cudaStream_t s) {
                                     S.q_norm, S.k_norm, S.rope_cos, S.rope_sin,
                                     S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale);
 }
+// PREQUANT K1: the input was ALREADY RMSNorm-quantized into xq_hidden+act_scale by the previous layer's
+// fused post-MoE residual (tp8_residual_rmsnorm_quant with w_in_norm).  Skip the rmsnorm_quant launch and
+// go straight to the QKV GEMM + epilogue.  (Folds the per-layer post-MoE residual_add into K1's prep.)
+static void gemm_k1_launch_prequant(RankState& S, cudaStream_t s) {
+  S.p_qkv.run(S.xq_hidden, S.Wqkv, S.d_qkv, s);
+  tp8_k1_epilogue_fused<<<1, 256, 0, s>>>(S.d_qkv, S.Wqkv_scale, S.act_scale, S.p_qkv.Mpad,
+                                    S.q_norm, S.k_norm, S.rope_cos, S.rope_sin,
+                                    S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale);
+}
 // K3 O-proj: quantize attn_out -> fp8 X[Q_DIM_RANK], GEMM -> D[*,HIDDEN], scale -> attn_partial.
 //   quant uses 1024 threads (not 256): the amax reduce over Q_DIM_RANK is reduce-bound at M=1, and the
 //   microbench (gemm_fuse_micro.cu) showed <<<1,1024>>> quant = 3.25us vs <<<1,256>>> = 5.3us (~2us/call
@@ -704,6 +756,14 @@ static void gemm_k3_launch(RankState& S, cudaStream_t s) {
 static void gemm_k4_launch(RankState& S, const float* h, cudaStream_t s) {
   const size_t smem = (size_t)HIDDEN * sizeof(float);
   gemm_rmsnorm_quant<<<1, 1024, smem, s>>>(h, S.w_post_norm, S.xq_hidden, S.act_scale, HIDDEN);
+  S.p_gate.run(S.xq_hidden, S.Wgate, S.d_gate, s);
+  tp8_k4_select_fused<<<1, 32, 0, s>>>(S.d_gate, S.act_scale, S.p_gate.Mpad,
+                                       S.Wgate_scale, S.sel_idx, S.sel_w);
+}
+// PREQUANT K4: the residual y was ALREADY RMSNorm-quantized into xq_hidden+act_scale by the fused
+// tp8_residual_rmsnorm_quant (which also wrote the fp32 residual h_dst).  So skip the separate
+// rmsnorm_quant launch and go straight to the gate GEMM + select.  (One fewer launch/layer.)
+static void gemm_k4_launch_prequant(RankState& S, cudaStream_t s) {
   S.p_gate.run(S.xq_hidden, S.Wgate, S.d_gate, s);
   // FUSED: the per-expert dequant (act_scale*Wgate_scale) is applied INSIDE the select, which reads the
   // bf16 gate GEMM output D directly -> the separate gemm_epi_gate launch is removed (one fewer/layer).
@@ -727,7 +787,11 @@ static void gemm_k5_launch(RankState& S, const float* y, const int* /*sel_phys*/
   // ---- gate+up: quantize y, ONE GEMM over the packed [TOP_K*2*192, HIDDEN] weights ----
   //   prequant: y was already quantized into S.xq_hidden + S.act_scale by tp8_residual_add_quant
   //   (the producer of y) -> skip the redundant per-GEMM quant launch.
-  if (!prequant) gemm_quant<<<32, 256, 0, s>>>(y, S.xq_hidden, S.act_scale, HIDDEN);
+  // quant: ONE CTA of 1024 (not 32x256).  gemm_quant computes a per-tensor amax->scale via a BLOCK
+  // reduce that writes act_scale[0]; with >1 block each block sees only its strided slice and races on
+  // act_scale[0] (wrong amax).  The microbench (glue_micro.cu) also showed <<<1,1024>>>=3.4us beats
+  // <<<32,256>>>=5.8us over HIDDEN — so single-CTA is BOTH correct and faster.  (~2us/layer saved.)
+  if (!prequant) gemm_quant<<<1, 1024, 0, s>>>(y, S.xq_hidden, S.act_scale, HIDDEN);
   S.p_k5gu_pack.run(S.xq_hidden, S.Wgu_pack, S.d_k5gu, s);
   // SiLU epilogue: D layout is [Mpad, TOP_K*2*192], slot s at column block s*384 -> a_glb (uses the
   // per-routed-expert gate/up scales via sel_idx).
@@ -954,7 +1018,11 @@ static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
 
 #if USE_GEMM
   // ---- K1: cuBLASLt fp8 QKV GEMM (RMSNorm+quant -> GEMM -> scale) + the unchanged QK-norm/RoPE epi.
-  gemm_k1_launch(S, h_src, s);
+  //   k1_prequant: the PREVIOUS layer's fused post-MoE residual already RMSNorm-quantized h_src into
+  //   xq_hidden+act_scale, so skip K1's own rmsnorm_quant (one fewer launch/layer).  Layer 0 uses the
+  //   full path (its h_src is the embedding, not produced by a fused residual).
+  if (S.k1_prequant) gemm_k1_launch_prequant(S, s);
+  else               gemm_k1_launch(S, h_src, s);
   // ---- K2: flash-decode (unchanged) ----
   tp8_k2_launch(S, s);
   // ---- K3: cuBLASLt fp8 O-proj GEMM -> PARTIAL hidden (h_in=0; residual added post-all-reduce) ----
@@ -964,15 +1032,25 @@ static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
   gemm_k3_launch(S, s);
   // ---- AR#1 ---- (out-of-place: result lands in S.attn_reduced; residual-add reads THAT)
   ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);
-  tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_reduced, h_dst);
-  // ---- K4: cuBLASLt fp8 router gate GEMM -> g_logits -> select ----
-  gemm_k4_launch(S, h_dst, s);
+  // FUSED: residual add (h_dst = h_src + AR(O-proj)) + K4 RMSNorm + fp8 quant in ONE launch -> xq_hidden
+  // + act_scale, so gemm_k4_launch_prequant skips its own rmsnorm_quant.  Collapses 2 launches -> 1.
+  tp8_residual_rmsnorm_quant<<<1, 1024, (size_t)HIDDEN*sizeof(float), s>>>(
+      h_src, S.attn_reduced, S.w_post_norm, h_dst, S.xq_hidden, S.act_scale);
+  // ---- K4: cuBLASLt fp8 router gate GEMM -> g_logits -> select (input prequantized above) ----
+  gemm_k4_launch_prequant(S, s);
   // ---- K5: cuBLASLt fp8 GROUPED gate+up/down GEMM -> PARTIAL MoE-down hidden ----
   CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
   gemm_k5_launch(S, h_dst, K5_SEL_PHYS_FIXED, s);   // proxy/graphed: fixed slot->shard (graph-safe)
   // ---- AR#2 ----
   ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);
-  tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_reduced, h_dst);
+  // POST-MoE residual.  When fuse_next_k1 is set, fold it with the NEXT layer's K1 RMSNorm+quant:
+  //   h_dst = h_dst + AR(MoE)  AND  RMSNorm(h_dst) -> xq_hidden (next K1's GEMM input).  Else plain add
+  //   (the LAST layer's output goes to final_norm, not a K1).  Removes one residual_add/layer (x93).
+  if (S.fuse_next_k1)
+    tp8_residual_rmsnorm_quant<<<1, 1024, (size_t)HIDDEN*sizeof(float), s>>>(
+        h_dst, S.moe_reduced, S.w_in_norm, h_dst, S.xq_hidden, S.act_scale);
+  else
+    tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_reduced, h_dst);
   return h_dst;
 #else
   // ---- K1: sharded RMSNorm + QKV GEMV (this rank's 2048 rows) + QK-norm + RoPE + KV write ----
@@ -1019,6 +1097,10 @@ static void enqueue_tp8_step(RankState& S) {
   float* cur = S.h_a;
   float* nxt = S.h_b;
   for (int layer = 0; layer < N_LAYERS; ++layer) {
+    // K1 of layer L>0 consumes the prequant produced by layer L-1's fused post-MoE residual.
+    S.k1_prequant = (layer > 0);
+    // Every layer except the last fuses its post-MoE residual into the NEXT layer's K1 quant.
+    S.fuse_next_k1 = (layer + 1 < N_LAYERS);
     float* out = enqueue_tp8_layer(S, cur, nxt);
     cur = out;
     nxt = (cur == S.h_a) ? S.h_b : S.h_a;
@@ -1074,12 +1156,16 @@ static void enqueue_tp8_segA(RankState& S, float* h_in, cudaStream_t s) {
 // segB: residual_add(h_in + attn_reduced -> h_out) -> K4 -> memset(moe_partial) -> K5a -> K5b.
 //   attn_reduced is the AR#1 result (eager AR ran before this segment replays; out-of-place -> OUT half).
 static void enqueue_tp8_segB(RankState& S, float* h_in, float* h_out, cudaStream_t s) {
-  tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.attn_reduced, h_out);
 #if USE_GEMM
-  gemm_k4_launch(S, h_out, s);
+  // FUSED residual add + K4 RMSNorm + fp8 quant (matches enqueue_tp8_layer): one launch -> h_out (fp32
+  // residual) + xq_hidden/act_scale (K4 GEMM input).  Then K4 GEMM+select consumes the prequantized X.
+  tp8_residual_rmsnorm_quant<<<1, 1024, (size_t)HIDDEN*sizeof(float), s>>>(
+      h_in, S.attn_reduced, S.w_post_norm, h_out, S.xq_hidden, S.act_scale);
+  gemm_k4_launch_prequant(S, s);
   CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
   gemm_k5_launch(S, h_out, K5_SEL_PHYS_FIXED, s);   // graph-safe fixed slot->shard
 #else
+  tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.attn_reduced, h_out);
   tp8_k4_launch(h_out, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, S.g_logits, s);
   CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
   tp8_k5a_gateup<<<S.k5.ctasA, S.k5.block, S.k5.smemA, s>>>(
@@ -1707,12 +1793,14 @@ static void fill_f32(float* dptr, size_t n, unsigned seed, float scale, bool pos
 // -> latency-bound partial.  Sweep (4096): 64 -> 21.5us, 128 -> 18.6us (BEST), 192 -> 19.6 (partial keeps
 // dropping but the reduce's HBM partial-read grows).  128 is the partial/reduce balance for the shard.
 static inline int tp8_k2_splits(int ctx_len) {
-  // Joint sweep (4096) of n_splits x reduce-warps (k2r_warps=32): 64/8 -> 21.5us, 128/32 -> 15.6us,
-  // 192/32 -> 14.6us (BEST), 256/32 -> 14.8us.  192 splits with the 32-warp reduce is the balance:
-  // the partial's dependent chain is short (4096/192 ~21 steps) and the wide reduce hides the partials' read.
-  int s = 192;
+  // In-GRAPH sweep (ctx 4096, full TP=8 graphed step, the headline metric): K2_SPLITS 96->106.7,
+  // 128->108.4, 192->110.5, 256->111.2 tok/s — monotone, 256 best.  (The earlier 192-best was a
+  // standalone eager K2 microbench; in the full graphed token the launch overhead the eager sweep
+  // saw is gone, so MORE splits keeps winning until the partial chunk gets too short.)  256 @ 4096.
+  int s = 256;
   if (ctx_len <= 1024) s = 96;                   // short ctx: fewer splits keep each chunk amortized
-  if (ctx_len > 16384) s = 256;                  // long ctx: more parallelism, chunks stay long
+  if (ctx_len <= 2048) s = 192;                  // mid ctx: 192 balances chunk length vs parallelism
+  if (ctx_len > 16384) s = 320;                  // long ctx: more parallelism, chunks stay long
   int max_by_chunk = (ctx_len + 31) / 32;
   if (s > max_by_chunk) s = max_by_chunk;
   if (s < 1) s = 1;
@@ -1988,10 +2076,13 @@ static void sharded_one_layer_capture(std::vector<RankState>& R,
     tp8_k2_launch(S, s);
     gemm_k3_launch(S, s);   // no memset: gemm_epi_scale fully overwrites attn_partial (see enqueue_tp8_layer)
     ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);                  // AR#1 (NVLS or NCCL)
-    tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_reduced, h_dst);   // r1 = h_src + AR(O-proj)
+    // FUSED residual add + K4 RMSNorm + quant (the ENGINE path being validated): r1 = h_src + AR(O-proj)
+    // written to h_dst (fp32), and RMSNorm(r1)->fp8 xq_hidden for the gate GEMM.
+    tp8_residual_rmsnorm_quant<<<1, 1024, (size_t)HIDDEN*sizeof(float), s>>>(
+        h_src, S.attn_reduced, S.w_post_norm, h_dst, S.xq_hidden, S.act_scale);
     if (S.rank == 0) CK(cudaMemcpyAsync(r1_out_host, h_dst, HIDDEN * sizeof(float),
                                         cudaMemcpyDeviceToHost, s));
-    gemm_k4_launch(S, h_dst, s);                                          // GEMM gate -> sel_idx/sel_w
+    gemm_k4_launch_prequant(S, s);                                        // GEMM gate -> sel_idx/sel_w
     // resolve the REAL routed expert -> physical shard map host-side (eager path: D2H is OK here).
     CK(cudaMemcpyAsync(S.sel_h, S.sel_idx, TOP_K * sizeof(int), cudaMemcpyDeviceToHost, s));
     CK(cudaStreamSynchronize(s));
@@ -2715,6 +2806,26 @@ int main(int argc, char** argv) {
         }
         if (r == 0) CK(cudaEventRecord(g_ev_k1, R[0].stream));
         CK(cudaStreamSynchronize(S.stream));
+        // ---- DIAGNOSTIC 2 (rank 0): isolate segA(K1,K2,K3) vs segB(resid,K4,K5) vs head, each x94,
+        //      back-to-back, no ARs, one sync.  Splits the kernels-only floor across the two sides. ----
+        if (r == 0) {
+          auto timeseg = [&](cudaGraphExec_t g, int reps)->double{
+            CK(cudaStreamSynchronize(S.stream));
+            cudaEvent_t a,b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+            for(int w=0;w<5;w++){ for(int j=0;j<reps;j++) CK(cudaGraphLaunch(g,S.stream)); }
+            CK(cudaStreamSynchronize(S.stream)); CK(cudaEventRecord(a,S.stream));
+            for(int i=0;i<IT;i++) for(int j=0;j<reps;j++) CK(cudaGraphLaunch(g,S.stream));
+            CK(cudaEventRecord(b,S.stream)); CK(cudaEventSynchronize(b));
+            float ms; CK(cudaEventElapsedTime(&ms,a,b));
+            CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+            return (double)ms/IT*1e3; // us for `reps` launches
+          };
+          double segA_us = timeseg(S.exec_segA, N_LAYERS);
+          double segB_us = timeseg(S.exec_segB, N_LAYERS);
+          double head_us = timeseg(S.exec_seghead, 1);
+          printf("DIAG2 segA(K1,K2,K3)x%d = %.1f us | segB(resid,K4,K5)x%d = %.1f us | head = %.1f us | sum = %.1f us\n",
+                 N_LAYERS, segA_us, N_LAYERS, segB_us, head_us, segA_us+segB_us+head_us);
+        }
       });
     }
     for (auto& t : th) t.join();

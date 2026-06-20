@@ -27,6 +27,16 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-A → CHARLES (2026-06-20 08:0x UTC) — de-dup EAGLE3:** Your `bench/run_eagle3.sh`
+  skips on the box because system vLLM=0.10.1. **I've solved that prereq:** isolated venv
+  `/alloc/data/eagle3-venv` (vLLM 0.11.0, own torch2.8) + converted head cached. Your script
+  can run today by using that interpreter (`/alloc/data/eagle3-venv/bin/python -m vllm...`
+  instead of `python3`). **Proposed split to avoid double-spending GPU slots:** I (LOOP-A,
+  :45–:00 slot, port 8077) own **FP8+EP + CUDA-graphs + lossless parity gate + the novel
+  route-aware/expert-union tree-shaping**; you own your **bf16 floor-bound "over-delivery"
+  hypothesis + tree-shape (W×D) optimizer + kernel**. Different model (FP8 vs bf16), different
+  slots, different ports — both data points useful, no redundant baseline re-runs. I'll post
+  the real FP8 accept-length + tok/s here once measured so your analytical model gets ground truth.
 - **LOOP-A (EAGLE3) → team/LOOP-B (2026-06-20 07:55 UTC):** Resuming on **EAGLE3 spec-decode**
   (sibling kv-fp8 loop stopped). **BLOCKER being resolved now (non-GPU prep, no lock/slot held):**
   box has system **vLLM 0.10.1 which REJECTS qwen3 EAGLE3** (needs ≥0.10.2). To avoid breaking
@@ -68,6 +78,11 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Slot log (append; newest first)
 <!-- format: <UTC> LOOP-X: acquired/released + what ran + result file -->
+- 2026-06-20 08:06 LOOP-A: **ARMED EAGLE3 slot runner** (`/alloc/data/slot_eagle3.sh`, pid 79926)
+  waiting for the **08:45** slot. De-risked non-GPU: venv vLLM 0.11 imports OK, `speculative_config`
+  is a valid arg, head config = Eagle3Speculator/algorithm=eagle3/verifier=FP8-target (verified).
+  Slot plan: EAGLE3 eager (parity+accept-len+tok/s) → baseline FP8 graphs (denominator) → parity
+  gate → push results to origin/djamoils-results + /alloc/data/eagle3/. LOOP-B stopped ⇒ I own 08:45.
 - 2026-06-20 07:58 LOOP-A: **BLOCKER RESOLVED (no GPU used).** Isolated venv built clean →
   `vllm 0.11.0 / torch 2.8.0+cu128` (RC=0) at `/alloc/data/eagle3-venv`. EAGLE3 head fully
   cached. EAGLE3 is now turnkey for the next full slot. **Next GPU launch: 08:45 UTC slot**

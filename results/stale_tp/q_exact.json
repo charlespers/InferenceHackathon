@@ -1,0 +1,17 @@
+{
+  "base": "http://localhost:8099",
+  "model": "qwen3",
+  "tokens": 96,
+  "completions": {
+    "Write a Python function to check if a string is a palindrome.": "Here's a simple Python function to check if a string is a **palindrome**:\n\n```python\ndef is_palindrome(s):\n    return s == s[::-1]\n```\n\n### Explanation:\n- `s == s[::-1]` compares the string with its reverse.\n- If the string is equal to its reverse, it is a palindrome.\n\n### Example:\n```python\nprint(is_palindrome(\"racecar\"))  # True\nprint(is_palindrome(\"hello\"))",
+    "What is the capital of Australia? Answer in one sentence.": "The capital of Australia is Canberra.",
+    "Explain the difference between a stack and a queue.": "A **stack** and a **queue** are both data structures used to manage sequences of elements, but they have fundamental differences in how they store and retrieve elements.\n\n### 1. **Stack**:\n- **Definition**: A stack is a last-in, first-out (LIFO) data structure. This means:\n  - The last element added to the stack is the first one to be removed.\n  - Elements are added to the top of the stack and removed from the",
+    "Compute 17 * 23 and show your steps.": "To compute $ 17 \\times 23 $, we can use the standard multiplication algorithm:\n\n### Step-by-step:\n\n1. Multiply 17 by 20:  \n   $ 17 \\times 20 = 340 $\n\n2. Multiply 17 by 3:  \n   $ 17 \\times 3 = 51 $\n\n3. Add the two results:  \n   $ 340 + 5",
+    "Write the first paragraph of a story about a lighthouse keeper.": "In the quiet coastal town of Eldershale, where the sea whispered secrets to the cliffs and the wind carried the scent of salt and pine, there lived a man named Elias. He was a lighthouse keeper, his hands calloused and his eyes sharp with the knowledge of the night sky. Every night, he stood at the helm, watching the stars above, a silent promise to the town. He had spent his life guarding the lighthouse, ensuring that the town\u2019s",
+    "List the planets of the solar system in order from the sun.": "The planets of the solar system, listed in order from the Sun, are:\n\n1. **Mercury**  \n2. **Venus**  \n3. **Earth**  \n4. **Mars**  \n5. **Jupiter**  \n6. **Saturn**  \n7. **Uranus**  \n8. **Neptune**",
+    "Implement binary search in Python with comments.": "Certainly! Here's a Python implementation of **binary search** with **comments** explaining each step:\n\n```python\ndef binary_search(arr, target):\n    \"\"\"\n    Perform a binary search on a sorted list to find the index of the target element.\n    \n    Args:\n        arr: List of elements (sorted in ascending order)\n        target: Element to search for\n\n    Returns:\n        The index of the target element if found, or -1 if not found\n    \"\"\"\n",
+    "Summarize what HTTP status code 404 means.": "HTTP 404 is a status code that indicates the server is unable to find the requested resource. It typically means the requested URL or file does not exist on the server.",
+    "Translate 'I would like a coffee' into French.": "Je veux un caf\u00e9.",
+    "What is recursion? Give a one-line example.": "Recursion is a programming technique where a function calls itself to solve a smaller instance of the same problem. A one-line example is:  \n**\"Write a function that calls itself to compute the sum of a list.\"**"
+  }
+}

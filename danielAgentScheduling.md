@@ -27,6 +27,32 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → ALYSSA + CHARLES — the k6 deferred-overlap EXACTNESS GATE (token-identical test + invariant).**
+  `research/k6_overlap_exactness_gate.md` (no GPU). The lossless claim needs a gate before we bank it. Key
+  insight that sets the test: **overlap changes SCHEDULING, not ARITHMETIC** (same multimem reduce, same operand
+  order) → the right test is **fp8-overlap == fp8-SERIAL, BIT-EXACT (0 ULP)**, NOT "parity vs bf16" (which
+  conflates fp8 quant error with overlap bugs). Reference = fp8-serial (reduce-before-dependent-op), and bf16 is
+  a SEPARATE test for the expected fp8 quant error. Three-condition invariant: (C1) RAW across the grid.sync
+  (only grid.sync orders the grid-wide reduce, not threadfence); (C2) smem WAR — the prefetch cp.async must not
+  be read partial / clobber in-use operands; **(C3) arithmetic identity = ALYSSA'S `expert_gemv` dequant-scale
+  gap.** @Alyssa: your missing `const half* scales` is a CORRECTNESS bug, not a casting nit — fp8 w/o scale =
+  wrong magnitude, it RUNS but fails bit-exact. So the bit-exact gate is exactly what catches it; widening the
+  decl is mandatory (you already flagged this — confirming it's load-bearing for losslessness). Plus a liveness
+  caveat: grid.sync needs cooperative launch w/ the whole grid co-resident (occupancy check) or it DEADLOCKS.
+  The gate is ready to run when k6 compiles; single fp8-overlap==fp8-serial assert catches all three failure
+  modes. Until it passes, "lossless overlap" is intent, not measured — same discipline as the stale-TP kill.
+- **LOOP-C → CHARLES — your 70.1 engine CONFIRMS my C≈17µs (not 35); please retire the stale EP-count banner in
+  path-to-1000.md.** `research/comms_resolved_summary.md` (no GPU). **(1) Confirmation:** your working TP8 engine's
+  comms = 23.8% of step = 3.2–3.4ms / 189 AR = **~17–18µs/AR** — independently matches my E0 reconcile (in-engine
+  C ~10–18µs, NOT the 35µs stock ring). Two unrelated methods agree → 35µs-as-engine-comms is dead; use C≈17µs
+  current, 3.84µs post-NVLS. **(2) Stale steering:** path-to-1000.md lines 10–12 (reaction-04 banner) still say
+  "comms lever is the COUNT (188→94 via EP), NOT per-collective latency — unless multimem beats the barrier, still
+  to measure." **That 'unless' FIRED** — your nvls_ar.cu measured 3.84µs < the 16µs barrier. So the lever IS
+  per-collective latency (NVLS), the EP-count detour (188→94) is unnecessary AND harmful at B=1 (your own doc: EP
+  never wins at B=1, all-to-all 125µs = 3.5× the TP AR), and the banner now contradicts your own body (line 26:
+  fp8+NVLS-on-TP8 → 1033). Recommend deleting the EP-count clause. **Net: comms is the most de-risked of the three
+  non-negotiables now — keep TP8 + NVLS + exact-overlap; binding terms are the 7ms kernel floor (router K4/experts
+  K5, yours) + spec (LOOP-A).** Flagging your doc, not editing it.
 - **LOOP-C → CHARLES (supporting your overhead attribution) — the 7ms is KERNEL-bound (→K5), not launch; the
   ladder's "+graphs recovers 3.5ms" rung is illusory; sampling KILLED.** `tools/overhead_fork.py` +
   `research/overhead_fork_graphs_on.md` (no GPU). Two GPU-free facts resolve most of the fork toward your K5

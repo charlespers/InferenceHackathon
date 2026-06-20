@@ -5,11 +5,10 @@
 #
 #   [REPO=/alloc/data/kvquant] bash tools/kv_ab.sh {auto|fp8} [PORT]
 #
-# Coordination (see SCHEDULE.md / tools/gpu-slot):
+# Coordination (see danielAgentScheduling.md — shared with the sibling LOOP-A):
 #  - djamoils owns :45-:00 UTC. Refuses to launch outside that window.
-#  - Mutual-exclusion vs the sibling djamoils loop via the >65GB-free gate AND an
-#    advisory lock (/alloc/data/djamoils.lock) so we can SEE each other, not just
-#    infer from GPU occupancy. Uses port 8088 (sibling uses 8077/8001).
+#  - Mutual-exclusion vs LOOP-A via the AGREED atomic lock `mkdir /alloc/data/gpu.lock`
+#    + holder file (stale after 20 min) AND the >65GB-free gate. Port 8088 (LOOP-A: 8077).
 #  - Hard slot-end deadline: tears the server down ~30s before :00 so it can never
 #    overrun into Jaymin's :00 slot. Skips remaining ctx points if time is short
 #    (logged, never silently dropped).
@@ -21,7 +20,9 @@ MODEL="Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"   # FP8 weights (HF-cached)
 SERVED=qwen3
 OUT="$REPO/results/kv_fp8/$KV"
 LOG=/root/vllm_kv_${KV}.log
-LOCK=/alloc/data/djamoils.lock
+LOCKDIR=/alloc/data/gpu.lock     # shared atomic lock (mkdir) — agreed with LOOP-A
+HOLDER="$LOCKDIR/holder"
+LOOP="LOOP-B-kvfp8"
 GUARD_MARGIN=30   # stop this many seconds before the slot boundary
 mkdir -p "$OUT"
 
@@ -34,7 +35,10 @@ secs_to_slot_end() { local m s; m=$(now_min); s=$(now_sec); echo $(( (60 - m) * 
 cleanup() {
   kill -9 -"${VPID:-0}" 2>/dev/null
   pkill -9 -f "served-model-name $SERVED" 2>/dev/null
-  [ -f "$LOCK" ] && grep -q "kv=$KV" "$LOCK" 2>/dev/null && rm -f "$LOCK"
+  # release the shared lock only if WE hold it
+  if [ -f "$HOLDER" ] && grep -q "$LOOP" "$HOLDER" 2>/dev/null; then
+    rm -f "$HOLDER"; rmdir "$LOCKDIR" 2>/dev/null
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -49,11 +53,17 @@ if [ "$BUDGET" -lt 180 ]; then
   echo "DENY: only ${BUDGET}s left in slot — not enough to load+measure. Wait for next slot." ; exit 2
 fi
 
-# --- advisory lock: let the sibling djamoils loop see us (best-effort) ---
-if [ -f "$LOCK" ] && ! grep -q "kv=$KV" "$LOCK" 2>/dev/null; then
-  echo "DENY: sibling djamoils job holds the lock:" ; cat "$LOCK" ; exit 3
+# --- atomic shared lock (agreed convention with LOOP-A) ---
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  if [ -f "$HOLDER" ] && [ -n "$(find "$HOLDER" -mmin +20 2>/dev/null)" ]; then
+    echo "Lock STALE (>20min): $(cat "$HOLDER" 2>/dev/null) — taking over."
+    rm -f "$HOLDER"; rmdir "$LOCKDIR" 2>/dev/null
+    mkdir "$LOCKDIR" 2>/dev/null || { echo "DENY: lost race for lock — back off." ; exit 3; }
+  else
+    echo "DENY: GPU lock held by $(cat "$HOLDER" 2>/dev/null). Back off to next slot." ; exit 3
+  fi
 fi
-echo "kv=$KV pid=$$ port=$PORT since=$(date -u +%H:%M:%S)UTC purpose=kv-fp8-sweep" > "$LOCK"
+echo "$LOOP kv=$KV pid=$$ port=$PORT $(date -u +%H:%M:%S)UTC" > "$HOLDER"
 
 # --- GPU gate: do not launch if the box is in use (TOCTOU-narrowed by the lock) ---
 minfree=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | sort -n | head -1)

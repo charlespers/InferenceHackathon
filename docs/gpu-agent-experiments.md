@@ -32,7 +32,27 @@ Record: the **8–16 KB all-reduce latency (µs)** and all-to-all latency. Then 
 **Go signal:** if all-reduce ≤ ~2µs → weight-bound → prioritize E7 (int4) + E4 (kernel); if ≥ ~4µs →
 comms-bound → prioritize route-prefetch (`engine/routing/scheduler.rs`) + one-shot all-reduce, then E6 spec.
 
-### E1 — End-to-end B=1 engine baseline (FP8 + expert-parallel)  ⟵ HIGHEST (after E0)
+### E0b — Comms tuning sweep  ⟵ NEW #1 (E0 showed comms-bound: 16µs all-reduce → 3.0ms TPOT)
+Use the **bf16 TP8** baseline (current best 85.7 tok/s / 11.67ms; bf16 has no 192 constraint so pure TP8
+launches). Each variant is env + relaunch; record TPOT. Goal: cut the 16µs all-reduce → shrink the ~3ms
+comms term, and **diagnose comms-vs-overhead** (if TPOT barely moves, the 11.67ms is mostly kernel/overhead
+→ K5/CUDA-graph work, E3/E4).
+```bash
+# pure TP8 bf16 (NO --enable-expert-parallel):
+BASE="vllm serve /alloc/data/Qwen3-235B-A22B --served-model-name q --tensor-parallel-size 8 \
+  --dtype bfloat16 --port 8001 --max-model-len 4096 --gpu-memory-utilization 0.92 --trust-remote-code"
+# run measure.py (512/128) after each; record TPOT:
+$BASE                                                   # 1. baseline (confirm ~11.67ms)
+NCCL_PROTO=LL $BASE                                     # 2. low-latency small-message protocol
+NCCL_NVLS_ENABLE=1 $BASE                                # 3. NVLink-SHARP in-switch all-reduce (mesh confirmed)
+NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=2 $BASE         # 4. fewer channels for tiny payloads
+$BASE --disable-custom-all-reduce                       # 5. isolate vLLM's one-shot AR vs NCCL
+NCCL_PROTO=LL NCCL_NVLS_ENABLE=1 NCCL_MAX_NCHANNELS=2 $BASE   # 6. stacked best-guess
+```
+Record TPOT per variant + the winner. Expect the model's 16→~4–8µs → bf16-TP8 floor 216→320–421. See
+`results-reaction-01.md`. (15-min budget: one load + a couple of env relaunches; pick the 2–3 most promising.)
+
+### E1 — End-to-end B=1 engine baseline (FP8 + expert-parallel)  ⟵ now lower priority than E0b/TP8
 Goal: the headline real single-user tok/s + which term dominates.
 ```bash
 # launch (served name = measure.py default)

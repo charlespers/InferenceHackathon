@@ -47,4 +47,20 @@ self-spec generally.
 - Conifer has GEMM/kernel-lab tuning methodology, but it targets edge/Metal/llama.cpp (not H100 sm_90a)
   and is clean-room-private — reference only, not copied here.
 - Found bug to fix: `tools/verify_self_speculation.py` `lens_top` must move `hidden` to the lm_head's
-  device (not just dtype) so the 235B (sharded) run works.
+  device (not just dtype) so the 235B (sharded) run works. **(FIXED + pushed.)**
+
+## Qwen3-30B-A3B — arch-faithful confirmation (same arch as the 235B: 128 experts, top-8) ✅
+The 235B's small sibling — identical router/RoPE/RMSNorm/top-8 structure → these numbers transfer
+directly to the 235B. Run on the box (GPU 0, bf16, 8 prompts, 24 tok). Random baseline = 8/128 = 0.062.
+
+| signal | OLMoE-1B-7B | **Qwen3-30B-A3B** | reading |
+|--------|------------:|------------------:|---------|
+| (A) DirectProxy accuracy | 0.808 (6.5×) | **0.718 (11.6× random)** | predictor.rs premise holds on the 235B arch; ~28% mispredict |
+| (B) layer-to-layer overlap | 0.115 (≈rand) | 0.066 (≈rand 0.062) | layers do NOT reuse experts — naive layer-reuse fails (both models) |
+| (C) token-to-token overlap | 0.470 | 0.510 (8.2×) | consecutive tokens reuse experts → markov/n-gram route cache viable |
+
+**Bottom line:** route-prefetch (`engine/routing/predictor.rs` + `scheduler.rs`) is validated on the
+235B's exact architecture — DirectProxy predicts the next layer's top-8 at **72% accuracy, 11.6× random**,
+*not* by layer-reuse (B≈random) but because `h_L` proxies `h_{L+1}` for L+1's router. Re-run on the full
+235B (8-way sharded; needs the `lens_top` device fix shipped here) for the final deploy number.
+E9 self-spec on Qwen3-30B-A3B: in progress (GPU 1).

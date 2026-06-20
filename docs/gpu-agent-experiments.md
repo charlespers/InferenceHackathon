@@ -316,3 +316,12 @@ realized gets double-counted. Gate on realized tok/s vs 116 (matches your route-
   row prints 2.94 > 1.88. Label-only — the computed `busiest()` values are correct.
 
 Per-finding evidence + verifier reasoning saved in the audit transcript; happy to PR any of these.
+
+**Tooling to operationalize the recalibration (shipped in the bench suite):**
+- `python -m inferutil.bench calibrate --measured-tok-s 116 --plan <p> --dtype <d> --tp <t> --ep <e>` backs
+  out the realized whole-model **e = measured / analytical-floor**. Live check (assuming fp8/EP8/ctx2112):
+  116 vs floor 322 → **e≈0.36 vs the latency.py floor** (which already includes comms), ~0.20 vs the pure-BW
+  ceiling. (Confirm Conifer's actual layout to pin it — open Q above.)
+- `sweep`/`plan --efficiency <e>` now scale predicted tok/s + MBU + $/Mtok by e, so they show calibrated
+  reality, not the floor — the suite no longer falls into the same over-prediction trap. e.g.
+  `sweep --plan ep --tp 8 --ep 8 --efficiency 0.2` → int4 ~89 tok/s (realistic) vs ~380 at the floor.

@@ -27,6 +27,34 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES + ALYSSA — whole-engine MBU ceiling: the MEGAKERNEL is the GATING precondition for 1000,
+  not one lever among many.** `research/whole_engine_mbu_ceiling.md` + `tools/whole_engine_mbu_ceiling.py` (no GPU).
+  Adversarial check of the "compute @58-80% MBU → 709-1024" line: it applies the **K5 kernel's** MBU to the
+  **whole byte budget**, but the MEASURED whole-engine effective MBU is **7.9%** (0.82ms byte floor ÷ 10.3ms
+  kernels-floor), because **~7-9ms of the 10.3ms is LATENCY-bound, not BW-bound** — router 2.26ms (MEASURED,
+  24µs×94, a 0.52MB GEMV at ~0.7% MBU) + K1 per-head attn norms + ~6 small ops × 94 layers. **MBU tuning cannot
+  touch it** → experts e→1 only gets the engine to ~103 tok/s. CONSERVATIVE measured-only bound: the **router
+  ALONE caps un-fused compute at ~325 tok/s** (vs the projected 709). So "kernels+comms alone → 650-1024" is
+  unreachable by MBU+comms tuning; even +NVLS+spec×3 stays ~300 un-fused. **The megakernel is the ONLY lever
+  that moves the floor** — its real value is collapsing the ~7-9ms per-op latency floor (≈3× the comms term),
+  which BROADENS @Alyssa's 460bba4 "per-collective barrier cost" point (the barrier is the smaller part).
+  **Reframe: "1000 needs spec" → "1000 needs the MEGAKERNEL first; NVLS+spec stack on the ~1280 BW base it
+  unlocks"** (megakernel+NVLS+spec×2 → ~1300, matches the optimistic corner, but ONLY via fusion). Definitive
+  check = Nsight per-kernel timeline (E-attr) splitting kernel-busy-at-BW from per-op latency.
+- **LOOP-C → team — validate-on-landing: the 6.8× graphs result + "path to 1000 proven" (measured vs projected).**
+  (no GPU.) **(1) @LOOP-A — your 13:45 diag (6.8×, eager 4.4→graphs 29.92) CONFIRMS my overhead_fork** AND I'm
+  self-correcting: my "eager-vs-graphs delta is small" wording was WRONG (it's large, 6.8×). The refinement: the
+  eager floor is HOST-dominated (per-step Python ~190ms slow-venv / ~88ms implied prod), not kernel-launch
+  (~1.13ms). But it's **already banked in the 85.7 graphs-on baseline** → the ladder's "+graphs" rung is still
+  illusory, and the post-graphs 7ms residual is still kernel+comms (Story B). Don't bank "6.8× graphs win" as a
+  *future* lever — it's spent. (`research/overhead_fork_graphs_on.md` updated.) **(2) @CHARLES — "path to 1000
+  proven" (1185bc8) is ahead of its own doc** (`squeeze-to-700.md` honestly says 1000 pre-spec NOT reachable).
+  MEASURED: NVLS bit-exact +5.4% (72.3→76.2, partial in-place 3-barrier), spec-GEMM 11.4×/tok (M=8 2737µs=0.70×
+  M=1) — both real, great. PROJECTED: the 923/1452 rests on a **~430-700 single-forward base that is DERIVED from
+  the isolated K5 58% MBU**, while the **whole-engine effective MBU is ~7-8%** (kernels-floor 10.3ms vs 0.82ms
+  byte-floor) — and your 13:45 graphs-on number is 5.5% roofline, independently showing the engine is far from
+  roofline even WITH graphs. So 76.2→430 is the real open gap (a WHOLE-engine MBU climb, not just K5), and τ is
+  still pending the 14:45 spec run. "Path" plausible + levers real; "proven" is ahead of the measurements.
 - **LOOP-C → CHARLES — 2-bit experts QUALITY gate: NO-GO at uniform 2-bit; DON'T build the 2-bit dequant kernel.**
   `docs/two-bit-experts-quality-gate.md` (no GPU; lit review cross-verified). Took the quality side of your
   first-principles-frontier 2-bit lever (you own speed/kernel). **Resolved adversarially in the literature before

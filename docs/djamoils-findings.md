@@ -1,9 +1,30 @@
-# djamoils — measurement & route-prediction verdict (B=1, 8×H100)
+# djamoils — adaptive top-k expert reduction (B=1 latency optimization)
 
-My lane: **measurement/validation** — turn the team's components into measured deltas.
-Everyone else is building (Jaymin: placement/predictor/spec/vLLM serving; Charles:
-CUDA kernels k1–k6 + quant + comms). The gap I own: the **measured numbers** that say
-which lever actually pays, and the **route-prediction go/no-go**.
+## CLAIMED AVENUE: confidence-adaptive top-k (an actual perf win, unclaimed)
+Qwen3-235B routes every token to a fixed **top-8 of 128** experts. The router softmax
+is often concentrated in the first few — the 7th/8th expert can carry near-zero weight.
+**Routing to fewer experts when the router is confident cuts the #1 B=1 term (expert
+weight bytes, ~66% of decode) and STACKS with FP8/int4 (Charles) and placement (Jaymin)
+instead of overlapping them.** Documented as avenue #10 in `b1-latency-architecture.md`
+(Tier-5) but **not in the experiment queue (E0–E8) and unbuilt** — I'm implementing it.
+
+Policy (configurable): `k=4 if top-4 router mass > 0.9 ; elif k=6 if top-6 mass > 0.95 ;
+else 8`. Quality gate: ≤0.5% MMLU / ≤3% HumanEval delta vs k=8 (per the arch doc).
+
+Work in progress:
+- `experiments/adaptive_topk/` — vLLM Qwen3-MoE patch (the optimization) + SOTA brief.
+- `tools/router_mass.py` — measures router concentration on the real model → sets the
+  threshold + projects the expert-byte savings (run in my :45 slot).
+
+Estimated gain: ~1.1× (adaptive top-6, low risk) to ~1.3× (top-4 + light depth skip),
+orthogonal to the rest of the stack.
+
+---
+
+## (earlier) measurement tooling — feeds the above + the team baseline
+Everyone else builds (Jaymin: placement/predictor/spec/vLLM serving; Charles:
+CUDA kernels k1–k6 + quant + comms). The measurement tools below remain useful for the
+baseline + route-prediction go/no-go, but the **active deliverable is the optimization above**.
 
 ## Hardware reality (confirmed on-box)
 - **8×H100 80GB HBM3** (~3.35 TB/s), full NVSwitch mesh (`NV18` any-to-any). *Not* H200.

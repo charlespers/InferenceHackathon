@@ -73,12 +73,14 @@ __device__ void stream_weight_tile(const void* __restrict__ hbm_src, void* __res
 //  3. is a __device__ function (one warp = one output row), not k5_experts_pipelined.cu's __global__
 //     kernel -- callable from k6's "compute" blocks directly, matching k6's SM-specialization design.
 //
-// STILL NEEDS, before this can be trusted: (a) k6_overlap_decode.cu's own extern declaration updated
-// to add `const half* scales`, (b) an actual on-box correctness check against k5_experts_pipelined.cu's
-// own validated reference (max_rel < 1e-3 per that file's own validation note), (c) the STAGES/TILE_K
-// cp.async double-buffering this single-warp version doesn't yet use (it does ONE direct dot product
-// per row -- the real perf win in k5_experts_pipelined.cu comes from overlapping STAGES loads with
-// compute, not captured here yet).
+// UPDATE: k6_overlap_decode.cu's extern declaration + call site + top-level kernel signature (added
+// `layer_scales`, mirroring `layer_weights`) are now widened to match (research/k6_overlap_exactness_gate.md
+// confirmed this fix as required, not optional -- it's the C3 condition of the bit-exact gate). STILL
+// NEEDS: (a) an actual on-box correctness check against k5_experts_pipelined.cu's own validated
+// reference (max_rel < 1e-3 per that file's own validation note) AND the gate doc's bit-exact
+// overlap-vs-serial comparison, (b) the STAGES/TILE_K cp.async double-buffering this single-warp
+// version doesn't yet use (it does ONE direct dot product per row -- the real perf win in
+// k5_experts_pipelined.cu comes from overlapping STAGES loads with compute, not captured here yet).
 // =================================================================================================
 __device__ __forceinline__ half2 k6_deq2(uint16_t packed, half scale) {
   __half2_raw r = __nv_cvt_fp8x2_to_halfraw2(packed, __NV_E4M3);

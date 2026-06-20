@@ -18,13 +18,22 @@ namespace cg = cooperative_groups;
 #define N_REDUCE_BLOCKS 4     // 8KB multimem needs only a few blocks; rest stream weights. TUNE {2,4,8}.
 
 // (declared in nvls_allreduce.cu / k5_experts_pipelined.cu; shown here as the overlap call sites)
+//
+// FIX (research/k6_overlap_exactness_gate.md, C3 — confirmed required, not optional): expert_gemv's
+// fp8 dequant (k5_experts_pipelined.cu's deq2()) needs a per-row scale; the original signature here had
+// no parameter for it. fp8 weights with no scale is the WRONG MAGNITUDE, not a benign cast — it would
+// compile and run without crashing but fail the bit-exact gate against the serial reference. Widened
+// below, and the top-level kernel now takes `layer_scales` (mirrors `layer_weights`'s per-layer shape)
+// to actually have a scales pointer to pass through.
 __device__ void multimem_allreduce_8kb(half* mc_ptr, int n);                 // the NVLS reduce (few blocks)
 __device__ void stream_weight_tile(const void* hbm_src, void* smem_dst, int bytes);  // cp.async (many blocks)
-__device__ void expert_gemv(const half* x, const void* w_smem, half* y, int rows, int k);
+__device__ void expert_gemv(const half* x, const void* w_smem, const half* scales,
+                             half* y, int rows, int k);
 
 // The persistent megakernel. grid = N_REDUCE_BLOCKS + (many stream/compute blocks). One launch, loops 94 layers.
 extern "C" __global__ void k6_overlap_decode(half* act,                 // residual stream (on-chip across layers)
                                              const void* const* layer_weights, // [94] per-layer weight bases (HBM)
+                                             const half* const* layer_scales,  // [94] per-layer dequant scales (HBM)
                                              half* mc_buf,              // multicast buffer for the all-reduce
                                              int num_layers) {
     cg::grid_group grid = cg::this_grid();
@@ -41,7 +50,7 @@ extern "C" __global__ void k6_overlap_decode(half* act,                 // resid
         }
         grid.sync();                                              // gate the dependent multiply on the reduced act
         // now act holds the reduced attention output AND the MoE gate/up weights are smem-resident:
-        if (!is_reduce) expert_gemv(act, smem, act, /*rows*/1536, 4096);   // MoE gate/up (uses resident weights)
+        if (!is_reduce) expert_gemv(act, smem, layer_scales[L], act, /*rows*/1536, 4096);  // MoE gate/up
         grid.sync();
 
         // ---- MoE down-proj (omitted): produces moe_out partial ----

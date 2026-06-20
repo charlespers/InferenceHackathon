@@ -18,9 +18,10 @@ you'd use those instead. So the internal-draft branch is closed; the draft is ei
 ## The decision tree
 1. **EAGLE3 head available + vLLM≥0.10.2 reachable?** → **EAGLE3** with `draft_tp=8`, big tree (W4–8×D3–4 on
    TP; biggest on EP). Highest τ. This is LOOP-A's 08:45 path.
-2. **No head / stuck on system vLLM 0.10.1 / want a win today?** → **lookahead** (draft-free, config flag) —
-   `spec_predict.py` puts it within ~5% of EAGLE3 in deep floor-bound (the floor amortization dominates the
-   lower acceptance). The portable primary.
+2. **No head / stuck on system vLLM 0.10.1 / want a win today?** → **lookahead** (draft-free, config flag).
+   Honest floor-bound τ ~1.5–2.5 → **~1.6–2.3×** (`spec_predict.py`, W=1-capped — the Jacobi window has no
+   independent width, so it can't match EAGLE3's ~3.4×). Its value is **portability**, not raw τ: zero draft
+   cost, no head, no version floor, any model. The portable primary when EAGLE3 isn't reachable.
 3. **Output is repetitive** (code-gen, JSON, retrieval, multi-turn boilerplate)? → **n-gram** — zero draft,
    τ rivals EAGLE3 on this content, works on 0.10.1. Cheapest possible.
 4. **Always run lookahead/n-gram as the control:** EAGLE3-speedup ÷ draft-free-speedup = exactly what the

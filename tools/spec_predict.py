@@ -88,9 +88,13 @@ def main():
                     ("lookahead (draft-free, α=0.55)", dict(mode="lookahead", draft_tp=8, alpha=0.55)),
                     ("temp 0.7 (product)", dict(mode="eagle3", draft_tp=8, temp=0.7))]:
         kw2 = dict(layout=a.layout, F=a.F, alpha=a.alpha); kw2.update({k: v for k, v in kw.items()})
+        # HONEST tree set: EAGLE3/n-gram can spread WIDTH (independent drafters/candidates); lookahead's Jacobi
+        # window is a sequential n-gram match with NO independent width, so cap it to W=1 (depth-only) — else
+        # the tree model over-credits it. This is why lookahead's honest floor-bound τ is ~1.5–2.5, not ~3.
+        trees = [(1, 5), (1, 8)] if kw2.get("mode") == "lookahead" else [(1, 5), (4, 5), (4, 8), (8, 8)]
         b = max(predict(kw2["F"], kw2["alpha"], W, D, kw2["layout"], kw2.get("mode", "eagle3"),
                         kw2.get("draft_tp", 8), kw2.get("temp", 0.0))[0]
-                for W, D in [(1, 5), (4, 5), (4, 8), (8, 8)])
+                for W, D in trees)
         print(f"  {tag:24} {b:.2f}x")
 
 

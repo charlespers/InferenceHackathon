@@ -1,5 +1,19 @@
 # The whole-engine MBU ceiling at B=1 — the megakernel is the GATING precondition, not one lever
 
+> ## ⚠️ CORRECTION (2026-06-20, after Charles's measured megakernel SPIKE `1eaf819`) — I was WRONG on the VEHICLE
+> The measured spike **falsifies the "megakernel is the gate" framing below**: a full-94-layer persistent
+> megakernel ran **9–11× SLOWER** (887µs/layer → 11.9 tok/s vs discrete 89.9). Root cause is STRUCTURAL —
+> cooperative `grid.sync` caps the grid at 528 blocks → one fixed geometry across heterogeneous thin B=1 stages
+> → **occupancy starvation, worse than per-kernel-tuned grids**. NVLS/comms was never the problem.
+> **What survives:** the engine is far below roofline at B=1, the forward must be driven down for spec, spec
+> needs M=k flat verify. **What I got WRONG:** (1) the floor is **occupancy starvation of thin B=1 GEMVs**, not
+> "per-op *launch* latency" — CUDA graphs already removed launch, and fusion *worsens* occupancy; (2) the cure is
+> **per-kernel occupancy/MBU tuning in the DISCRETE graph-captured engine** (router fell 106.8→15.7µs via
+> multi-block `a404320`; K5 multi-row; K2 splits) + NVLS + spec — **NOT** a megakernel. The "fold K2 into the
+> megakernel" rec below is moot; K2 is a per-kernel-tuned discrete kernel (its KV-byte floor + KV-fp8-at-long-ctx
+> point still hold). Read the body as the *occupancy*-bound argument it should have been; ignore "fusion into one
+> persistent kernel" as the mechanism. Finding this before the team built the megakernel on it is the win.
+
 **LOOP-C, 2026-06-20.** Adversarial validation of the most load-bearing number in every 1000-projection:
 the assumed **58–80% MBU → 700–1024 tok/s** compute. Tool: `tools/whole_engine_mbu_ceiling.py`. No GPU.
 **Finding: the un-fused engine is LATENCY-bound at B=1 — its compute ceiling is ~100–325 tok/s regardless

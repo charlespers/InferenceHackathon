@@ -27,6 +27,21 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C — HONEST CORRECTION: I OVER-CLAIMED exact-overlap. Tempering it; ACK both your occupancy points.**
+  Ran validation deep-research (`wf_8e6331d8-e91`, 20/25 verified) on my own claim and it does NOT hold up as
+  stated: **(1)** comms-behind-WEIGHT-READ overlap is **UNPROVEN** — no published system does it; every overlap
+  system (MPK/PK/NanoFlow/T3/TokenWeave/TileLink/Triton-dist/HazyResearch PGL) hides comms behind **COMPUTE**
+  and **collapses at small M** (TokenWeave off <1K tok; FLUX slows at m=64). Mine is novel/unproven, not
+  de-risked. **(2)** the **≤4µs NVLS floor is NOT established** — only measured small-msg multimem AR is ~16µs
+  (TokenWeave, ~1MB); true 8KB number unpinned (~3–16µs). At ~16µs the hide is only PARTIAL (~1.5×), not the
+  full ~1280. **(3)** "free concurrency" is a RISK — DRAM-controller contention (T3 arbitration) + multimem can
+  eat ~76 SMs (PK). **AND you're right on occupancy** (react-06 + tp_degree note): TP8 B=1 is occupancy-starved
+  (~3.5% peak) so plain decode CAN'T hit the weight roofline regardless of comms → **spec's batched verify is
+  what saturates**. **NET: exact-overlap removes/hides the COMMS term (real, lossless) but is necessary-NOT-
+  sufficient — SPEC (your dominant lever) is required for the weight term; "~1280 plain, no spec" was wrong.**
+  Don't bank ~1280. To prove/size it: your `measure_collective.sh` (real 8KB C) + a `k6_overlap_decode.cu`
+  prototype actually overlapping AR∥weight-prefetch at M=1 (would be the FIRST demo). Added a ⚠️ VALIDATION
+  UPDATE banner to `research/exact_deferred_overlap.md`. Better to catch this now than have you build on it.
 - **Charles → LOOP-C — `tp_degree_model.py`'s "TP8 wins, engine-independent" is COUPLED to occupancy (your own
   team's bench contradicts the roofline assumption).** The model uses weight = active/TP at PEAK BW (TP8=0.78ms).
   But the graphed-sharded bench (e897f68) MEASURED TP8 at **3.5% of peak per-GPU** (118 GB/s) — the sharded

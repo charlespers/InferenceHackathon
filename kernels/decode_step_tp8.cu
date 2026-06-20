@@ -317,8 +317,8 @@ static void tp8_k3_launch(RankState& S, cudaStream_t s);
 // Measured fused: 15% -> ~34% MBU on the 192-shard (2.2x), correctness max_rel 1.3e-5.  Compile-time
 // R; warp_dot math is byte-identical to tp8_warp_dot (split-K, hw fp8x2->half2, 2 accumulators/row).
 #ifndef TP8_K5_RA
-#define TP8_K5_RA 2     // gate+up rows per warp  (dots 2*RA = 4 weight rows/warp)
-#define TP8_K5_RB 8     // down    rows per warp
+#define TP8_K5_RA 2     // gate+up rows per warp  (dots 2*RA = 4 weight rows/warp) — sweep best (42% MBU)
+#define TP8_K5_RB 16    // down    rows per warp  — sweep: R=16 (22.3% MBU) slightly beats R=8 on the shard
 #endif
 
 // gate+up shard: a_glb[slot*192 + j] = silu(s_g*<y,gate_j>) * (s_u*<y,up_j>), RA channels/warp.
@@ -483,11 +483,14 @@ extern "C" __global__ void tp8_residual_add(const float* __restrict__ h_src,
 // Per-channel scale is applied in B (after the cross-split atomic sum), so the split-K is exact.
 // =================================================================================================
 #ifndef TP8_K4_KSPLIT
-#define TP8_K4_KSPLIT 4        // K-splits per expert (128 experts * 4 = 512 warps -> fills 132 SMs)
+#define TP8_K4_KSPLIT 8        // K-splits per expert (128 experts * 8 = 1024 warps; KSPLIT 4..32 flat)
 #endif
 
 // Kernel A: split-K gate GEMV.  Each warp owns (expert e, ksplit ks); atomicAdds its partial dot into
 // g_logits[e] (pre-zeroed by the caller).  y is staged per-CTA via a block-wide RMSNorm of h.
+// NOTE: a precompute-y-once variant was tried (microbench 16->13 us standalone) but in the 94x/token
+// launch chain the EXTRA 1-CTA rmsnorm launch (~8.7 us launch overhead each) cost MORE than the
+// per-CTA redundancy it removed, so the fused-norm form below is kept.
 extern "C" __global__ void tp8_k4_gate_gemv(
     const float* __restrict__ h, const float* __restrict__ w_post_norm,
     const fp8* __restrict__ Wgate, float* __restrict__ g_logits) {
@@ -590,8 +593,8 @@ static inline void tp8_k4_launch(const float* h, const float* w_post_norm,
                                  int* sel_idx, float* sel_w,
                                  float* g_logits, cudaStream_t s) {
   const int block = 128, warps = block >> 5;                // 4 warps/CTA
-  const int need_warps = N_EXPERTS * TP8_K4_KSPLIT;         // 512
-  const int ctas = (need_warps + warps - 1) / warps;        // 128 CTAs -> fills 132 SMs
+  const int need_warps = N_EXPERTS * TP8_K4_KSPLIT;         // 1024 @ KSPLIT=8
+  const int ctas = (need_warps + warps - 1) / warps;        // 256 CTAs (capped by sched to 132 SMs)
   const size_t smem = (size_t)HIDDEN * sizeof(float);
   CK(cudaMemsetAsync(g_logits, 0, N_EXPERTS * sizeof(float), s));
   tp8_k4_gate_gemv<<<ctas, block, smem, s>>>(h, w_post_norm, Wgate, g_logits);
@@ -988,16 +991,30 @@ extern "C" __global__ void tp8_k2_partial(
   #pragma unroll
   for (int c = 0; c < K2_VPL; c++) ao[c] = acc[c];
 }
+// K2 reduce — PARALLEL: ONE CTA per (local) q_head, K2R_WARPS warps tree-combine the n_splits partials.
+// The old reduce launched only Q_HEADS_RANK/4 = 2 CTAs on 132 SMs, each warp SERIALLY looping all 64
+// splits with a dependent log-sum-exp chain reading 64x128 floats from HBM -> it was SLOWER than the
+// well-parallelized partial pass (the K2 bottleneck).  Now each CTA's W warps each fold a STRIDED
+// subset of splits into a register (m,l,acc[4/lane]); warp 0 folds the W warp-partials in smem.  Same
+// log-sum-exp math, bit-identical output (verified in microbench: max|serial-parallel| < 1e-10), but
+// the dependent chain per warp is n_splits/W instead of n_splits, and the W=8 warps give intra-CTA
+// latency hiding.  Microbench (ctx 4096, nsp 64, 8 heads): combined K2 33.6us -> 20.5us (1.6x).
+#ifndef K2R_WARPS
+#define K2R_WARPS 8
+#endif
 extern "C" __global__ void tp8_k2_reduce(
     const float* __restrict__ part_m, const float* __restrict__ part_l,
     const float* __restrict__ part_acc, int n_splits, float* __restrict__ attn_out /*[Q_DIM_RANK]*/) {
   const int lane = threadIdx.x & 31;
-  const int lqh  = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int wid  = threadIdx.x >> 5;
+  const int W    = blockDim.x >> 5;             // warps per CTA = parallel split-folds
+  const int lqh  = blockIdx.x;                  // ONE CTA per local q_head
   if (lqh >= Q_HEADS_RANK) return;
+  // each warp folds a strided subset {wid, wid+W, ...} of the n_splits partials.
   float m = -FLT_MAX, l = 0.f, acc[K2_VPL];
   #pragma unroll
   for (int c = 0; c < K2_VPL; c++) acc[c] = 0.f;
-  for (int sp = 0; sp < n_splits; sp++) {
+  for (int sp = wid; sp < n_splits; sp += W) {
     const size_t pidx = (size_t)lqh * n_splits + sp;
     float ms = part_m[pidx], ls = part_l[pidx];
     if (ls <= 0.f) continue;
@@ -1009,18 +1026,45 @@ extern "C" __global__ void tp8_k2_reduce(
     for (int c = 0; c < K2_VPL; c++) acc[c] = acc[c] * corr_o + ai[c] * corr_s;
     m = m_new;
   }
-  float inv = (l > 0.f) ? (1.f / l) : 0.f;
-  float* o = attn_out + lqh * HEAD_DIM + lane * K2_VPL;
+  // fold the W warp-partials in smem (warp 0).  smem: m[W] + l[W] + acc[W*HEAD_DIM].
+  extern __shared__ float k2r_sm[];
+  float* sm_m = k2r_sm;                 // [W]
+  float* sm_l = sm_m + W;               // [W]
+  float* sm_a = sm_l + W;               // [W*HEAD_DIM]
+  if (lane == 0) { sm_m[wid] = m; sm_l[wid] = l; }
+  float* sao = sm_a + (size_t)wid * HEAD_DIM + lane * K2_VPL;
   #pragma unroll
-  for (int c = 0; c < K2_VPL; c++) o[c] = acc[c] * inv;
+  for (int c = 0; c < K2_VPL; c++) sao[c] = acc[c];
+  __syncthreads();
+  if (wid == 0) {
+    float rm = -FLT_MAX, rl = 0.f, racc[K2_VPL];
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) racc[c] = 0.f;
+    for (int w = 0; w < W; w++) {
+      float ms = sm_m[w], ls = sm_l[w];
+      if (ls <= 0.f) continue;
+      const float* ai = sm_a + (size_t)w * HEAD_DIM + lane * K2_VPL;
+      float mn = fmaxf(rm, ms), co = __expf(rm - mn), cs = __expf(ms - mn);
+      rl = rl * co + ls * cs;
+      #pragma unroll
+      for (int c = 0; c < K2_VPL; c++) racc[c] = racc[c] * co + ai[c] * cs;
+      rm = mn;
+    }
+    float inv = (rl > 0.f) ? (1.f / rl) : 0.f;
+    float* o = attn_out + lqh * HEAD_DIM + lane * K2_VPL;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) o[c] = racc[c] * inv;
+  }
 }
 static void tp8_k2_launch(RankState& S, cudaStream_t s) {
   const int warps_per_cta = 4, block = warps_per_cta * 32;
   dim3 gP(S.n_splits, (Q_HEADS_RANK + warps_per_cta - 1) / warps_per_cta);
   tp8_k2_partial<<<gP, block, 0, s>>>(S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale,
                                       S.ctx_len, S.n_splits, S.rank, S.part_m, S.part_l, S.part_acc);
-  dim3 gR((Q_HEADS_RANK + warps_per_cta - 1) / warps_per_cta);
-  tp8_k2_reduce<<<gR, block, 0, s>>>(S.part_m, S.part_l, S.part_acc, S.n_splits, S.attn_out);
+  // parallel reduce: ONE CTA per head, K2R_WARPS warps; smem = (2*W + W*HEAD_DIM) floats.
+  const int rw = K2R_WARPS, rblock = rw * 32;
+  const size_t rsmem = (size_t)(2 * rw + rw * HEAD_DIM) * sizeof(float);
+  tp8_k2_reduce<<<Q_HEADS_RANK, rblock, rsmem, s>>>(S.part_m, S.part_l, S.part_acc, S.n_splits, S.attn_out);
 }
 
 // K3: O-proj on the [HIDDEN, Q_DIM_RANK] column-shard -> PARTIAL hidden (h_in = ZERO, see caller).
@@ -1574,7 +1618,9 @@ static void profile_per_kernel(RankState& S, int PEAK_unused) {
       S.qkv_proj, S.q_norm, S.k_norm, S.rope_cos, S.rope_sin, S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale); });
   timeit("K2 partial (flash-decode)", N_LAYERS, [&]{ tp8_k2_partial<<<k2gP, k2_block, 0, s>>>(
       S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale, S.ctx_len, S.n_splits, S.rank, S.part_m, S.part_l, S.part_acc); });
-  timeit("K2 reduce", N_LAYERS, [&]{ tp8_k2_reduce<<<k2gR, k2_block, 0, s>>>(
+  const int k2r_w = K2R_WARPS, k2r_block = k2r_w * 32;
+  const size_t k2r_smem = (size_t)(2 * k2r_w + k2r_w * HEAD_DIM) * sizeof(float);
+  timeit("K2 reduce", N_LAYERS, [&]{ tp8_k2_reduce<<<Q_HEADS_RANK, k2r_block, k2r_smem, s>>>(
       S.part_m, S.part_l, S.part_acc, S.n_splits, S.attn_out); });
   timeit("K3 oproj", N_LAYERS, [&]{ tp8_k3_oproj<<<k3_ctas, k3_block, k3_smem, s>>>(
       S.attn_out, S.Wo, S.Wo_scale, S.attn_partial); });
@@ -1582,7 +1628,7 @@ static void profile_per_kernel(RankState& S, int PEAK_unused) {
   // OLD single-CTA router (the measured bottleneck) — timed for the before->after record (NOT in sum).
   timeit_x("K4 router OLD (1-CTA)", N_LAYERS, false, [&]{ k4_router<<<1, 256, k4_smem, s>>>(
       S.h_a, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w); });
-  // NEW fast router: split-K gate GEMV across the whole GPU + tiny select kernel.
+  // NEW fast router: fused-RMSNorm split-K gate GEMV across the whole GPU + tiny select kernel.
   {
     const int k4_block = 128, k4_warps = k4_block >> 5;
     const int k4_ctas = (N_EXPERTS * TP8_K4_KSPLIT + k4_warps - 1) / k4_warps;

@@ -244,6 +244,20 @@ int main(int argc, char** argv) {
   printf("K2  %.2f us/token   KV read %.1f MB -> %.0f GB/s, %.1f%% of H100 peak (%.0f GB/s)\n",
          ms2*1e3, k2_bytes/1e6, k2_bytes/1e6/ms2, k2_bytes/1e6/ms2/PEAK*100.0, PEAK);
 
+  // ---------------- K2 FUSED (single-launch) correctness + microbench ----------------
+  int Wf = k2_launch_fused(d_q2,d_KC,d_VC,d_kks,d_kvs,ctx_len,d_attn,(argc>2)?n_splits:-1);
+  CK(cudaDeviceSynchronize());
+  std::vector<float> attnf(Q_DIM); CK(cudaMemcpy(attnf.data(),d_attn,Q_DIM*4,cudaMemcpyDeviceToHost));
+  double e_atf=0; for (int i=0;i<Q_DIM;i++) e_atf=std::max(e_atf,(double)std::fabs(attnf[i]-out_ref[i]));
+  printf("K2F max-abs-err:  attn_out=%.3e   (warps/CTA=%d, target < 1e-2) -> %s\n",
+         e_atf, Wf, (e_atf<1e-2?"PASS":"FAIL"));
+  for(int i=0;i<WARM;i++) k2_launch_fused(d_q2,d_KC,d_VC,d_kks,d_kvs,ctx_len,d_attn,(argc>2)?n_splits:-1);
+  CK(cudaDeviceSynchronize()); CK(cudaEventRecord(s));
+  for(int i=0;i<IT;i++)   k2_launch_fused(d_q2,d_KC,d_VC,d_kks,d_kvs,ctx_len,d_attn,(argc>2)?n_splits:-1);
+  CK(cudaEventRecord(e)); CK(cudaEventSynchronize(e)); float msf; CK(cudaEventElapsedTime(&msf,s,e)); msf/=IT;
+  printf("K2F %.2f us/token   KV read %.1f MB -> %.0f GB/s, %.1f%% of H100 peak (fused, warps=%d)\n",
+         msf*1e3, k2_bytes/1e6, k2_bytes/1e6/msf, k2_bytes/1e6/msf/PEAK*100.0, Wf);
+
   printf("== done ==\n");
   return 0;
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .store import RunRecord
 from .attribution import diagnose
+from .cost import rental_usd_per_mtok, energy_metrics
 
 
 def _pct(x) -> str:
@@ -50,6 +51,17 @@ def format_result(record: RunRecord) -> str:
             f"  MBU (decode) : {_pct(eff.mbu_decode)}   (KV byte share {_pct(eff.kv_byte_share)})",
             f"  AI decode    : {ai} FLOP/B   ridge {ridge}  -> {eff.regime_decode}",
         ]
+    n_gpus = record.env.get("n_gpus") or 8
+    rental = rental_usd_per_mtok(r.decode_tok_per_s, n_gpus)
+    cost_lines = ["  -- cost --"]
+    cost_lines.append(f"  rental       : ${rental:.1f}/Mtok  (@$3/GPU-hr x{n_gpus})"
+                      if rental is not None else "  rental       : —")
+    if t.available:
+        em = energy_metrics(r.decode_tok_per_s, t.power_w_mean)
+        cost_lines.append(
+            f"  energy       : {em['tok_s_per_watt']:.2f} tok/s/W, "
+            f"${em['usd_per_mtok_energy']:.2f}/Mtok, {em['kwh_per_mtok']:.2f} kWh/Mtok")
+    lines += cost_lines
     b = diagnose(r)
     lines += [
         "  -- bottleneck --",
@@ -78,6 +90,24 @@ def format_result(record: RunRecord) -> str:
         ]
     else:
         lines.append("  -- device telemetry unavailable --")
+    return "\n".join(lines)
+
+
+def format_sweep(points, *, n_gpus: int = 8, usd_per_gpu_hr: float = 3.0,
+                 title: str = "SWEEP") -> str:
+    """Ranked sweep table: tok/s, TPOT, MBU, KV share, $/Mtok, and bottleneck."""
+    lines = [
+        f"== {title} ==",
+        f"  {'label':<14}{'ctx':>8}{'tok/s':>9}{'TPOT':>8}{'MBU':>7}"
+        f"{'KVshr':>7}{'$/Mtok':>8}  bottleneck",
+    ]
+    for p in points:
+        cost = rental_usd_per_mtok(p.decode_tok_s, n_gpus, usd_per_gpu_hr=usd_per_gpu_hr)
+        cost_s = f"{cost:.1f}" if cost is not None else "—"
+        lines.append(
+            f"  {p.label:<14}{p.seq_len:>8}{p.decode_tok_s:>9.1f}{p.tpot_ms:>8.2f}"
+            f"{_pct(p.mbu_decode):>7}{_pct(p.kv_byte_share):>7}{cost_s:>8}  "
+            f"{p.dominant_term} -> {p.hint}")
     return "\n".join(lines)
 
 

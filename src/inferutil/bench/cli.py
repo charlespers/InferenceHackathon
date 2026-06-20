@@ -17,10 +17,11 @@ from .runner import run_benchmark
 from .telemetry import NvmlTelemetry, NullTelemetry
 from .store import (write_run, load_run, load_latest, load_all,
                     result_to_x_summary, RunRecord, export_csv, export_jsonl)
-from .report import format_result, format_compare, format_diagnosis
+from .report import format_result, format_compare, format_diagnosis, format_sweep
 from .attribution import diagnose
 from .levers import recommend
 from .manifest import build_manifest
+from .sweep import depth_sweep, config_sweep, quant_grid
 from .gate import Thresholds, evaluate
 
 DEFAULT_RESULTS_DIR = "results"
@@ -118,6 +119,23 @@ def _cmd_diagnose(args) -> None:
     print(format_diagnosis(rec, levers))
 
 
+def _cmd_sweep(args) -> None:
+    cluster = Cluster(gpu=GPUS[args.gpu], n_gpus=args.n_gpus)
+    config = BenchConfig(name="sweep", plan=args.plan, dtype_bytes=args.dtype,
+                         kv_dtype_bytes=args.kv_dtype, tp=args.tp, ep=args.ep,
+                         prompt_tokens=args.prompt, decode_tokens=args.decode)
+    if args.depths:
+        depths = [int(x) for x in args.depths.split(",")]
+        pts = depth_sweep(QWEN3_235B, cluster, config, depths)
+        title = (f"DEPTH SWEEP  plan={config.plan} w{config.dtype_bytes}b "
+                 f"kv{config.kv_dtype_bytes}b tp={config.tp} ep={config.ep}")
+    else:
+        pts = config_sweep(QWEN3_235B, cluster, quant_grid(config))
+        title = f"CONFIG SWEEP (quant grid)  plan={config.plan} ctx={config.seq_len}"
+    print(format_sweep(pts, n_gpus=cluster.n_gpus, usd_per_gpu_hr=args.gpu_hr,
+                       title=title))
+
+
 def _cmd_export(args) -> None:
     records = load_all(args.name, args.results_dir)
     if not records:
@@ -186,6 +204,22 @@ def main(argv=None) -> None:
     dp.add_argument("--min-speedup", type=float, default=1.02,
                     help="drop levers predicting less than this speedup")
     dp.set_defaults(func=_cmd_diagnose)
+
+    sw = sub.add_parser("sweep",
+                        help="analytical depth/config sweep (no GPU required)")
+    sw.add_argument("--gpu", default="H100-SXM-80GB", choices=list(GPUS))
+    sw.add_argument("--n-gpus", type=int, default=8)
+    sw.add_argument("--plan", default="hybrid", choices=["tp", "ep", "hybrid"])
+    sw.add_argument("--dtype", type=float, default=1.0, help="2=bf16, 1=fp8, 0.5=int4")
+    sw.add_argument("--kv-dtype", type=int, default=2, choices=[1, 2])
+    sw.add_argument("--tp", type=int, default=2)
+    sw.add_argument("--ep", type=int, default=8)
+    sw.add_argument("--prompt", type=int, default=512)
+    sw.add_argument("--decode", type=int, default=128)
+    sw.add_argument("--depths", default=None,
+                    help="comma list e.g. 512,4096,32768; omit for a quant-grid config sweep")
+    sw.add_argument("--gpu-hr", type=float, default=3.0, help="$/GPU-hr for $/Mtok")
+    sw.set_defaults(func=_cmd_sweep)
 
     ep = sub.add_parser("export", help="export stored runs to csv/jsonl")
     ep.add_argument("--name", default="default")

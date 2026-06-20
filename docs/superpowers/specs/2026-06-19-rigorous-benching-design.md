@@ -135,6 +135,8 @@ results.
 | `src/inferutil/bench/stats.py` | NEW | `Stat` + Student-t summarize |
 | `src/inferutil/bench/attribution.py` | NEW | bottleneck diagnosis |
 | `src/inferutil/bench/levers.py` | NEW | ranked next-lever recommender |
+| `src/inferutil/bench/sweep.py` | NEW | analytical depth + config sweeps (KV-decay, quant ranking) |
+| `src/inferutil/bench/cost.py` | NEW | energy + rental cost-per-Mtok |
 | `src/inferutil/bench/manifest.py` | NEW | reproducibility capture |
 | `src/inferutil/bench/metrics.py` | EDIT | `Efficiency` field on `BenchResult` |
 | `src/inferutil/bench/runner.py` | EDIT | repeats→5, collect latency Stats |

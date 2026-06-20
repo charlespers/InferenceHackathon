@@ -28,6 +28,19 @@ _HINTS = {
 }
 
 
+def dominant_of_breakdown(weight_s: float, kv_s: float, comms_s: float,
+                          compute_s: float) -> str:
+    """Name the largest of the four floor terms (for analytical sweep points that
+    have no measured run / kernel_gap)."""
+    parts = {"weight_bw": weight_s, "kv_bw": kv_s,
+             "comms": comms_s, "compute": compute_s}
+    return max(parts, key=parts.get)
+
+
+def lever_hint(term: str) -> str:
+    return _HINTS.get(term, term)
+
+
 @dataclass(frozen=True)
 class Bottleneck:
     dominant_term: str

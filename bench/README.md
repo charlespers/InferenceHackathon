@@ -29,10 +29,16 @@ roofline model (MockEngine) and, when the engine lands, against real streamed ru
 ```bash
 PYTHONPATH=src python -m inferutil.bench run --name fp8ep --dtype 1 --kv-dtype 2 --tp 2 --ep 8 --repeats 5
 PYTHONPATH=src python -m inferutil.bench diagnose --name fp8ep     # bottleneck → ranked next levers
+PYTHONPATH=src python -m inferutil.bench sweep --dtype 1 --depths 512,4096,32768,131072   # KV-decay curve
+PYTHONPATH=src python -m inferutil.bench sweep --plan hybrid       # quant-grid config ranking
 PYTHONPATH=src python -m inferutil.bench export --name fp8ep --format csv --out runs.csv
 ```
 - Reports MFU/MBU, a full latency panel (TTFT / E2E / throughput / TPOT) with **Student-t 95% CIs**,
-  roofline regime, and a **bottleneck → ranked-lever** recommendation (predicted speedup + effort).
+  roofline regime, **cost/token** ($/Mtok rental + energy), and a **bottleneck → ranked-lever**
+  recommendation (predicted speedup + effort).
+- `sweep` (no GPU): depth sweep shows where KV-bandwidth overtakes weights (so you know when KV
+  quant beats weight quant); config sweep ranks quant variants and shows the bottleneck *moving*
+  as you apply levers (e.g. after int4, comms becomes dominant).
 - `run` also writes a reproducibility `*.manifest.json` (host, git commit, model hash, hardware).
 - Design rationale: `docs/superpowers/specs/2026-06-19-rigorous-benching-design.md`.
 

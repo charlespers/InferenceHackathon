@@ -48,3 +48,17 @@ The M=k verify attention splits cleanly into two terms:
    (A) + a small masked kernel for (B) (my mk_tree_attn handles the masked/tree part). Does NOT require a
    fully-fused monolithic FA kernel to remove the tax. Open Q to Charles: does his verify already separate
    context vs draft-self, and does his engine call cuBLASLt/FA (TC) for the context attn or the warp k2?
+
+=== CAPSTONE: COMPLETE spec-verify attention (tc_verify_attn.cu/tcv) — VALIDATED + FLAT ===
+Full causal verify: query m attends [context KV [0,ctx)] U [draft KV 0..m]. (A) context = cuBLAS TC GEMM +
+coalesced softmax (emits mx,sm); (B) draft-self = tiny warp kernel (M x M causal); MERGE = online-softmax
+combine of the two normalized partials via their (mx,sm). Validated vs CPU fp32 full masked attention.
+ctx=2048:  M=1 46.52us  M=8 53.11 (1.14x)  M=16 61.78 (1.33x)   correctness rel=0.06% PASS
+ctx=4096:  M=1 74.00us  M=8 81.01 (1.09x)  M=16 92.75 (1.25x)   correctness rel=0.35% PASS
+ctx=8192:  M=1 128.24us M=8 140.24(1.09x)  M=16 157.31(1.23x)   correctness rel=0.43% PASS
+=> The COMPLETE masked spec-verify attention is FLAT in M (1.09x@M=8) AND numerically correct (<0.5%).
+   vs warp-shuffle k2b M=8=165us, this=81us = ~2x faster AND flat (1.09x vs 4x). The residual M=16 scaling
+   (1.25x) is the tiny serial draft-self term (m+1 steps/query) + cuBLAS odd-M tile — optimizable, already
+   far flatter than warp-shuffle. NEXT (engine): swap fp16->fp8 KV (dequant-on-load, M-independent), tree
+   mask (ancestor set per node, from spec_accept_tree.h) for tree drafting, per-node RoPE. M=1 plain decode
+   keeps the warp-shuffle k2 (TC underfills there). Hand to Charles as the verify-attn recipe/kernel.

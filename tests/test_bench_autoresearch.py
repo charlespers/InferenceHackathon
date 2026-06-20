@@ -21,6 +21,13 @@ def test_classify_maps_every_principled_term():
     assert "unclear" in bsweep.classify("nonsense")[0]
 
 
+def test_measure_t95_matches_stats_t95():
+    import measure   # bench/measure.py (on path above)
+    from inferutil.bench.stats import t95 as stats_t95
+    for df in range(1, 41):
+        assert abs(measure._t95(df) - stats_t95(df)) < 1e-9, df
+
+
 def test_public_api_exports_rigorous_suite():
     import inferutil.bench as b
     for name in ("diagnose", "recommend", "compute_efficiency", "summarize",

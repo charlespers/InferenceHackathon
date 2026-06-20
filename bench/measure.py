@@ -15,9 +15,12 @@ import argparse, json, time, urllib.request
 from math import sqrt
 
 # Two-sided 95% Student-t critical values by df (=n-1); >30 falls back to z=1.96.
+# Tabulated through df=30 to stay identical to inferutil.bench.stats.t95.
 _T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
         8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145,
-        15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086}
+        15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086, 21: 2.080,
+        22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060, 26: 2.056, 27: 2.052, 28: 2.048,
+        29: 2.045, 30: 2.042}
 
 
 def _t95(df):
@@ -25,7 +28,7 @@ def _t95(df):
         return float("inf")
     if df in _T95:
         return _T95[df]
-    return 1.96 if df > 20 else _T95[max(k for k in _T95 if k <= df)]
+    return 1.96 if df > 30 else _T95[max(k for k in _T95 if k <= df)]
 
 
 def _pct(sv, p):

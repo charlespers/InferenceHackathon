@@ -39,6 +39,20 @@ def test_below_floor_flags_kernel_gap():
     assert "below the analytical floor" in b.note
 
 
+def test_above_floor_shares_stay_sane():
+    # efficiency>1 -> run BEATS the analytical floor (pct_of_floor>1); a reachable
+    # regime (better-than-modeled routing) that was previously untested.
+    eng = MockEngine(QWEN3_235B, CLUSTER, efficiency=1.5, jitter=0.0)
+    r = run_benchmark(eng, _cfg(), QWEN3_235B, CLUSTER)
+    assert r.pct_of_floor > 1.0
+    b = diagnose(r)
+    assert b.dominant_term == "weight_bw"          # gap=0 can't win
+    assert b.headroom_to_floor == 0.0
+    # shares are fractions of ACTUAL per-token time: in [0,1], not inflated past 1
+    assert 0.0 < b.share <= 1.0 and 0.0 <= b.second_share <= 1.0
+    assert b.share + b.second_share <= 1.0 + 1e-9
+
+
 def test_fallback_without_measured_breakdown():
     # build a result with no per-term breakdown (step_breakdowns=None)
     cfg = _cfg()

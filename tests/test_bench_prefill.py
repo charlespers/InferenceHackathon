@@ -51,6 +51,25 @@ def test_prefill_makes_mfu_meaningful():
     assert eff.mfu_prefill > 0.01
 
 
+def test_prompt_tokens_zero_is_finite_and_json_safe():
+    import math, json, tempfile
+    from inferutil.bench.store import RunRecord, write_run
+    cfg = BenchConfig(name="z", plan="hybrid", dtype_bytes=1, kv_dtype_bytes=2,
+                      tp=2, ep=8, prompt_tokens=0, decode_tokens=8, repeats=1)
+    eng = MockEngine(QWEN3_235B, CLUSTER, efficiency=1.0, jitter=0.0)
+    r = run_benchmark(eng, cfg, QWEN3_235B, CLUSTER)
+    # no inf leaks into prefill metrics (would serialize as invalid JSON `Infinity`)
+    assert math.isfinite(r.prefill_tok_per_s)
+    assert math.isfinite(r.efficiency.mfu_prefill)
+    assert math.isfinite(r.efficiency.achieved_tflops_prefill)
+    with tempfile.TemporaryDirectory() as d:
+        p = write_run(RunRecord("zr", cfg, {"gpu": "H100-SXM-80GB", "n_gpus": 8}, r), d)
+        with open(p) as f:
+            txt = f.read()
+        assert "Infinity" not in txt and "NaN" not in txt
+        json.loads(txt)   # strict parse must succeed
+
+
 if __name__ == "__main__":
     for k, v in sorted(globals().items()):
         if k.startswith("test_"):

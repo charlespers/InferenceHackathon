@@ -85,7 +85,12 @@ def diagnose(result) -> Bottleneck:
     floor_s = (1.0 / floor_tok_s) if floor_tok_s else 0.0
     actual_s = (1.0 / actual_tok_s) if actual_tok_s else floor_s
     gap_s = max(0.0, actual_s - floor_s)
-    parts = {term: floor_s * frac for term, frac in _shape(result).items()}
+    # Floor terms are apportioned over the *non-gap* part of actual time. When the
+    # run beats the analytical floor (actual_s < floor_s, e.g. better-than-modeled
+    # routing), floor_base = actual_s so shares stay "fraction of actual time" and
+    # still sum to 1 (rather than being inflated against floor_s).
+    floor_base = actual_s - gap_s          # == min(actual_s, floor_s)
+    parts = {term: floor_base * frac for term, frac in _shape(result).items()}
     parts["kernel_gap"] = gap_s
 
     ranked = sorted(parts.items(), key=lambda kv: kv[1], reverse=True)

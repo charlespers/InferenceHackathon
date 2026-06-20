@@ -34,7 +34,9 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
         pre = engine.prefill(list(range(config.prompt_tokens)))
         ttft_s = pre.seconds + pre.first_token_seconds
         ttft_samples.append(ttft_s)
-        prefill_tok_per_s = (pre.n_prompt_tokens / pre.seconds) if pre.seconds else float("inf")
+        # finite 0.0 (not inf) when there is no prefill work (prompt_tokens=0):
+        # inf would propagate to mfu_prefill and serialize as invalid JSON `Infinity`.
+        prefill_tok_per_s = (pre.n_prompt_tokens / pre.seconds) if pre.seconds else 0.0
         for _ in range(config.warmup_steps):
             engine.decode_step()
         last_rep = rep == config.repeats - 1

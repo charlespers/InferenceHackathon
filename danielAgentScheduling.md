@@ -27,6 +27,20 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → ALYSSA + CHARLES — the k6 deferred-overlap EXACTNESS GATE (token-identical test + invariant).**
+  `research/k6_overlap_exactness_gate.md` (no GPU). The lossless claim needs a gate before we bank it. Key
+  insight that sets the test: **overlap changes SCHEDULING, not ARITHMETIC** (same multimem reduce, same operand
+  order) → the right test is **fp8-overlap == fp8-SERIAL, BIT-EXACT (0 ULP)**, NOT "parity vs bf16" (which
+  conflates fp8 quant error with overlap bugs). Reference = fp8-serial (reduce-before-dependent-op), and bf16 is
+  a SEPARATE test for the expected fp8 quant error. Three-condition invariant: (C1) RAW across the grid.sync
+  (only grid.sync orders the grid-wide reduce, not threadfence); (C2) smem WAR — the prefetch cp.async must not
+  be read partial / clobber in-use operands; **(C3) arithmetic identity = ALYSSA'S `expert_gemv` dequant-scale
+  gap.** @Alyssa: your missing `const half* scales` is a CORRECTNESS bug, not a casting nit — fp8 w/o scale =
+  wrong magnitude, it RUNS but fails bit-exact. So the bit-exact gate is exactly what catches it; widening the
+  decl is mandatory (you already flagged this — confirming it's load-bearing for losslessness). Plus a liveness
+  caveat: grid.sync needs cooperative launch w/ the whole grid co-resident (occupancy check) or it DEADLOCKS.
+  The gate is ready to run when k6 compiles; single fp8-overlap==fp8-serial assert catches all three failure
+  modes. Until it passes, "lossless overlap" is intent, not measured — same discipline as the stale-TP kill.
 - **LOOP-C → CHARLES — your 70.1 engine CONFIRMS my C≈17µs (not 35); please retire the stale EP-count banner in
   path-to-1000.md.** `research/comms_resolved_summary.md` (no GPU). **(1) Confirmation:** your working TP8 engine's
   comms = 23.8% of step = 3.2–3.4ms / 189 AR = **~17–18µs/AR** — independently matches my E0 reconcile (in-engine

@@ -35,9 +35,13 @@ hardware, and the biggest single lever is now NCCL comms tuning — not quantiza
    one-shot/two-shot all-reduce, `NCCL_P2P_LEVEL=NVL`, few channels → target 16µs → ~4–8µs. Model says
    bf16-TP8 floor 216→320–421; fp8-TP8 262→431–638. **These are 🔲 in `config-sweep.md` (COMM rows) — run
    them next.** Biggest bang, no requant, no kernel work.
-2. **fp8 + TP8 — the prize cell, currently blocked.** TP8 (no EP penalty) + fp8 (½ weight bytes) is the best
-   physics, but `--tensor-parallel-size 8` on the block-128 FP8 ckpt crashes (192%128). **Unblock with a
-   block-64 FP8 requant** (192/64=3) → fp8-TP8 floor 262 (16µs) → 638 (tuned comms). The single highest cell.
+2. **fp8 + TP8 — the prize cell, with a SIMPLE unblock.** TP8 (no EP penalty) + fp8 (½ weight bytes) is the
+   best physics. The 192%128 crash is specific to the *released block-128 FP8 checkpoint*. **`vllm serve
+   /alloc/data/Qwen3-235B-A22B --quantization fp8 --tensor-parallel-size 8` does *dynamic* per-channel FP8
+   (no `block_size`) → no 192 constraint → pure fp8+TP8 should launch with one flag, no requant** (verify it
+   loads; dynamic fp8 is slightly less accurate than the calibrated block ckpt — fine for a latency run,
+   gate quality later). Floor 262 (16µs) → 638 (tuned comms). If dynamic fp8 underperforms, fall back to a
+   block-64 requant (192/64=3). **This is the single highest-value cell and now a one-flag experiment (E2b).**
 3. **Kernel / overhead reduction — the 7 ms gap.** vLLM's default B=1 MoE kernels run at ~16% util; the K5
    work (`kernels/k5_experts_warp.cu`, e=0.46, 100× over scalar) + `--enforce-eager` vs graphs (E3) + fused
    sampling/detok are how to close it. Long-term: the cudarc Rust engine calling tuned kernels.

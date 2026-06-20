@@ -52,7 +52,19 @@ NCCL_PROTO=LL NCCL_NVLS_ENABLE=1 NCCL_MAX_NCHANNELS=2 $BASE   # 6. stacked best-
 Record TPOT per variant + the winner. Expect the model's 16→~4–8µs → bf16-TP8 floor 216→320–421. See
 `results-reaction-01.md`. (15-min budget: one load + a couple of env relaunches; pick the 2–3 most promising.)
 
-### E1 — End-to-end B=1 engine baseline (FP8 + expert-parallel)  ⟵ now lower priority than E0b/TP8
+### E2b — fp8 + TP8 via dynamic quant (the PRIZE cell, one-flag unblock)  ⟵ run right after E0b
+The best physics cell (TP8 no-EP-penalty + fp8 ½-weight) that the released block-128 ckpt can't reach.
+Dynamic fp8 has no `block_size` → no 192 crash:
+```bash
+vllm serve /alloc/data/Qwen3-235B-A22B --served-model-name q --quantization fp8 \
+  --tensor-parallel-size 8 --port 8001 --max-model-len 4096 --gpu-memory-utilization 0.92 --trust-remote-code
+# then measure.py 512/128; and re-run with the E0b comms env (NCCL_PROTO=LL NCCL_NVLS_ENABLE=1 ...)
+```
+Record: does it launch (vs the block-128 192-crash)? TPOT/tok-s vs bf16-TP8 (85.7) and fp8-EP8 (64.5).
+**Predicted floor 262 (16µs) → 638 (tuned comms).** This + E0b comms tuning is the highest-ceiling combo
+without a requant. If dynamic fp8 fails/regresses, fall back to a block-64 FP8 requant (192/64=3).
+
+### E1 — End-to-end B=1 engine baseline (FP8 + expert-parallel)  ⟵ now lower priority than E0b/E2b
 Goal: the headline real single-user tok/s + which term dominates.
 ```bash
 # launch (served name = measure.py default)

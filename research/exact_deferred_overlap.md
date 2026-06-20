@@ -75,6 +75,30 @@ Charles cited for the stale path (`docs/path-to-1000.md`), now **without** the q
    unchanged), so the gate is a numerical-identity check (token-exact vs baseline), not a quality
    sweep — much cheaper than the staleness probe. Reuse `tools/quality_compare.py` for parity == 1.0.
 
+## 5b. Roadmap impact — exact-overlap RELAXES the NVLS make-or-break (≤1 µs → ≤~4 µs)
+
+`docs/path-to-1000.md` calls **NVLS ≤1 µs "non-negotiable"** because in its budget the comms term is
+*added*: `0.78 (fp8 weight) + 0.19 (comms@1µs) ≈ 0.97 ms → 1033`. At a *realistic* NVLS (2–4 µs) that
+budget gives 0.38–0.75 ms comms → **744–865 tok/s, short of 1000** for plain decode (the doc then needs
+small-tree spec to claw back to ~1170).
+
+**Exact deferred-overlap changes the arithmetic: comms is HIDDEN, not added.** The exact NVLS runs on a
+few SMs *concurrent with* the fp8 weight-stream on the rest (megakernel/MPK SM-pipelining). The cover is
+the per-collective slice of the 0.78 ms weight read ≈ **~4 µs/collective**. So:
+
+| | comms on critical path | plain fp8 decode | needs spec for 1000? |
+|---|---|---|---|
+| NVLS only (roadmap) @3 µs | +0.56 ms (added) | 0.78+0.56 = 1.34 ms → **744** | yes (→~1170 w/ small tree) |
+| **NVLS + exact-overlap** @3 µs | **~0 (hidden, C<cover)** | **0.78 ms → ~1280** | **no — roofline already** |
+
+**Net for the team:** exact-overlap turns the NVLS requirement from a heroic **≤1 µs** into the
+*realistic* **≤~4 µs** (fit under the weight cover), reaches **lossless ~1280 with plain fp8 decode**
+(no spec needed), and spec then *stacks* on top. It is the **lossless replacement** for the now-dead
+stale-TP "hide-it" lever (`n4_speculative_stale_tp.md` §6: stale/predicted measured 0.000–0.025). Same
+~roofline destination the roadmap credited to stale-TP, **without the quality gate.** The dependency:
+the megakernel must pipeline NVLS-on-some-SMs vs weight-streaming-on-others (MPK does exactly this) —
+so this lives in Charles's K6/NVLS kernel, and it makes his make-or-break *easier*, not harder.
+
 ## 6. Open questions / next
 - Confirm vLLM/megakernel can issue an NVLS multimem reduction on a subset of SMs concurrent with a
   weight-stream at B=1 (Charles's `measure_collective.sh` + K6 wiring).

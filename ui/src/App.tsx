@@ -14,10 +14,14 @@ export default function App() {
   });
   const onTurn = useCallback((t: { telemetry: Telemetry[]; summary: Summary | null }) => setTurn(t), []);
 
+  // Poll topology every 2s for live GPU mem/util/temp updates.
   useEffect(() => {
     let alive = true;
-    getTopology(base).then((t) => alive && setTopology(t)).catch(() => alive && setTopology(null));
-    return () => { alive = false; };
+    const poll = () =>
+      getTopology(base).then((t) => alive && setTopology(t)).catch(() => {});
+    poll();
+    const id = setInterval(poll, 2000);
+    return () => { alive = false; clearInterval(id); };
   }, [base]);
 
   return (

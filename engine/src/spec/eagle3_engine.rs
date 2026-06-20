@@ -16,6 +16,7 @@ use crate::error::Result;
 use crate::spec::accept::accept_multi_drafter;
 use crate::spec::model::ModelRunner;
 use crate::spec::route_aware_drafter::{CandidateSource, RouteAwareDrafter};
+use crate::spec::telemetry::SpecTelemetry;
 use crate::spec::types::{AcceptedRun, DraftTree, RngCore, TokenId};
 
 /// Aux-hidden-state contract the target must expose for a REAL EAGLE3 head (the head reads 3 aux
@@ -61,6 +62,15 @@ pub struct Eagle3RoundStats {
     pub verify_depth: usize,
     /// Distinct experts the verify read at that depth (the cost driver this lever minimizes).
     pub union_size: u32,
+}
+
+/// Stopping criteria for the multi-round [`Eagle3Engine::decode`] loop.
+#[derive(Debug, Clone)]
+pub struct DecodeStop {
+    /// Emit at most this many new tokens (hard cap; the loop never overshoots it).
+    pub max_new_tokens: usize,
+    /// Stop as soon as this token is emitted (end-of-sequence). `None` = run to the cap.
+    pub eos_token: Option<TokenId>,
 }
 
 /// Route-aware EAGLE3 speculative engine. `S` = draft head (candidate source), `T` = target verifier.
@@ -118,6 +128,78 @@ impl<S: CandidateSource, T: ModelRunner> Eagle3Engine<S, T> {
             union_size,
         };
         Ok((run, stats))
+    }
+
+    /// Run the full speculative decode loop until `stop.max_new_tokens` are emitted or `eos_token`
+    /// appears, accumulating per-round [`SpecTelemetry`]. Returns the generated tokens (excluding the
+    /// prompt) and the telemetry snapshot accumulator.
+    ///
+    /// Each round emits its accepted draft prefix + the bonus token (lossless speculative sampling).
+    /// A *degenerate* round (the head proposed nothing, `n_drafted == 0`) falls back to one normal
+    /// target decode step ([`Self::fallback_decode`]) so the loop always makes progress and stays
+    /// correct — exactly the "caller decodes normally" path the single-round [`Self::step`] documents.
+    /// Output is bit-identical to plain target decoding regardless of λ / verify depth.
+    pub fn decode(
+        &self,
+        prompt: &[TokenId],
+        stop: &DecodeStop,
+        rng: &mut impl RngCore,
+    ) -> Result<(Vec<TokenId>, SpecTelemetry)> {
+        let mut context = prompt.to_vec();
+        let mut output: Vec<TokenId> = Vec::new();
+        let mut telem = SpecTelemetry::new();
+
+        while output.len() < stop.max_new_tokens {
+            let (run, stats) = self.step(&context, rng)?;
+            telem.record(&stats);
+
+            if stats.n_drafted == 0 {
+                // Degenerate round: nothing speculated → one normal target decode step.
+                let tok = self.fallback_decode(&context)?;
+                output.push(tok);
+                context.push(tok);
+                if stop.eos_token == Some(tok) {
+                    break;
+                }
+                continue;
+            }
+
+            let mut stop_now = false;
+            for tok in run.all_tokens() {
+                if output.len() >= stop.max_new_tokens {
+                    stop_now = true;
+                    break;
+                }
+                output.push(tok);
+                context.push(tok);
+                if stop.eos_token == Some(tok) {
+                    stop_now = true;
+                    break;
+                }
+            }
+            if stop_now {
+                break;
+            }
+        }
+        Ok((output, telem))
+    }
+
+    /// One normal greedy target decode of the token following `context` (used when the head proposes
+    /// nothing). `forward_single(ctx, t)` returns the distribution at `t`'s position, so feeding the
+    /// last context token with the rest as prefix yields P(next | context). Empty context → token 0.
+    fn fallback_decode(&self, context: &[TokenId]) -> Result<TokenId> {
+        if context.is_empty() {
+            return Ok(0);
+        }
+        let (prefix, last) = context.split_at(context.len() - 1);
+        let logits = self.target.forward_single(prefix, last[0])?;
+        let arg = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i as TokenId)
+            .unwrap_or(0);
+        Ok(arg)
     }
 }
 
@@ -201,6 +283,67 @@ mod tests {
         let b = aware.step(&[7], &mut FixedRng).unwrap().1;
         assert_eq!(a.union_size, b.union_size); // overlapping head → same union either way
         let _ = (a.verify_depth, b.verify_depth);
+    }
+
+    #[test]
+    fn decode_emits_exactly_max_new_tokens_and_records_telemetry() {
+        // OverlapHead always proposes, EchoTarget + always-accept RNG → every round accepts its
+        // verified prefix + bonus. The loop must emit EXACTLY max_new_tokens (never overshoot) and
+        // the telemetry must reflect the rounds it ran.
+        let vocab = 512;
+        let engine = Eagle3Engine::new(
+            RouteAwareDrafter::new(OverlapHead, 2.0),
+            EchoTarget(vocab),
+            Eagle3Config { depth: 4, width: 2, vocab_size: vocab, floor_fraction: 0.86 },
+        );
+        let stop = DecodeStop { max_new_tokens: 10, eos_token: None };
+        let (out, telem) = engine.decode(&[1, 2, 3], &stop, &mut FixedRng).unwrap();
+        assert_eq!(out.len(), 10, "emits exactly the cap, no overshoot");
+        assert!(telem.rounds() >= 1);
+        // τ over the rounds it ran is a sane >1 (each round emits accepted prefix + bonus).
+        assert!(telem.mean_accept_length() > 1.0);
+    }
+
+    #[test]
+    fn decode_stops_at_eos() {
+        // Pick an EOS that the head will emit: OverlapHead yields token (100 + chain_len) at each
+        // position, so token 100 appears in round 1. Stop there.
+        let vocab = 512;
+        let engine = Eagle3Engine::new(
+            RouteAwareDrafter::new(OverlapHead, 2.0),
+            EchoTarget(vocab),
+            Eagle3Config { depth: 4, width: 2, vocab_size: vocab, floor_fraction: 0.86 },
+        );
+        let stop = DecodeStop { max_new_tokens: 100, eos_token: Some(100) };
+        let (out, _telem) = engine.decode(&[1, 2, 3], &stop, &mut FixedRng).unwrap();
+        assert!(out.len() < 100, "stopped at EOS well before the cap");
+        assert_eq!(*out.last().unwrap(), 100, "last emitted token is the EOS");
+        assert!(!out[..out.len() - 1].contains(&100), "EOS appears once, at the end");
+    }
+
+    #[test]
+    fn decode_makes_progress_on_a_degenerate_head_via_fallback() {
+        // EmptyHead proposes nothing every round → every round is degenerate → the loop must fall
+        // back to a normal target decode and still reach the cap (no infinite loop). EchoTarget's
+        // greedy of forward_single(prefix, last) returns `last`, so the fallback echoes the last
+        // context token; output is that token repeated.
+        struct EmptyHead;
+        impl CandidateSource for EmptyHead {
+            fn candidates(&self, _c: &[TokenId], _ch: &[TokenId], _w: usize) -> Vec<Candidate> { vec![] }
+        }
+        let vocab = 64;
+        let engine = Eagle3Engine::new(
+            RouteAwareDrafter::new(EmptyHead, 1.0),
+            EchoTarget(vocab),
+            Eagle3Config { depth: 4, width: 2, vocab_size: vocab, floor_fraction: 0.0 },
+        );
+        let stop = DecodeStop { max_new_tokens: 5, eos_token: None };
+        let (out, telem) = engine.decode(&[7, 9], &stop, &mut FixedRng).unwrap();
+        assert_eq!(out.len(), 5, "fallback guarantees progress to the cap");
+        assert!(out.iter().all(|&t| t == 9), "fallback echoes the last context token (9)");
+        // every round was degenerate → no speculating rounds, but rounds counted, τ = 1 per round
+        assert_eq!(telem.snapshot().spec_rounds, 0);
+        assert!((telem.mean_accept_length() - 1.0).abs() < 1e-6);
     }
 
     #[test]

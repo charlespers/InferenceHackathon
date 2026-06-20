@@ -1,5 +1,29 @@
 # The path to 1000 tok/s (B=1, Qwen3-235B-A22B, 8×H100) — from first principles
 
+> ## ⬛ MEASURED STATUS — charles-work, live (supersedes the theory below where they conflict)
+> We now have a **WORKING end-to-end custom engine** (`kernels/decode_step_tp8.cu`, full K1–K6 TP8, single-
+> process 8-rank, correctness gate PASS). Real measured numbers on the 8×H100 box:
+>
+> | milestone | measured | how |
+> |---|---|---|
+> | first runnable end-to-end token | **39.5 tok/s** | engine had NEVER produced a token before (decode_step.cu crashed); now builds+runs+validates |
+> | profile-driven kernel fixes | **74.5 tok/s** (matches vLLM 69.5) | **K4 router was the real #1 bottleneck** — 128-expert gate GEMV on a SINGLE CTA (1/132 SMs, 59% of kernel time) → split-K = 4.5×; K5 sharded starved 15%→34% MBU; K2 reduce 2-CTA-serial → 1-CTA/head = 2.8× |
+> | NVLS comms | **3.84µs/AR** (validated); integrated, measuring | replaces NCCL ~17µs → comms 3.35ms → 0.73ms |
+> | **GEMM verify forward (spec primitive)** | **flat 1.000× in k, k=1..16** (fp8) | tensor-core M=k verify = ONE weight read; GEMV path scales 8× and is the WRONG primitive |
+>
+> **Corrected architecture (measured, not theorized):** the binding constraint is NOT comms-first and NOT
+> launch overhead (CUDA-graph collapse saved <0.5ms — we are compute-bound). It is that **the M=1 GEMV decode
+> is occupancy-starved at B=1 TP8** (~8ms of kernels at ~10–30% MBU; weight roofline is 0.82ms). The fix *is*
+> speculation: drive the forward to **M=k via EAGLE3 draft + GEMM verify** — same ~2.1ms cost, but tensor
+> cores fill the SMs AND it commits τ≈2.95 tokens. `forward 2.1ms + NVLS 0.73ms ≈ 2.8ms × τ2.95 ≈ ~1050 tok/s`.
+> **1000 reachable at τ≥2.5** (EAGLE3 expected ~2.8). int4 = margin.
+>
+> **Two theory claims the data KILLED:** (1) in-kernel NVSHMEM recursive-doubling AR is **dead** (52µs/round,
+> 6 device barriers, no SHARP) — **NVLS multimem (NVSwitch in-network) is the live path** (3.84µs). (2) the
+> per-kernel MBU table was **stale** (claimed K1=2.3%; K1 is actually ~44%). Profile the *integrated* step.
+>
+> **Remaining to 1000:** wire EAGLE3 draft (propose k≤16) → GEMM-verify core loop (validated) → accept τ.
+
 **The target is 1000 tok/s = 1.0 ms/token.** We are at 85.7 (11.67 ms). That's ~12×. This derives, from
 physics, exactly what is *required* — and shows that most of what the team has been measuring (fp8 alone,
 env-comms, spec alone) **cannot get there**; a specific, narrow combination can.

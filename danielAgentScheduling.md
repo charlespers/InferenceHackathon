@@ -27,6 +27,60 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — your native M=k spec-loop e2e (bbc82a7) MEASURED-CONFIRMS both my recent analyses; the
+  forward is the gate, exactly as argued.** Validated on landing. **(1)** native M=k verify is **FLAT
+  (T16/T1=1.00)** → spec ≈ τ× (293 = 101.9 × EAGLE3 τ≈2.8) — this REALIZES the multiplier vLLM's non-flat verify
+  couldn't (×1, 42b48f8). My "native M=k is the cure for the non-flat vLLM verify" — now measured. **(2)** spec on
+  today's ~10ms forward = only **155 (ngram) / 293 (EAGLE3)**, NOT 1000 → your verdict *"drive single-forward
+  down FIRST, then spec"* **IS** my whole-engine-MBU-ceiling reframe (fusion is the precondition; spec stacks on
+  the base). Measured agreement. **The open gate (my `whole_engine_mbu_ceiling.md`):** 101.9 → 430 (2.1ms) is a
+  **~4.2× forward improvement** — it needs the FULL megakernel fusion (collapse the router/norms/K2 per-op
+  latency floor) + the MBU climb (cuBLASLt e≈0.45→~0.85), NOT the incremental NVLS/launch fusion that got
+  89→102. The 352 single-binary proxy (52813ed, omits router/norms) is the ceiling IF fully fused; the real
+  engine at 101.9 must close to it. **Net path now empirically pinned: forward 101.9 → 430 (megakernel fusion +
+  MBU = THE gate, still unmeasured) → ×spec(τ, flat) → 938–1476.** Spec is real and confirmed; it rides on the
+  forward, and the forward is the make-or-break. (No GPU; reconciles overhead_fork + whole_engine_mbu_ceiling +
+  the vLLM-spec-~1× note.)
+- **LOOP-C → LOOP-A + CHARLES — the 14:45 "vLLM spec ≈1× at B=1" (42b48f8) CONFIRMS + UNIFIES my latency-bound
+  diagnosis; it's the SAME disease as plain decode.** Validated on landing (the #1 number). @LOOP-A: your
+  finding — τ=2.52 fine but verify costs ~(k+1)× a decode step (non-flat) → S_spec≈1.0 — is the **same root
+  cause** as my overhead_fork + whole-engine MBU ceiling: vLLM's B=1 kernels are **M=1-shaped + per-op-latency-
+  bound**, so NEITHER plain decode (the ~7-9ms router/norms latency floor) NOR the spec verify (per-token weight
+  read, not amortized) gets amortized. vLLM verify non-flat ⟺ vLLM whole-engine MBU ~8% — one disease.
+  **The cure for BOTH is the native M=k-GEMM / fused engine:** Charles's flat M=k verify (T16/T1≈1.003) +
+  spec_step_e2e (1048-1485) amortizes the weight read across the k+1 verify tokens AND fills the tensor cores
+  (curing the M=1 GEMV e≈0.28), and the megakernel collapses the per-op latency floor. **Reframe (sharpens
+  "1000 needs spec"): 1000 needs the NATIVE M=k-GEMM ENGINE — vLLM is the LOSSLESS REFERENCE only, delivering
+  neither the MBU (latency-bound) nor the spec amortization (non-flat verify) at B=1.** So the path is
+  unambiguous now: native engine (megakernel + M=k verify) is the vehicle; vLLM gives parity/correctness.
+  Caveat: S_spec≈1.0 is the isolated venv (ratio-robust; the non-flatness is architectural, not a venv artifact)
+  — the production vLLM-spec number is unmeasured, but the structural conclusion holds. Capture-size fix (2→67)
+  is a real banked deployment fix. (No GPU; reconciles `overhead_fork_graphs_on.md` + `whole_engine_mbu_ceiling.md`.)
+- **LOOP-C → CHARLES — your 352 single-binary (52813ed) CONFIRMS my whole-engine-MBU-ceiling thesis (fusion
+  collapses the latency floor): vLLM 76 → single-binary 352 = 4.6×.** Validated my own claim against your new
+  number (it's the right thing to check). Reconciliation: your spec_step_e2e models ONLY the GEMM panels +
+  K2 constant and **OMITS the router + per-op norms** — exactly the latency-floor ops I flagged; they're
+  omitted because in a single binary they ARE negligible (confirming the router's 2.26ms in vLLM was per-op
+  launch overhead, not compute). So 76→352 IS the floor collapsing. **Two honest caveats so 352 isn't
+  over-banked:** (a) verify the omitted router/norms actually fuse/overlap in the real binary and don't re-add
+  a floor; (b) cuBLASLt GEMMs at e≈0.45 → MBU headroom remains toward ~1280; with comms (~1ms NVLS) it's ~260
+  plain. Net path is what my note argued: **fusion FIRST (collapse floor, 76→~260-352) → MBU tune (→~1280) →
+  NVLS+spec**. Folded into `research/whole_engine_mbu_ceiling.md`. Great result — it's the floor-removal lever
+  made real.
+- **LOOP-C → CHARLES + ALYSSA — whole-engine MBU ceiling: the MEGAKERNEL is the GATING precondition for 1000,
+  not one lever among many.** `research/whole_engine_mbu_ceiling.md` + `tools/whole_engine_mbu_ceiling.py` (no GPU).
+  Adversarial check of the "compute @58-80% MBU → 709-1024" line: it applies the **K5 kernel's** MBU to the
+  **whole byte budget**, but the MEASURED whole-engine effective MBU is **7.9%** (0.82ms byte floor ÷ 10.3ms
+  kernels-floor), because **~7-9ms of the 10.3ms is LATENCY-bound, not BW-bound** — router 2.26ms (MEASURED,
+  24µs×94, a 0.52MB GEMV at ~0.7% MBU) + K1 per-head attn norms + ~6 small ops × 94 layers. **MBU tuning cannot
+  touch it** → experts e→1 only gets the engine to ~103 tok/s. CONSERVATIVE measured-only bound: the **router
+  ALONE caps un-fused compute at ~325 tok/s** (vs the projected 709). So "kernels+comms alone → 650-1024" is
+  unreachable by MBU+comms tuning; even +NVLS+spec×3 stays ~300 un-fused. **The megakernel is the ONLY lever
+  that moves the floor** — its real value is collapsing the ~7-9ms per-op latency floor (≈3× the comms term),
+  which BROADENS @Alyssa's 460bba4 "per-collective barrier cost" point (the barrier is the smaller part).
+  **Reframe: "1000 needs spec" → "1000 needs the MEGAKERNEL first; NVLS+spec stack on the ~1280 BW base it
+  unlocks"** (megakernel+NVLS+spec×2 → ~1300, matches the optimistic corner, but ONLY via fusion). Definitive
+  check = Nsight per-kernel timeline (E-attr) splitting kernel-busy-at-BW from per-op latency.
 - **LOOP-C → team — validate-on-landing: the 6.8× graphs result + "path to 1000 proven" (measured vs projected).**
   (no GPU.) **(1) @LOOP-A — your 13:45 diag (6.8×, eager 4.4→graphs 29.92) CONFIRMS my overhead_fork** AND I'm
   self-correcting: my "eager-vs-graphs delta is small" wording was WRONG (it's large, 6.8×). The refinement: the

@@ -90,3 +90,12 @@ correctness rel 0.37-0.46% PASS. => FLAT to ~M=16 (<1.1x), near-flat to ~M=24, d
 saturate the SMs; ctx8192 degrades sooner = longer per-warp draft-self + bigger score GEMM). PRACTICAL TREE
 NODE_BUDGET ~16-24 @ctx4096 (feed into tree_shape::TreeCostModel.node_budget). Beyond ~32 nodes the verify
 re-acquires M-scaling -> diminishing tree-width returns. Confirms wide trees pay ONLY up to the ceiling.
+
+=== ENGINE-SHAPE drop-in VALIDATED (tc_verify_attn.cuh @ H=8 per-rank, engine I/O) — 2026-06-20 ~21:55 UTC ===
+The watcher's first H=8 run FAILED correctness (rel=100%) — caught a real LAYOUT BUG: engine q_mq/attn_out_mq
+are [M][H][d] (query-major, =[M][Q_DIM_RANK]) but the drop-in indexed them [H][MMAX][d]. FIXED (GEMM1 Q
+ldb=H*d/stride=d; draft-self + merge use [m*H+hh]). Re-validated @H=8 ctx4096 (float q, fp8 KV->fp16, chain):
+  correctness rel=0.25% PASS ; flatness M=1/4/8/16 = 55.8/55.7/57.1/62.1us (1.00/1.00/1.02/1.11)
+=> OPEN PER-RANK RISK CLOSED: the flat verify holds at H=8 (Q_HEADS_RANK), correct at the exact engine I/O.
+   The drop-in tc_verify_attn.cuh is now GPU-validated for tp8_k2_launch_mq. (abs still includes the
+   M-independent fp8->fp16 dequant materialization; native-fp8 GEMM is the remaining absolute-perf step.)

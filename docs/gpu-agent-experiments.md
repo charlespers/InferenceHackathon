@@ -184,7 +184,9 @@ tuning + kernel work → weight-bound), the tax returns → **shrink k→2–3**
 Full reasoning: **`docs/spec-decode-floor-bound.md`** + `tools/spec_floor_model.py`. **Best draft (general
 text), per `experiments/eagle3/INTEGRATION.md`:** use the **converted** head (raw `lmsys/...` is SGLang-format),
 and **EAGLE3 needs vLLM 0.10.2+** (box has 0.10.1 → upgrade, or use n-gram):
-`--speculative-config '{"method":"eagle3","model":"nm-testing/Qwen3-235B-A22B-EAGLE3-converted-speculators-lmsys","num_speculative_tokens":5,"draft_tensor_parallel_size":1}'`.
+`--speculative-config '{"method":"eagle3","model":"nm-testing/Qwen3-235B-A22B-EAGLE3-converted-speculators-lmsys","num_speculative_tokens":5,"draft_tensor_parallel_size":8}'`
+(**`draft_tp=8`, NOT 1** — at B=1 the 1B draft head is bandwidth-bound; sharding it /8 is ~6× faster reads +
+avoids the aux-hidden gather; INTEGRATION.md's `draft_tp=1` is throughput intuition — `docs/eagle3-draft-tp.md`).
 **n-gram (free, zero-setup, works on 0.10.1) for repetitive prompts — the immediate test (run_bench5);** EAGLE3
 for prose. **Prediction:** EAGLE3's published ~1.9× is a weight-bound number; on THIS floor-bound engine (86%
 floor) it should **over-deliver toward its accept length (~τ ≈ 2.5–3×)** — the amortized floor is larger here

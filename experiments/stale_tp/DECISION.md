@@ -89,8 +89,14 @@ Honest KILL of the *runtime-only* variant. Then:
 
 Sanity: `exact` reproduced correct output; all 8 TP workers patched (fork); control degraded.
 
-**Branch taken: ❌ NO-GO** (A2=0.000 ≪ 0.90; not marginal drift but token-1 gibberish, so the
-CONDITIONAL error-feedback recovery cannot apply). → **next action:** kill the runtime stale-TP
-lever; pivot to the **lossless exact deferred-overlap** (in the megakernel) + Charles's multimem
-one-shot for the comms floor. Ladder-Residual-with-retrain works but is out of hackathon scope.
-Full write-up: `research/n4_speculative_stale_tp.md` §6.
+**Predicted-proxy follow-up (Charles's GO candidate, measured 10:46):** `lyr_pred_k2 = 0.025`,
+`lyr_pred_k4 = 0.018` — also catastrophic (predicted = local×world_size: right magnitude, wrong
+direction → router still flips). Generalizes the kill to **any local-info predictor** (incl.
+DirectProxy, same info class). Information barrier, not a tuning problem.
+
+**Branch taken: ❌ NO-GO (complete).** All runtime substitution variants fail (stale 0.000, local
+0.023/0.028, predicted 0.018–0.025). Retraining (Ladder/Kog) is out of scope (weeks + 3.76 TB
+optimizer state vs 640 GB HBM + no dedicated box). → **PIVOTED to lossless exact deferred-overlap**:
+`research/exact_deferred_overlap.md` (overlap the EXACT NVLS all-reduce with the next op's weight
+stream in Charles's megakernel — same ~roofline ceiling, zero quality risk). Full write-up:
+`research/n4_speculative_stale_tp.md` §6.

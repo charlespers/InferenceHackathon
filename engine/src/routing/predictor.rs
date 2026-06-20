@@ -267,6 +267,22 @@ impl MarkovTransition {
         }
     }
 
+    /// Seed one layer's transition counts from a probability matrix.
+    ///
+    /// `probs[i][j]` = P(expert j at L+1 | expert i at L), row-normalised.
+    /// Multiplied by `scale` to convert to pseudo-counts (try 1000.0).
+    /// Called once at startup from routing_stats.json markov_matrices.
+    pub fn seed_layer_from_probs(&mut self, layer: usize, probs: &[Vec<f32>], scale: f32) {
+        if layer >= self.counts.len() { return; }
+        let ne = self.n_experts;
+        let row = &mut self.counts[layer];
+        for i in 0..ne.min(probs.len()) {
+            for j in 0..ne.min(probs[i].len()) {
+                row[i * ne + j] = probs[i][j] * scale + 1.0; // +1 Laplace prior
+            }
+        }
+    }
+
     /// Record one token's routing at consecutive layers.
     pub fn observe(
         &mut self,

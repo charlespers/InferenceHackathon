@@ -26,6 +26,10 @@ pub struct RoutingStats {
 #[derive(Deserialize)]
 pub struct RoutingCore {
     pub activation_counts: Vec<Vec<u32>>, // [n_layers][n_experts]
+    /// Markov transition matrices saved by routing_analysis.py.
+    /// Key "L->L+1", value is [n_experts][n_experts] row-normalized probability matrix.
+    #[serde(default)]
+    pub markov_matrices: std::collections::HashMap<String, Vec<Vec<f32>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +54,44 @@ pub struct PlacementStats {
     pub optimized_mean_imbalance: f64,
     pub improvement_pct: f64,
     pub total_replicated_expert_layers: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Load helpers — reconstruct engine types from persisted JSON
+// ---------------------------------------------------------------------------
+
+/// Load `PlacementMap` from an `optimized_placement.json` file produced by
+/// `optimize()`. Called at engine startup so the optimizer doesn't need to
+/// re-run from scratch each time.
+pub fn placement_from_json(path: &str, n_gpus: usize) -> anyhow::Result<PlacementMap> {
+    let raw = std::fs::read_to_string(path)?;
+    let opt: OptimizedPlacement = serde_json::from_str(&raw)?;
+    let n_layers = opt.stats.n_layers;
+    let n_experts = opt.stats.n_experts;
+
+    let mut primary: Vec<Vec<usize>> = vec![vec![0usize; n_experts]; n_layers];
+    let mut replicas: Vec<Vec<Option<usize>>> = vec![vec![None; n_experts]; n_layers];
+
+    for (layer_str, experts) in &opt.placement {
+        let layer: usize = layer_str.parse()?;
+        for (e_str, &gpu) in experts {
+            let e: usize = e_str.parse()?;
+            if layer < n_layers && e < n_experts {
+                primary[layer][e] = gpu;
+            }
+        }
+    }
+    for (layer_str, experts) in &opt.replicas {
+        let layer: usize = layer_str.parse()?;
+        for (e_str, &gpu) in experts {
+            let e: usize = e_str.parse()?;
+            if layer < n_layers && e < n_experts {
+                replicas[layer][e] = Some(gpu);
+            }
+        }
+    }
+
+    Ok(PlacementMap::from_tables(primary, replicas, n_gpus, n_experts))
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +336,10 @@ mod tests {
             .map(|e| if e % 8 == 0 { 100 } else { 1 })
             .collect();
         let stats = RoutingStats {
-            routing: RoutingCore { activation_counts: vec![layer_counts.clone()] },
+            routing: RoutingCore {
+                activation_counts: vec![layer_counts.clone()],
+                markov_matrices: Default::default(),
+            },
         };
         let rr = rr_imbalance(&layer_counts, 8);
         let (_, out) = optimize(&stats, 8);

@@ -27,6 +27,46 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C — SELF-CORRECTION on Charles's megakernel SPIKE (1eaf819): I was WRONG on the VEHICLE; the FLOOR is
+  OCCUPANCY, not launch.** Your measured 9-11× slower megakernel (occupancy starvation from the cooperative
+  grid.sync 528-block geometry cap) **falsifies my "megakernel is the gating precondition" framing**
+  (`whole_engine_mbu_ceiling.md`, now banner-corrected). Honest reckoning: **(1)** the B=1 floor is **occupancy
+  starvation of thin GEMVs**, NOT "per-op launch latency" — CUDA graphs already removed launch (the 6.8×), and
+  full fusion WORSENS occupancy (one fixed geometry across heterogeneous stages). I mis-named it. **(2)** the
+  cure is **per-kernel occupancy/MBU tuning in the DISCRETE graph-captured engine** — exactly what you're doing
+  (router 106.8→15.7µs multi-block a404320; K5 multi-row; K2 splits) + NVLS + spec — **NOT** a megakernel. **(3)**
+  my "fold K2 into the megakernel" is moot; K2 stays a per-kernel-tuned discrete kernel (its KV-byte floor +
+  KV-fp8-at-long-ctx crossover ~14k≈LOOP-B's 16k still hold). **What survives of my analyses:** engine far below
+  roofline at B=1, forward-must-drop-for-spec, vLLM-spec-~1×-needs-M=k-flat-verify, forward→430 reachability
+  (now via per-kernel occupancy tuning, consistent: router already 2.26→1.48ms). Your VERDICT "discrete + NVLS +
+  spec is the path" is right; I'm aligning my docs to it. Catching this before anyone built on the megakernel
+  framing is the win, not a failure.
+- **LOOP-C → CHARLES — NEW: forward→430 gate is REACHABLE but zero-slack; K2 flash-decode is the next floor.**
+  `research/whole_engine_mbu_ceiling.md` §forward→430 (no GPU). Bounding the forward from measured pieces (byte
+  0.82ms@e=1, K2 0.50ms measured const, NVLS 0.72ms): **430 clears ONLY when THREE compound at once** —
+  (1) megakernel fuses router/norms latency→0, (2) comms **overlapped into the kernel**→0 (not just NVLS-fast),
+  (3) cuBLASLt e≥0.45 → 2.32ms = 431. Miss any one → slips (fuse-lat-only-no-overlap = 329, misses). MBU climb
+  (e→0.85) is the only margin (→684). **NEW lever: K2 flash-decode is the emerging floor — 24% of the 2.1ms
+  target**, it's NOT a GEMM (MBU-immune, latency-bound at B=1 short ctx), currently a hardcoded `MK2_US=500`
+  constant in spec_step_e2e, **unaddressed**. After router/norms, fold K2 into the megakernel SM schedule (it can
+  overlap the expert weight-stream like the NVLS reduce); if it stays a separate 0.5ms launch it caps the forward
+  at ~684 even at e=0.85+comms→0 — clears 430 but eats the spec margin. Open Q for the megakernel run: does K2
+  fuse, or is it a hard 0.5ms? (Adversarial validation of the gate, not churn — it de-risks 430 AND flags the
+  next target.)
+- **LOOP-C → CHARLES — your native M=k spec-loop e2e (bbc82a7) MEASURED-CONFIRMS both my recent analyses; the
+  forward is the gate, exactly as argued.** Validated on landing. **(1)** native M=k verify is **FLAT
+  (T16/T1=1.00)** → spec ≈ τ× (293 = 101.9 × EAGLE3 τ≈2.8) — this REALIZES the multiplier vLLM's non-flat verify
+  couldn't (×1, 42b48f8). My "native M=k is the cure for the non-flat vLLM verify" — now measured. **(2)** spec on
+  today's ~10ms forward = only **155 (ngram) / 293 (EAGLE3)**, NOT 1000 → your verdict *"drive single-forward
+  down FIRST, then spec"* **IS** my whole-engine-MBU-ceiling reframe (fusion is the precondition; spec stacks on
+  the base). Measured agreement. **The open gate (my `whole_engine_mbu_ceiling.md`):** 101.9 → 430 (2.1ms) is a
+  **~4.2× forward improvement** — it needs the FULL megakernel fusion (collapse the router/norms/K2 per-op
+  latency floor) + the MBU climb (cuBLASLt e≈0.45→~0.85), NOT the incremental NVLS/launch fusion that got
+  89→102. The 352 single-binary proxy (52813ed, omits router/norms) is the ceiling IF fully fused; the real
+  engine at 101.9 must close to it. **Net path now empirically pinned: forward 101.9 → 430 (megakernel fusion +
+  MBU = THE gate, still unmeasured) → ×spec(τ, flat) → 938–1476.** Spec is real and confirmed; it rides on the
+  forward, and the forward is the make-or-break. (No GPU; reconciles overhead_fork + whole_engine_mbu_ceiling +
+  the vLLM-spec-~1× note.)
 - **LOOP-C → LOOP-A + CHARLES — the 14:45 "vLLM spec ≈1× at B=1" (42b48f8) CONFIRMS + UNIFIES my latency-bound
   diagnosis; it's the SAME disease as plain decode.** Validated on landing (the #1 number). @LOOP-A: your
   finding — τ=2.52 fine but verify costs ~(k+1)× a decode step (non-flat) → S_spec≈1.0 — is the **same root

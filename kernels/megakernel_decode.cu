@@ -371,6 +371,27 @@ __device__ unsigned g_nvls_gen = 0;
 // ================================================================================================
 static __device__ void mk_allreduce_recd(float* __restrict__ acc, float* __restrict__ recv,
                                           int n, int mype, int npes, cg::grid_group& grid) {
+#if defined(MK_MODE_NOAR)
+  // INSTRUMENTATION: skip the cross-PE all-reduce entirely (keep the surrounding grid.syncs so the
+  // grid-barrier count per layer is unchanged) -> isolates the COMPUTE + grid.sync floor.
+  grid.sync();
+  grid.sync();
+  (void)acc; (void)recv; (void)n; (void)mype; (void)npes;
+#elif defined(MK_MODE_NOBARRIER)
+  // INSTRUMENTATION: keep the put + local add but DROP the nvshmemx_barrier_all_block() handshakes
+  // (numerically WRONG, but isolates whether the NVSHMEM all-PE barrier is the cost vs the put/add).
+  grid.sync();
+  if (blockIdx.x == 0) {
+    const int tid = threadIdx.x, nthr = blockDim.x;
+    for (int mask = 1; mask < npes; mask <<= 1) {
+      const int peer = mype ^ mask;
+      nvshmemx_float_put_block(recv, acc, n, peer);
+      for (int i = tid; i < n; i += nthr) acc[i] += recv[i];
+      __syncthreads();
+    }
+  }
+  grid.sync();
+#else
   // Ensure every CTA on this PE has finished writing its share of `acc` before the exchange.
   grid.sync();
   if (blockIdx.x == 0) {
@@ -386,6 +407,7 @@ static __device__ void mk_allreduce_recd(float* __restrict__ acc, float* __restr
   }
   // Make the reduced `acc` visible to ALL of this PE's CTAs for the next stage.
   grid.sync();
+#endif
 }
 
 // ================================================================================================
@@ -908,6 +930,22 @@ __global__ void mk_coop_smoke(int* flag) {
   if (blockIdx.x == 0 && threadIdx.x == 0) *flag = 1;
 }
 
+// DIAGNOSTIC: pure grid.sync() cost.  Does NSYNC_PER grid syncs per "layer" over n_layers, NO compute.
+// Times the bare cooperative grid-barrier on the SAME 528-block grid the megakernel uses, so we can
+// attribute the megakernel's per-layer floor between grid.sync overhead and actual GEMV compute.
+#ifndef NSYNC_PER
+#define NSYNC_PER 16
+#endif
+__global__ void mk_syncbench(int n_layers, int* sink) {
+  cg::grid_group grid = cg::this_grid();
+  int acc = 0;
+  for (int l = 0; l < n_layers; ++l) {
+    #pragma unroll
+    for (int s = 0; s < NSYNC_PER; ++s) { grid.sync(); acc += s; }
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0) *sink = acc;
+}
+
 // ================================================================================================
 // main — runs on every PE.  Bootstraps NVSHMEM, allocates the resident state, launches the persistent
 // megakernel ONCE per timed iter (the launch IS the whole decode step), and reports us/layer-step +
@@ -1075,6 +1113,32 @@ int main(int argc, char** argv) {
     nvshmem_barrier_all();
     if (mype == 0) printf("  [check] cooperative grid.sync() under collective_launch OK (%d blocks)\n", smoke_blocks);
     CK(cudaFree(coop_flag));
+  }
+
+  // ================================ DIAGNOSTIC: pure grid.sync() floor =========================
+  // If argv[3]=="syncbench", time mk_syncbench (NSYNC_PER grid.syncs/layer, ZERO compute) on the SAME
+  // 528-block grid + N_LAYERS_TEST, then exit.  Tells us how much of the megakernel's per-layer floor
+  // is the bare cooperative grid-barrier vs the GEMV compute.
+  if (argc > 3 && strcmp(argv[3], "syncbench") == 0) {
+    int* sink = nullptr; CK(cudaMalloc(&sink, sizeof(int)));
+    int nl = N_LAYERS_TEST;
+    void* a[] = { (void*)&nl, (void*)&sink };
+    dim3 g(grid_blocks), b(block);
+    for (int it = 0; it < warmup; ++it) nvshmemx_collective_launch((const void*)mk_syncbench, g, b, a, 0, s);
+    CK(cudaStreamSynchronize(s)); nvshmem_barrier_all();
+    cudaEvent_t se0, se1; CK(cudaEventCreate(&se0)); CK(cudaEventCreate(&se1));
+    CK(cudaEventRecord(se0, s));
+    for (int it = 0; it < iters; ++it) nvshmemx_collective_launch((const void*)mk_syncbench, g, b, a, 0, s);
+    CK(cudaEventRecord(se1, s)); CK(cudaEventSynchronize(se1));
+    float sms; CK(cudaEventElapsedTime(&sms, se0, se1));
+    if (mype == 0) {
+      double us_call = (double)sms * 1e3 / iters;
+      double us_layer = us_call / N_LAYERS_TEST;
+      printf("  [syncbench] %d grid.syncs/layer x %d layers: %.2f us/call -> %.3f us/layer (%.3f us/sync)\n",
+             NSYNC_PER, N_LAYERS_TEST, us_call, us_layer, us_layer / NSYNC_PER);
+      fflush(stdout);
+    }
+    nvshmem_barrier_all(); nvshmem_finalize(); return 0;
   }
 
   // ================================ CORRECTNESS (in-kernel all-reduce) =========================

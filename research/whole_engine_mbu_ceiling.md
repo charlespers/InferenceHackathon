@@ -1,5 +1,19 @@
 # The whole-engine MBU ceiling at B=1 — the megakernel is the GATING precondition, not one lever
 
+> ## ⚠️ CORRECTION (2026-06-20, after Charles's measured megakernel SPIKE `1eaf819`) — I was WRONG on the VEHICLE
+> The measured spike **falsifies the "megakernel is the gate" framing below**: a full-94-layer persistent
+> megakernel ran **9–11× SLOWER** (887µs/layer → 11.9 tok/s vs discrete 89.9). Root cause is STRUCTURAL —
+> cooperative `grid.sync` caps the grid at 528 blocks → one fixed geometry across heterogeneous thin B=1 stages
+> → **occupancy starvation, worse than per-kernel-tuned grids**. NVLS/comms was never the problem.
+> **What survives:** the engine is far below roofline at B=1, the forward must be driven down for spec, spec
+> needs M=k flat verify. **What I got WRONG:** (1) the floor is **occupancy starvation of thin B=1 GEMVs**, not
+> "per-op *launch* latency" — CUDA graphs already removed launch, and fusion *worsens* occupancy; (2) the cure is
+> **per-kernel occupancy/MBU tuning in the DISCRETE graph-captured engine** (router fell 106.8→15.7µs via
+> multi-block `a404320`; K5 multi-row; K2 splits) + NVLS + spec — **NOT** a megakernel. The "fold K2 into the
+> megakernel" rec below is moot; K2 is a per-kernel-tuned discrete kernel (its KV-byte floor + KV-fp8-at-long-ctx
+> point still hold). Read the body as the *occupancy*-bound argument it should have been; ignore "fusion into one
+> persistent kernel" as the mechanism. Finding this before the team built the megakernel on it is the win.
+
 **LOOP-C, 2026-06-20.** Adversarial validation of the most load-bearing number in every 1000-projection:
 the assumed **58–80% MBU → 700–1024 tok/s** compute. Tool: `tools/whole_engine_mbu_ceiling.py`. No GPU.
 **Finding: the un-fused engine is LATENCY-bound at B=1 — its compute ceiling is ~100–325 tok/s regardless
@@ -93,3 +107,29 @@ compute. So 76 → 352 IS "the latency floor collapsing."
   (c) cuBLASLt GEMMs at e≈0.45 → MBU tuning still has headroom toward the ~1280 BW ceiling; (d) the spec
   1048–1485 rides on this and re-confirms spec-as-GEMM flat-in-k. Net: the path is **single-binary/megakernel
   (collapse the floor, 76→~260–352) → MBU tune (→ ~1280) → NVLS + spec** — fusion first, exactly as argued.
+
+## Is the forward→430 gate reachable? YES, but with ZERO slack — and K2 is the next floor (2026-06-20)
+The native M=k spec result (bbc82a7) pinned the path: spec needs the single-forward at **~430 tok/s (2.1 ms)**
+to clear 1000 (→938–1476 at τ). Bounding the forward floor from the MEASURED pieces (byte 0.818 ms @e=1; K2
+flash-decode **0.50 ms** measured constant, MBU-immune; NVLS comms 0.72 ms):
+
+| scenario | forward ms | tok/s |
+|---|---|---|
+| today-ish (e=0.45, router/norms floor ~7 ms unfused, NVLS) | 10.04 | 100 |
+| megakernel fuses router/norms (lat→0), e=0.45, NVLS | 3.04 | 329 |
+| **+ comms overlapped into kernel (comms→0)** | **2.32** | **431** ✓ |
+| + MBU climb e=0.65 / 0.85 | 1.76 / 1.46 | 569 / 684 ✓ |
+
+**430 is reachable — but only when THREE things compound at once:** (1) the megakernel fuses the router/norms
+per-op latency floor to ~0, (2) comms is **overlapped into the kernel** to ~0 (not merely NVLS-fast), and
+(3) cuBLASLt e≥0.45. Miss any one and it slips (fuse-lat-but-no-comms-overlap = 329, misses 430). The MBU
+climb (e→0.85) is the only source of margin.
+
+**NEW lever surfaced — K2 flash-decode is the emerging floor.** At the 2.1 ms target the 0.5 ms K2 is **24%**
+of the budget (byte read is 39%). K2 is **NOT a GEMM** (attention over the KV cache) → MBU-immune and latency-
+bound at B=1 short ctx; it's currently a **hardcoded constant** in `spec_step_e2e.cu` (`MK2_US=500`), not
+optimized. **After router/norms, K2 is the next thing to fuse/overlap** — and because it's MBU-immune, only
+fusion/overlap (not kernel-MBU tuning) reduces it. Recommend: fold K2 into the megakernel's SM schedule (it can
+overlap the expert weight-stream like the NVLS reduce does) and re-measure; if K2 stays a separate 0.5 ms
+launch, it caps the forward at ~684 even at e=0.85+comms→0, which still clears 430 but eats the margin spec
+needs. (Open question for the on-box megakernel run: does K2 fuse, or is it a hard 0.5 ms?)

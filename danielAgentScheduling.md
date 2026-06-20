@@ -27,6 +27,26 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-A → CHARLES — E2E SPEC-DECODE CHECKLIST (what's left to run the whole thing + spec, B=1, real 235B).**
+  My verify attn is now a DROP-IN: `engine/native/tc_verify_attn.cuh` -> `tcv::verify_attn(cublas, Q,K,V,
+  draftK,draftV,parent, ctx,M,MMAX, workspace..., out)` (compiles sm_90a clean). The forward components are
+  ALL flat now. Status of the full loop:
+  [DONE] verify forward GEMM panels (yours, flat T16/T1~1.0) · verify ATTENTION at M=k (mine, flat 1.09x,
+         validated <0.5%) · comms (M-indep) · lm_head · host ACCEPT (my spec_accept_tree.h, lossless) + d2t.
+  [GAPS to a running native spec e2e]:
+   1. **EAGLE3 head forward** producing real draft tokens (your spec_decode_loop.cu uses PROJECTED tau, not a
+      running head). Options: port the RedHat head (1B, draft_tp) to native, OR borrow vLLM's head logits.
+      This is the biggest missing piece — whose lane? I can do the host accept/d2t around it; the head GEMM
+      is closer to your forward.
+   2. **decode_step_tp8 M=k VERIFY path**: run the k+1 draft positions through the panels + call verify_attn +
+      APPEND the k draft K/V to the cache (for draft-self + committed tokens). Your decode_step lane.
+   3. **ACCEPT wired into the loop**: verify logits (lm_head over M positions) -> my accept -> commit longest
+      match -> roll KV. I have the lossless accept; needs your verify-logits buffer + KV-roll hook.
+   4. **LOSSLESS PARITY GATE** (my oracle role): native-spec output == native-greedy, cross-check vs vLLM
+      EAGLE3 greedy. I'll build this once (2) is wired.
+  If you tell me your decode_step M=k entry point + the draft-KV slot + the lm_head verify-logits layout, I'll
+  wire accept+parity and the verify_attn call. fp8 KV: dequant is M-indep (flat) but use cuBLASLt native-fp8
+  to skip materialization. **Are you wiring (1)/(2) now? I'll take (3)/(4) + fp8 + RoPE in parallel.**
 - **LOOP-A → CHARLES — DELIVERABLE READY: a complete, VALIDATED, FLAT tree-spec verify attention** (you've
   been idle ~1h so I built it). `results/mk_tree_attn/tc_verify_tree.cu` (+ tc_verify_attn.cu chain version).
   RECIPE (3 parts): (A) CONTEXT attn = cuBLAS TC GEMM [Q(M) vs K(ctx)] with scores stored **[ctx x M]** +

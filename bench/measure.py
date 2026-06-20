@@ -58,9 +58,9 @@ def summarize(xs):
     return out
 
 
-def stream_once(base, prompt, decode, engine=None, model="qwen3-235b-a22b"):
+def stream_once(base, prompt, decode, engine=None, model="qwen3-235b-a22b", temperature=0.0):
     body = {"model": model, "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": decode, "temperature": 0.0, "stream": True}
+            "max_tokens": decode, "temperature": temperature, "stream": True}
     if engine:
         body["engine"] = engine  # mock-only profile selector; ignored by a real OpenAI server
     req = urllib.request.Request(f"{base}/v1/chat/completions",
@@ -111,11 +111,13 @@ if __name__ == "__main__":
     ap.add_argument("--model", default="qwen3-235b-a22b", help="served model name to request")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=5, help="measured repeats (warmup dropped)")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="sampling temperature (0=greedy, default; use 0.7 for product-like spec accept-rate, spec-in-production.md)")
     a = ap.parse_args()
     prompt = ("Summarize the following. " + "context " * max(0, a.ctx)).strip()
     for _ in range(a.warmup):
         stream_once(a.base, "warm up", 8, a.engine, a.model)
-    runs = [stream_once(a.base, prompt, a.decode, a.engine, a.model)
+    runs = [stream_once(a.base, prompt, a.decode, a.engine, a.model, a.temperature)
             for _ in range(max(1, a.repeats))]
     ttft = summarize([r["ttft_ms"] for r in runs])
     tpot = summarize([g for r in runs for g in r["inter_ms"]])   # pooled inter-token gaps

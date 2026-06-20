@@ -61,6 +61,7 @@ def stream_request(base: str, prompt: str, max_tokens: int) -> dict:
     t_first = None
     n_tokens = 0
     buf = b""
+    x_summary = {}
 
     with urllib.request.urlopen(req, timeout=120) as resp:
         for raw in resp:
@@ -77,6 +78,10 @@ def stream_request(base: str, prompt: str, max_tokens: int) -> dict:
                     chunk = json.loads(body)
                 except json.JSONDecodeError:
                     continue
+                # Capture x_summary injected by our server
+                if "x_summary" in chunk:
+                    x_summary = chunk["x_summary"]
+                    continue
                 content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
                 if content:
                     if t_first is None:
@@ -84,15 +89,18 @@ def stream_request(base: str, prompt: str, max_tokens: int) -> dict:
                     n_tokens += 1
 
     t_end = time.perf_counter()
-    ttft_ms = (t_first - t_start) * 1000 if t_first else 0.0
-    decode_s = (t_end - t_first) if t_first else (t_end - t_start)
-    decode_tps = (n_tokens - 1) / decode_s if decode_s > 0 and n_tokens > 1 else 0.0
+    # Prefer server-reported values (more accurate — server measures from vLLM)
+    ttft_ms = x_summary.get("ttft_ms") or ((t_first - t_start) * 1000 if t_first else 0.0)
+    decode_tps = x_summary.get("decode_tok_per_s") or (
+        (n_tokens - 1) / (t_end - t_first) if t_first and n_tokens > 1 else 0.0
+    )
 
     return {
         "ttft_ms": ttft_ms,
         "decode_tok_per_s": decode_tps,
         "n_tokens": n_tokens,
         "total_s": t_end - t_start,
+        "predictor_hit_rate": x_summary.get("predictor_hit_rate"),
     }
 
 
@@ -107,16 +115,17 @@ def main():
     prompts = (PROMPTS * ((args.n // len(PROMPTS)) + 1))[:args.n]
 
     print(f"Benchmarking {args.base}  ({args.n} prompts, {args.tokens} tokens each)")
-    print(f"{'#':>3}  {'TTFT ms':>10}  {'tok/s':>8}  {'tokens':>7}  {'total s':>8}")
-    print("─" * 46)
+    print(f"{'#':>3}  {'TTFT ms':>10}  {'tok/s':>8}  {'tokens':>7}  {'hit%':>6}  {'total s':>8}")
+    print("─" * 54)
 
     results = []
     for i, prompt in enumerate(prompts):
         try:
             r = stream_request(args.base, prompt, args.tokens)
             results.append(r)
+            hit_str = f"{r['predictor_hit_rate']*100:.1f}%" if r.get("predictor_hit_rate") is not None else "  N/A"
             print(f"{i+1:>3}  {r['ttft_ms']:>10.1f}  {r['decode_tok_per_s']:>8.1f}"
-                  f"  {r['n_tokens']:>7}  {r['total_s']:>8.2f}s")
+                  f"  {r['n_tokens']:>7}  {hit_str:>6}  {r['total_s']:>8.2f}s")
         except Exception as e:
             print(f"{i+1:>3}  ERROR: {e}")
 
@@ -126,8 +135,9 @@ def main():
 
     ttfts = [r["ttft_ms"] for r in results]
     tpss = [r["decode_tok_per_s"] for r in results if r["decode_tok_per_s"] > 0]
+    hit_rates = [r["predictor_hit_rate"] for r in results if r.get("predictor_hit_rate") is not None]
 
-    print("─" * 46)
+    print("─" * 54)
     print(f"\n{'TTFT (ms)':<20} p50={statistics.median(ttfts):.1f}  "
           f"p95={sorted(ttfts)[int(len(ttfts)*0.95)]:.1f}  "
           f"mean={statistics.mean(ttfts):.1f}")
@@ -135,6 +145,9 @@ def main():
           f"p95={sorted(tpss)[int(len(tpss)*0.95)]:.1f}  "
           f"mean={statistics.mean(tpss):.1f}")
     print(f"{'ms/tok (mean)':<20} {1000/statistics.mean(tpss):.1f} ms")
+    if hit_rates:
+        print(f"{'Predictor hit%':<20} mean={statistics.mean(hit_rates)*100:.1f}%  "
+              f"(fraction of prefetched experts that would have fired)")
 
     summary = {
         "backend": args.base,
@@ -145,6 +158,7 @@ def main():
         "decode_tok_per_s": {"mean": statistics.mean(tpss), "p50": statistics.median(tpss),
                               "p95": sorted(tpss)[int(len(tpss)*0.95)]},
         "ms_per_tok_mean": 1000 / statistics.mean(tpss),
+        "predictor_hit_rate_mean": statistics.mean(hit_rates) if hit_rates else None,
         "results": results,
     }
 

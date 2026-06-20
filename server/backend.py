@@ -7,6 +7,7 @@ from typing import Iterator
 
 from server.schemas import ChatRequest
 from server.mock_engine import mock_stream
+from server.predictor import get_simulator
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001")
 
@@ -46,6 +47,8 @@ class VLLMBackend(Backend):
         t_first: float | None = None
         n_tokens = 0
         buf = b""
+        sim = get_simulator()
+        token_hit_rates: list[float] = []
 
         with urllib.request.urlopen(request, timeout=120) as resp:
             for raw in resp:
@@ -69,6 +72,12 @@ class VLLMBackend(Backend):
                         if t_first is None:
                             t_first = now  # actual time-to-first-token
                         t_tok = (now - t_start) * 1000
+
+                        # Run predictor simulation for this token
+                        if sim:
+                            hit_rate, _ = sim.simulate_token()
+                            token_hit_rates.append(hit_rate)
+
                         chunk["x_telemetry"] = _make_telemetry(n_tokens, t_tok, topo)
                         n_tokens += 1
 
@@ -79,6 +88,10 @@ class VLLMBackend(Backend):
         # decode tok/s excludes prefill: only count time after first token
         decode_elapsed = (elapsed - (t_first - t_start)) if t_first else elapsed
         prefill_tokens = sum(len(m.content.split()) for m in req.messages)
+        predictor_hit_rate = (
+            round(sum(token_hit_rates) / len(token_hit_rates), 3)
+            if token_hit_rates else None
+        )
         yield {
             "x_summary": {
                 "ttft_ms": ttft_ms,
@@ -86,6 +99,7 @@ class VLLMBackend(Backend):
                 "prefill_tokens": prefill_tokens,
                 "completion_tokens": n_tokens,
                 "spec_accept_rate": 0.0,
+                "predictor_hit_rate": predictor_hit_rate,
             }
         }
 

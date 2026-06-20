@@ -1,3 +1,4 @@
+pub mod optimizer;
 pub mod predictor;
 pub mod scheduler;
 pub mod stats;

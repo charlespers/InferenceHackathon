@@ -78,6 +78,7 @@ FREE=$(freemin); echo "min GPU free ${FREE}MB" >> "$LOG"
 if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
   echo "LOOP-C(stale-tp) $(date -u)" > /alloc/data/gpu.lock/holder
   echo "- $(date -u) LOOP-C: acquired gpu.lock -> stale-TP quality probe (port $PORT)" >> "$SCHED"
+  DEADLINE=$(( $(date +%s) + 1200 ))   # 20-min hard budget for the whole locked section
 
   # launch ONCE with stale_tp installed; ctl starts as exact (enable=false)
   write_ctl false layer proxy 1
@@ -93,7 +94,7 @@ if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
   for i in $(seq 1 240); do
     curl -sf -m3 http://localhost:$PORT/v1/models >/dev/null 2>&1 && { ok=1; break; }
     kill -0 $VPID 2>/dev/null || { echo "vLLM exited early — see vllm_stale.log" >> "$LOG"; break; }
-    [ "$(mins)" -ge 58 ] && { echo "TIME GUARD — abort readiness wait" >> "$LOG"; break; }
+    [ "$(date +%s)" -ge "$DEADLINE" ] && { echo "BUDGET GUARD — abort readiness wait" >> "$LOG"; break; }
     sleep 5
   done
 
@@ -107,7 +108,7 @@ if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
 
     # 1) sweep — each point: rewrite ctl, probe greedy. Stop if slot is ending.
     for spec in "${SWEEP[@]}"; do
-      [ "$(mins)" -ge 58 ] && { echo "out of slot time — stop sweep" >> "$LOG"; break; }
+      [ "$(date +%s)" -ge "$DEADLINE" ] && { echo "budget reached — stop sweep" >> "$LOG"; break; }
       set -- $spec; mode=$1; policy=$2; K=$3; label=$4
       write_ctl true "$mode" "$policy" "$K"
       probe "$label"

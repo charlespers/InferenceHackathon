@@ -8,7 +8,7 @@ def _req(n=5):
 
 
 def test_emits_content_chunks_then_summary():
-    topo = build_topology(num_gpus=8, num_layers=4, experts_per_layer=16)
+    topo = build_topology(num_layers=4, experts_per_layer=16)
     out = list(mock_stream(_req(5), topo))
     content_chunks = [c for c in out if "choices" in c]
     assert len(content_chunks) == 5
@@ -29,7 +29,7 @@ def test_emits_content_chunks_then_summary():
 
 
 def test_deterministic():
-    topo = build_topology(num_gpus=8, num_layers=4, experts_per_layer=16)
+    topo = build_topology(num_layers=4, experts_per_layer=16)
     a = list(mock_stream(_req(3), topo))
     b = list(mock_stream(_req(3), topo))
     assert a == b

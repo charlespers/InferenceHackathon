@@ -58,6 +58,23 @@ gate) restore 1000. Keep them as the **safety net**, validated in parallel, not 
 Net: **1000 lossless = megakernel (overhead→0) + NVLS kernel (≤3 µs) + small-tree EAGLE3 spec.** int4 experts are
 the safety net for the last bit if any of those three slips.
 
+## The comms is the crux — two strategies: make it FAST (NVLS) or HIDE it (stale-TP)
+The 188 collectives are the binding constraint. There are two independent ways to beat them, and **they stack**:
+- **Make it fast — in-kernel NVLS** (my Stage 3): 16 µs → ~2–3 µs. Lossless. The path above → ~1170 with small-spec.
+- **Hide it — stale/async-TP** (LOOP-C, `research/n4_speculative_stale_tp.md`): overlap AR(L) behind the
+  weight-read of layer L+1 so it leaves the critical path. LOOP-C's `stale_tp_ceiling.py`: at 16 µs it only
+  ~1.5× (the 16 µs AR > the ~8 µs/layer weight-read, can't fully hide); **once the AR is ≤ ~8 µs it hides
+  entirely → comms → 0 → the fp8 weight roofline (~1280 tok/s)**. *Quality-gated* (computing on stale activations
+  is lossy unless retrained — Ladder-Residual ICML'25 needs training; the no-retrain staleness tolerance is the
+  open question, settled by LOOP-C's GPU staleness probe).
+- **They multiply:** NVLS pushes the AR to ~3 µs (well under the ~8 µs "hide" threshold) → stale-TP then hides
+  it for *free*. So **NVLS makes stale-TP viable**, and stale-TP turns "cheap comms" into "zero comms." If the
+  staleness probe passes, the comms term vanishes and 1000 becomes *comfortable* (~1280, fp8 roofline), not tight.
+
+**So the comms plan:** build the NVLS kernel regardless (it's lossless and gates everything); run LOOP-C's
+staleness probe in parallel — if it passes, stale-TP + NVLS hides the comms entirely (upside to ~1280); if it
+fails, NVLS + small-tree spec is the lossless fallback (~1170). Either way the **NVLS kernel is the pivot.**
+
 ## Why the cheap levers DON'T reach 1000 (and what they're actually for)
 - **Spec decode alone caps at ~300 tok/s.** It *amortizes* the floor over τ; at EAGLE3's τ≈3.5 that's 85.7×3.5 ≈
   300. It **cannot** reach 1000 because τ is capped (~3.5) and, worse, a big tree *reads the expert union* —

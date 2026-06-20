@@ -26,6 +26,10 @@ HEAD=nm-testing/Qwen3-235B-A22B-EAGLE3-converted-speculators-lmsys
 SPEC="{\"method\":\"eagle3\",\"model\":\"$HEAD\",\"num_speculative_tokens\":3,\"draft_tensor_parallel_size\":1}"
 PORT=8077
 NSPEC=${NSPEC:-3}
+# MODE=eager (slot 1: de-risk + lossless parity + accept-len, matched-eager speedup)
+# MODE=graphs (slot 2: drop --enforce-eager for the CUDA-graph headline; only after eager passes)
+MODE=${MODE:-eager}
+if [ "$MODE" = "graphs" ]; then EAGER=""; else EAGER="--enforce-eager"; fi
 
 echo "armed $(date -u) — waiting for a FRESH :45 slot (EAGLE3)" > "$LOG"
 # If armed mid-slot (:45-:59), first wait OUT to :00 so we catch a full window.
@@ -73,14 +77,15 @@ launch_measure () {
 FREE=$(freemin); echo "min GPU free ${FREE}MB" >> "$LOG"
 if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
   echo "LOOP-A(eagle3) $(date -u)" > /alloc/data/gpu.lock/holder
-  echo "- $(date -u) LOOP-A: acquired gpu.lock -> EAGLE3 eager+baseline" >> "$SCHED"
+  echo "- $(date -u) LOOP-A: acquired gpu.lock -> EAGLE3 $MODE + baseline ($MODE)" >> "$SCHED"
 
-  # 1) EAGLE3 eager — the de-risk + accept-length + lossless capture (most important)
-  launch_measure eagle3_eager "--enforce-eager --speculative-config $SPEC" 0.85
+  # 1) EAGLE3 — de-risk + accept-length + lossless capture (most important)
+  launch_measure "eagle3_$MODE" "$EAGER --speculative-config $SPEC" 0.85
 
-  # 2) baseline FP8 graphs — speedup denominator + parity reference (if time remains)
+  # 2) baseline FP8 in the SAME mode — so S=tok/s(eagle3)/tok/s(base) and V=tau/S are valid
+  #    (matched floor in both). If time remains.
   if [ "$(mins)" -lt 56 ]; then
-    launch_measure baseline_fp8 "" 0.9
+    launch_measure "baseline_$MODE" "$EAGER" 0.9
   else
     echo "skip baseline (out of slot time)" >> "$LOG"
   fi
@@ -91,15 +96,15 @@ else
   echo "GPUs busy (${FREE}MB) or gpu.lock held -> NOT my window, skipping" >> "$LOG"
 fi
 
-# Lossless parity gate: EAGLE3 greedy must EXACTLY match baseline greedy.
-if [ -f "$OUT/q_baseline_fp8.json" ] && [ -f "$OUT/q_eagle3_eager.json" ]; then
-  echo "=== EAGLE3 lossless parity gate (baseline vs eagle3 greedy) ===" >> "$LOG"
-  $PY "$TOOLS/quality_compare.py" "$OUT/q_baseline_fp8.json" "$OUT/q_eagle3_eager.json" \
-      --out "$OUT/parity_gate.json" >> "$LOG" 2>&1
+# Lossless parity gate: EAGLE3 greedy must EXACTLY match baseline greedy (same MODE).
+if [ -f "$OUT/q_baseline_$MODE.json" ] && [ -f "$OUT/q_eagle3_$MODE.json" ]; then
+  echo "=== EAGLE3 lossless parity gate ($MODE: baseline vs eagle3 greedy) ===" >> "$LOG"
+  $PY "$TOOLS/quality_compare.py" "$OUT/q_baseline_$MODE.json" "$OUT/q_eagle3_$MODE.json" \
+      --out "$OUT/parity_gate_$MODE.json" >> "$LOG" 2>&1
 fi
 
 # Share results to origin/djamoils-results (box can't push main; results/* gitignored)
-RES=$(ls "$OUT"/m_*.json "$OUT"/parity_gate.json "$OUT"/q_*.json "$OUT"/metrics_*.txt 2>/dev/null)
+RES=$(ls "$OUT"/m_*.json "$OUT"/parity_gate_*.json "$OUT"/q_*.json "$OUT"/metrics_*.txt 2>/dev/null)
 if [ -n "$RES" ]; then
   REPO=/alloc/data/InferenceHackathon
   git -C "$REPO" fetch origin -q 2>/dev/null

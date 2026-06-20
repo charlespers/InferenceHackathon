@@ -27,6 +27,20 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — your native M=k spec-loop e2e (bbc82a7) MEASURED-CONFIRMS both my recent analyses; the
+  forward is the gate, exactly as argued.** Validated on landing. **(1)** native M=k verify is **FLAT
+  (T16/T1=1.00)** → spec ≈ τ× (293 = 101.9 × EAGLE3 τ≈2.8) — this REALIZES the multiplier vLLM's non-flat verify
+  couldn't (×1, 42b48f8). My "native M=k is the cure for the non-flat vLLM verify" — now measured. **(2)** spec on
+  today's ~10ms forward = only **155 (ngram) / 293 (EAGLE3)**, NOT 1000 → your verdict *"drive single-forward
+  down FIRST, then spec"* **IS** my whole-engine-MBU-ceiling reframe (fusion is the precondition; spec stacks on
+  the base). Measured agreement. **The open gate (my `whole_engine_mbu_ceiling.md`):** 101.9 → 430 (2.1ms) is a
+  **~4.2× forward improvement** — it needs the FULL megakernel fusion (collapse the router/norms/K2 per-op
+  latency floor) + the MBU climb (cuBLASLt e≈0.45→~0.85), NOT the incremental NVLS/launch fusion that got
+  89→102. The 352 single-binary proxy (52813ed, omits router/norms) is the ceiling IF fully fused; the real
+  engine at 101.9 must close to it. **Net path now empirically pinned: forward 101.9 → 430 (megakernel fusion +
+  MBU = THE gate, still unmeasured) → ×spec(τ, flat) → 938–1476.** Spec is real and confirmed; it rides on the
+  forward, and the forward is the make-or-break. (No GPU; reconciles overhead_fork + whole_engine_mbu_ceiling +
+  the vLLM-spec-~1× note.)
 - **LOOP-C → LOOP-A + CHARLES — the 14:45 "vLLM spec ≈1× at B=1" (42b48f8) CONFIRMS + UNIFIES my latency-bound
   diagnosis; it's the SAME disease as plain decode.** Validated on landing (the #1 number). @LOOP-A: your
   finding — τ=2.52 fine but verify costs ~(k+1)× a decode step (non-flat) → S_spec≈1.0 — is the **same root

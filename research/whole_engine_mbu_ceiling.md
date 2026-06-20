@@ -93,3 +93,29 @@ compute. So 76 → 352 IS "the latency floor collapsing."
   (c) cuBLASLt GEMMs at e≈0.45 → MBU tuning still has headroom toward the ~1280 BW ceiling; (d) the spec
   1048–1485 rides on this and re-confirms spec-as-GEMM flat-in-k. Net: the path is **single-binary/megakernel
   (collapse the floor, 76→~260–352) → MBU tune (→ ~1280) → NVLS + spec** — fusion first, exactly as argued.
+
+## Is the forward→430 gate reachable? YES, but with ZERO slack — and K2 is the next floor (2026-06-20)
+The native M=k spec result (bbc82a7) pinned the path: spec needs the single-forward at **~430 tok/s (2.1 ms)**
+to clear 1000 (→938–1476 at τ). Bounding the forward floor from the MEASURED pieces (byte 0.818 ms @e=1; K2
+flash-decode **0.50 ms** measured constant, MBU-immune; NVLS comms 0.72 ms):
+
+| scenario | forward ms | tok/s |
+|---|---|---|
+| today-ish (e=0.45, router/norms floor ~7 ms unfused, NVLS) | 10.04 | 100 |
+| megakernel fuses router/norms (lat→0), e=0.45, NVLS | 3.04 | 329 |
+| **+ comms overlapped into kernel (comms→0)** | **2.32** | **431** ✓ |
+| + MBU climb e=0.65 / 0.85 | 1.76 / 1.46 | 569 / 684 ✓ |
+
+**430 is reachable — but only when THREE things compound at once:** (1) the megakernel fuses the router/norms
+per-op latency floor to ~0, (2) comms is **overlapped into the kernel** to ~0 (not merely NVLS-fast), and
+(3) cuBLASLt e≥0.45. Miss any one and it slips (fuse-lat-but-no-comms-overlap = 329, misses 430). The MBU
+climb (e→0.85) is the only source of margin.
+
+**NEW lever surfaced — K2 flash-decode is the emerging floor.** At the 2.1 ms target the 0.5 ms K2 is **24%**
+of the budget (byte read is 39%). K2 is **NOT a GEMM** (attention over the KV cache) → MBU-immune and latency-
+bound at B=1 short ctx; it's currently a **hardcoded constant** in `spec_step_e2e.cu` (`MK2_US=500`), not
+optimized. **After router/norms, K2 is the next thing to fuse/overlap** — and because it's MBU-immune, only
+fusion/overlap (not kernel-MBU tuning) reduces it. Recommend: fold K2 into the megakernel's SM schedule (it can
+overlap the expert weight-stream like the NVLS reduce does) and re-measure; if K2 stays a separate 0.5 ms
+launch, it caps the forward at ~684 even at e=0.85+comms→0, which still clears 430 but eats the margin spec
+needs. (Open question for the on-box megakernel run: does K2 fuse, or is it a hard 0.5 ms?)

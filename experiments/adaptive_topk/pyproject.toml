@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-topk"
+version = "0.1.0"
+description = "Confidence-adaptive top-k expert routing plugin for vLLM (Qwen3-MoE, B=1)."
+
+# vLLM imports general_plugins in EVERY process (engine + TP workers), so the
+# monkeypatch reaches the workers where the model actually runs. Enable with
+#   VLLM_PLUGINS=adaptive_topk ADAPTIVE_TOPK_ENABLE=1 ... python3 -m vllm.entrypoints.openai.api_server ...
+[project.entry-points."vllm.general_plugins"]
+adaptive_topk = "vllm_adaptive_moe:register"
+adaptive_topk_fallback = "custom_forward_fallback:register"
+
+[tool.setuptools]
+py-modules = ["vllm_adaptive_moe", "custom_forward_fallback"]

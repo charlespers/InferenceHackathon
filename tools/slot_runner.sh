@@ -39,7 +39,7 @@ if [ ${#RESULTS[@]} -gt 0 ]; then
     mkdir -p /tmp/reswt/results
     cp "${RESULTS[@]}" /tmp/reswt/results/ 2>/dev/null
     ( cd /tmp/reswt
-      git add results 2>/dev/null
+      git add -f results 2>/dev/null
       git -c user.email=djamoils25@gmail.com -c user.name="djamoils-box" \
         commit -q -m "results: slot run $(date -u)" 2>/dev/null \
         && git push -q -f origin HEAD:djamoils-results 2>>"$LOG" \

@@ -24,6 +24,26 @@ Candidate causes (unresolved): graphs⊗spec interaction (graph replay overhead 
 with the draft), `draft_tensor_parallel_size=1` serializing the head against the TP8 target, or the
 FP8-MoE Triton path (DeepGEMM unavailable). Root cause is the next experiment, not a conclusion yet.
 
+## ROOT CAUSE FOUND (post-slot log analysis) — it was a config bug, NOT a graphs limitation
+The vLLM worker log shows the smoking gun:
+```
+WARNING compilation.py:948] No valid cudagraph sizes after rounding to multiple of
+  num_speculative_tokens + 1 (4); please adjust num_speculative_tokens or max_cudagraph_capture_size
+Capturing CUDA graphs (decode, FULL): 0it [00:00, ?it/s]     ← ZERO full decode graphs captured
+```
+With spec decode, vLLM rounds the cudagraph capture sizes to multiples of `(num_speculative_tokens+1)`
+= 4. The default `cudagraph_capture_sizes=[1,2]` (chosen for B=1/2 plain decode, capped because
+`max-num-seqs=1`) rounds to **nothing valid** → **no FULL decode graph was captured** → the spec
+decode ran effectively **un-graphed** (eager-equivalent + spec overhead) → the ~2 tok/s, *slower* than
+plain eager. So "graphs didn't help" was a **mis-capture**, not a real graphs⊗spec limitation.
+(Secondary, non-confounding: FP8-MoE used an untuned Triton config — `fused_moe.py:886` "Using default
+MoE config… sub-optimal" — affects all arms equally, doesn't change the ratio.)
+
+**Fix (in `tools/slot_graphs_diag.sh`, armed for 13:45):** pass
+`--compilation-config {"cudagraph_capture_sizes":[4,8,16],"max_cudagraph_capture_size":16}` (sizes =
+multiples of NSPEC+1) on the eagle3 arm so the B=1 verify (k+1 positions) actually gets a FULL decode
+graph. The 13:45 run should now show whether graphs delivers the real spec speedup once truly engaged.
+
 ## Measurement-reliability caveat (the real blocker)
 `measure_baseline.py` single-stream decode tok/s is **not trustworthy on this shared box**: prior
 `m_baseline_eager.json` = **1.95 tok/s** (tpot 513 ms) where analyze.py's own reference says FP8+EP

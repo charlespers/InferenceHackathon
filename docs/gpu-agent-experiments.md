@@ -137,6 +137,18 @@ misprediction (wasted-prefetch) rate to budget for. Feeds the markov/route-cache
 this locally — no torch on the Mac, and the only cached small MoE is a hybrid-arch GGUF/MLX without clean
 router hooks — so it's queued for the box where torch + Qwen3 + standard `output_router_logits` exist.)*
 
+### E9 — Self-speculation viability (shallow-pass agreement curve)  ⟵ decides the n-gram fallback
+Goal: does a shallow pass (first L_d layers + logit-lens) predict the next token well enough to draft
+without a trained head / extra GPU? Decides whether self-spec is a viable general-text fallback to n-gram.
+Pure inference, no engine relaunch.
+```bash
+python tools/verify_self_speculation.py --model /alloc/data/Qwen3-235B-A22B --device cuda --dtype bfloat16
+# (or a small MoE first: --model allenai/OLMoE-1B-7B-0924)
+```
+Record: top-1 agreement vs depth. **Go signal:** τ≈agreement·k must beat break-even (~1.86 at L_d=12,k=2)
+at a *small* L_d (cheap draft). See `docs/self-speculation-design.md`. If even deep L_d barely clears it,
+drop self-spec → rely on E6 n-gram (repetitive) + a trained MTP head (general).
+
 ## Results Log  (GPU agent: append, newest first; format below)
 <!-- ### YYYY-MM-DD  E<n> — <one-line result>
      launch/config: ...

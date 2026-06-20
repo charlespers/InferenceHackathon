@@ -13,7 +13,18 @@ to inferutil. Stdlib-only client (matches the harness's dependency-light style).
       --prompt 512 --decode 128 --warmup 8 --src /alloc/data/InferenceHackathon/src
 """
 from __future__ import annotations
-import argparse, json, sys, time, urllib.request
+import argparse, json, os, sys, time, urllib.request
+
+
+def _unique_runid(results_dir, name):
+    """Collision-proof runid (suffix -1/-2 on a same-second clash) so a precious
+    on-box run never silently overwrites another."""
+    base = time.strftime("%Y%m%d-%H%M%S")
+    d = os.path.join(results_dir, name)
+    c, i = base, 1
+    while os.path.exists(os.path.join(d, c + ".json")):
+        c, i = f"{base}-{i}", i + 1
+    return c
 
 
 def _import_inferutil(src_path):
@@ -26,6 +37,7 @@ def _import_inferutil(src_path):
     from inferutil.bench.engine import PrefillResult, DecodeStep, ExpertRoute
     from inferutil.bench.store import write_run, RunRecord, result_to_x_summary
     from inferutil.bench.report import format_result
+    from inferutil.bench.manifest import build_manifest
     try:
         from inferutil.bench.telemetry import NvmlTelemetry, NullTelemetry
     except Exception:
@@ -34,6 +46,7 @@ def _import_inferutil(src_path):
                 run_benchmark=run_benchmark, PrefillResult=PrefillResult, DecodeStep=DecodeStep,
                 ExpertRoute=ExpertRoute, write_run=write_run, RunRecord=RunRecord,
                 result_to_x_summary=result_to_x_summary, format_result=format_result,
+                build_manifest=build_manifest,
                 NvmlTelemetry=NvmlTelemetry, NullTelemetry=NullTelemetry)
 
 
@@ -113,6 +126,9 @@ def main():
     ap.add_argument("--prompt", type=int, default=512)
     ap.add_argument("--decode", type=int, default=128)
     ap.add_argument("--warmup", type=int, default=8)
+    ap.add_argument("--repeats", type=int, default=3,
+                    help="full-run repeats for CIs (each is a fresh stream; "
+                         "mind the slot budget)")
     ap.add_argument("--gpu", default="H100-SXM-80GB")
     ap.add_argument("--n-gpus", type=int, default=8)
     ap.add_argument("--results-dir", default="results")
@@ -125,7 +141,7 @@ def main():
     config = M["BenchConfig"](name=a.name, plan=a.plan, dtype_bytes=a.dtype,
                               kv_dtype_bytes=a.kv_dtype, tp=a.tp, ep=a.ep,
                               prompt_tokens=a.prompt, decode_tokens=a.decode,
-                              warmup_steps=a.warmup)
+                              warmup_steps=a.warmup, repeats=a.repeats)
     needed = a.warmup + a.decode + 4               # prefill(1)+warmup+(decode-1) content tokens
     engine = make_vllm_engine(M, a.base_url, a.model, a.prompt, needed)
 
@@ -135,16 +151,23 @@ def main():
         tele = t if getattr(t, "available", False) else M["NullTelemetry"]()
 
     result = M["run_benchmark"](engine, config, M["QWEN3_235B"], cluster, telemetry=tele)
-    runid = time.strftime("%Y%m%d-%H%M%S")
+    runid = _unique_runid(a.results_dir, config.name)
     rec = M["RunRecord"](runid=runid, config=config,
                          env={"gpu": cluster.gpu.name, "n_gpus": a.n_gpus,
                               "engine": "vllm", "base_url": a.base_url}, result=result)
     path = M["write_run"](rec, a.results_dir)
+    # reproducibility manifest (host, git commit, model hash, hardware) — real runs
+    # are exactly where "which commit / which driver produced this" matters.
+    manifest = M["build_manifest"](M["QWEN3_235B"], cluster, config,
+                                   cli=" ".join(sys.argv), runid=runid)
+    mpath = os.path.join(a.results_dir, config.name, runid + ".manifest.json")
+    with open(mpath, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
     if a.json:
         print(json.dumps(M["result_to_x_summary"](rec), indent=2))
     else:
         print(M["format_result"](rec))
-        print(f"\nsaved -> {path}")
+        print(f"\nsaved -> {path}\nmanifest -> {mpath}")
 
 
 if __name__ == "__main__":

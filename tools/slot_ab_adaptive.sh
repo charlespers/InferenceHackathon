@@ -8,7 +8,10 @@
 set -u
 LOG=/alloc/data/slot_run.log
 REPO=/alloc/data/InferenceHackathon
-MODEL=/alloc/data/Qwen3-235B-A22B
+# Weight-bound regime: FP8 checkpoint + CUDA graphs ON (no --enforce-eager).
+# v1 (bf16, enforce-eager) was floor-bound so adaptive-k regressed; the byte
+# saving only pays once weight reads dominate. Override MODEL via env if needed.
+MODEL=${MODEL:-Qwen/Qwen3-235B-A22B-Instruct-2507-FP8}
 PORT=8077
 echo "armed $(date -u), waiting for :45 slot (adaptive top-k A/B)" > "$LOG"
 while :; do m=$((10#$(date +%M))); [ "$m" -ge 45 ] && break; sleep 10; done
@@ -26,8 +29,8 @@ run_mode () {  # $1=label  $2=ENABLE
   ADAPTIVE_TOPK_DEBUG=1 \
     python3 -m vllm.entrypoints.openai.api_server \
        --model "$MODEL" --served-model-name qwen3 --tensor-parallel-size 8 \
-       --enable-expert-parallel --max-num-seqs 1 --dtype bfloat16 --max-model-len 8192 \
-       --enforce-eager --gpu-memory-utilization 0.9 --port $PORT \
+       --enable-expert-parallel --max-num-seqs 1 --max-model-len 8192 \
+       --no-enable-prefix-caching --gpu-memory-utilization 0.9 --port $PORT \
     > /alloc/data/vllm_$mode.log 2>&1 &
   local vpid=$! ok=0
   for i in $(seq 1 100); do
@@ -50,14 +53,25 @@ run_mode () {  # $1=label  $2=ENABLE
   kill $vpid 2>/dev/null; sleep 20  # release HBM before next launch
 }
 
-if [ "$freemb" -gt 65000 ]; then
+SCHED=/alloc/data/danielAgentScheduling.md
+# stale-lock cleanup (>20 min) then atomic acquire (coordinate with LOOP-B / kv-fp8)
+if [ -d /alloc/data/gpu.lock ] && [ -n "$(find /alloc/data/gpu.lock -mmin +20 2>/dev/null)" ]; then
+  rmdir /alloc/data/gpu.lock 2>/dev/null; fi
+if [ "$freemb" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
+  echo "LOOP-A $(date -u)" > /alloc/data/gpu.lock/holder
+  echo "- $(date -u) LOOP-A: acquired gpu.lock -> adaptive-topk A/B" >> "$SCHED" 2>/dev/null
+  echo "=== expert-chain microbench (kernel-level: does time scale with k?) ===" >> "$LOG"
+  python3 tools/moe_kernel_microbench.py --out /alloc/data/moe_kernel_microbench.json >> "$LOG" 2>&1
+  [ -f /alloc/data/moe_kernel_microbench.json ] && RESULTS+=(/alloc/data/moe_kernel_microbench.json)
   run_mode baseline 0
   echo "pip install -e adaptive_topk plugin ..." >> "$LOG"
   pip install -e experiments/adaptive_topk -q >> "$LOG" 2>&1
   [ $((10#$(date +%M))) -lt 56 ] && run_mode adaptive 1 \
     || echo "skip adaptive (out of slot time)" >> "$LOG"
+  rmdir /alloc/data/gpu.lock 2>/dev/null
+  echo "- $(date -u) LOOP-A: released gpu.lock (results in /alloc/data/ab_*.json)" >> "$SCHED" 2>/dev/null
 else
-  echo "GPUs busy (${freemb}MB free) -> cannot launch our vLLM; skipping A/B" >> "$LOG"
+  echo "GPUs busy (${freemb}MB free) or gpu.lock held by LOOP-B -> skipping A/B" >> "$LOG"
 fi
 
 # Quality gate: does adaptive (k=4) match baseline (k=8) greedy output?

@@ -234,7 +234,42 @@ drop self-spec → rely on E6 n-gram (repetitive) + a trained MTP head (general)
      launch/config: ...
      raw: TTFT=.. TPOT=.. tok/s=.. %roofline=.. dominant=..
      notes/anomalies: ... -->
-_(empty — awaiting first GPU window)_
+
+### 2026-06-20  Live :8000 (Conifer engine, spec ON) — B=1 baseline measured ⟵ floor-bound CONFIRMED on Conifer
+launch/config: localhost:8000, served `qwen3-235b-a22b`, **engine=Conifer** (per `x_summary.engine`),
+`x_summary.spec_enabled=true`, **spec_accept_rate=0.688**. Measured over the OpenAI `/v1/chat/completions`
+SSE seam with `bench/measure.py` (now reports percentiles + Student-t 95% CIs); ctx 128/512/2048,
+decode 32–64, warmup 1, 2 repeats.
+raw:
+- **decode 116 tok/s (wall-clock) / 143 tok/s (server `x_summary`)** — FLAT across ctx 128→2048
+- **TPOT 8.62–8.66 ms** (p50 ~8.9, tight: 95% CI ±~0.1 ms over n=62–126 pooled gaps)
+- **TTFT ~47–49 ms** (flat across ctx) — **NOT** the 777 ms vLLM figure (E-ttft)
+- **% of roofline: 9.4%** (fp8 ceiling 1231 tok/s) / **18.8%** (bf16 ceiling 616); ideal TPOT 0.81/1.62 ms
+- **dominant term: `kernel_gap`** (7.85 ms of the 8.66 ms is above the floor)
+notes/anomalies:
+- **Floor-bound confirmed on the Conifer engine too** (not just vLLM): 9–19% of roofline, overhead/launch
+  dominates → the "floor is the game" priority holds here. And this is **with spec already on (accept 0.688)**,
+  so the raw per-forward-pass rate is even lower — the floor dominates *even after* spec amortization.
+- **Decode is FLAT across ctx 128/512/2048** (116 tok/s) → weights ≫ KV at these depths, exactly as the
+  analytical depth-sweep predicts (KV crossover only ~128k). KV quant is a long-context-only lever here.
+- **TTFT flat ~47 ms** → Conifer's prefill/fast-path is NOT overhead-bound the way vLLM's 777 ms was; the
+  E-ttft prefix-caching win may be vLLM-specific (re-confirm on the vLLM path).
+- wall (116) vs server (143) = ~19% client/SSE overhead; use server `x_summary` for engine-internal, wall for user-facing.
+- repro: `PYTHONPATH=src python3 bench/measure.py --base http://localhost:8000 --model qwen3-235b-a22b --ctx 2048 --decode 64 --repeats 2`
+  then `python3 bench/roofline.py --ctx 2048 --weight-bytes 1 --kv-bytes 1 --tpot-ms 8.66` (MFU/MBU/ridge/dominant).
 
 ## Blockers / questions → planning agent
-_(none yet)_
+- **[bench-suite audit] `latency.py:157` attention-FLOP term omits `n_layers` (94× undercount):**
+  `flops += 4*cfg.n_heads*cfg.head_dim*seq_len` should be `* cfg.n_layers` (mirrors
+  `efficiency.flops_per_token`, which includes it). SHARED FILE — flagging, not editing. Impact is confined
+  to the diagnostic `compute_s`; even corrected it's ~0.018 ms vs weight_read ~3.3 ms, so the "compute is
+  negligible" conclusion stands — only an MFU/compute-ms sub-number is wrong. Found by a multi-agent audit
+  (8 dimension-auditors + adversarial verify); the 4 findings in bench-suite files are already fixed (commit
+  205f9b6: attribution above-floor shares, measure._t95 df 21-30 CI, runner prompt_tokens=0 inf→JSON, +error-path test).
+- **Q (weight dtype):** what is the live :8000 Conifer engine serving — fp8 or bf16? The roofline % differs
+  (9.4% fp8 vs 18.8% bf16); confirm and I'll pin it. Either way it's floor-bound.
+- **Q (other ports):** :8001 and :8077 are up but didn't return `/v1/models` cleanly; :8080 is llama-3.1-8b
+  (conifer). Worth measuring a different engine/config? Only :8000 (qwen3-235b) was characterized.
+- **Note:** `bench/measure.py` now does N-repeat measurement with p50/p90/p95/p99 + 95% CIs, and
+  `bench/roofline.py` reports MFU/MBU/ridge + the principled dominant term — so future Results-Log entries
+  can be richer than TTFT/TPOT/tok-s alone.

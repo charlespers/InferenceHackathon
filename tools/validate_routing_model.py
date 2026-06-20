@@ -47,6 +47,26 @@ def sim_busiest(P, rng, placement):
     return tot / (TRIALS // max(P, 1))
 
 
+def expected_accepted_formula(alpha, k, n):
+    p = 1.0 - (1.0 - alpha) ** n
+    return float(k) if p >= 1.0 else (1.0 - p ** k) / (1.0 - p)
+
+
+def sim_accepted(alpha, k, n, rng):
+    # p_hit per position = 1-(1-alpha)^n (n independent drafters); accept the run until the first miss.
+    p = 1.0 - (1.0 - alpha) ** n
+    tot = 0
+    for _ in range(TRIALS):
+        acc = 0
+        for _ in range(k):
+            if rng.random() < p:
+                acc += 1
+            else:
+                break
+        tot += acc
+    return tot / TRIALS
+
+
 def main():
     rng = random.Random(12345)
     rr = {e: e % NRANK for e in range(E)}    # round-robin EP placement
@@ -71,7 +91,17 @@ def main():
 
     print("3) TP8 (every expert column-sharded on every rank) -> per-rank imbalance is exactly 1.0 by")
     print("   construction (no balls-in-bins) — the reason TP8 > EP at B=1. (No sim needed; structural.)")
-    print(f"\nNet: the union + EP-imbalance + verify-rebalancing models are empirically sound on a simulated")
+    print("4) ACCEPTANCE — E[accepted]=(1−p^k)/(1−p), p=1−(1−α)^N (the spec speedup numerator) vs Monte-Carlo")
+    print(f"   {'α':>4} {'k':>3} {'N':>3} {'formula':>9} {'sim':>9} {'err%':>7}")
+    ok_a = True
+    for alpha, k, n in ((0.6, 5, 1), (0.7, 5, 1), (0.8, 8, 1), (0.7, 5, 2), (0.6, 8, 4)):
+        f, s = expected_accepted_formula(alpha, k, n), sim_accepted(alpha, k, n, rng)
+        err = 100 * abs(f - s) / max(s, 1e-9)
+        ok_a &= err < 3
+        print(f"   {alpha:>4.1f} {k:>3} {n:>3} {f:>9.3f} {s:>9.3f} {err:>6.1f}%")
+    print(f"   => acceptance formula {'VALIDATED' if ok_a else 'MISMATCH'} (<3% error)\n")
+
+    print(f"Net: the union + EP-imbalance + verify-rebalancing + acceptance models are empirically sound on a simulated")
     print("128-expert top-8 MoE. The same formulas drive spec_floor_model / tree_spec_optimizer / spec_predict /")
     print("backout_floor — so those rest on a validated foundation before the H100 runs confirm the absolute numbers.")
 

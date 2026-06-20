@@ -16,6 +16,7 @@ class BenchConfig:
     decode_tokens: int = 128
     seed: int = 0
     warmup_steps: int = 8
+    repeats: int = 1               # full-run repeats for variance/significance
 
     @property
     def seq_len(self) -> int:

@@ -39,6 +39,9 @@ class BenchResult:
     pct_of_floor: float
     # device
     telemetry: TelemetrySummary
+    # variance (appended, defaulted — keeps existing positional construction valid)
+    n_repeats: int = 1
+    decode_tok_per_s_std: float = 0.0
 
 
 def bytes_per_token(cfg: MoEConfig, seq_len: int, dtype_bytes: int,
@@ -84,7 +87,8 @@ def summarize_telemetry(samples, n_decode_tokens: int,
 
 def build_result(*, cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
                  ttft_s: float, prefill_tok_per_s: float, decode_step_seconds: list,
-                 telemetry_summary: TelemetrySummary) -> BenchResult:
+                 telemetry_summary: TelemetrySummary,
+                 decode_tok_per_s_samples=None) -> BenchResult:
     steps_sorted = sorted(decode_step_seconds)
     n = len(decode_step_seconds)
     total_decode = sum(decode_step_seconds)
@@ -96,6 +100,17 @@ def build_result(*, cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
         cfg, cluster, plan=config.plan, dtype_bytes=config.dtype_bytes,
         kv_dtype_bytes=config.kv_dtype_bytes, seq_len=config.seq_len,
         tp=config.tp, ep=config.ep).tokens_per_s
+    # Variance across full-run repeats, when provided. The representative
+    # decode_step_seconds still drives TPOT percentiles + bytes/BW.
+    if decode_tok_per_s_samples:
+        n_rep = len(decode_tok_per_s_samples)
+        mean = sum(decode_tok_per_s_samples) / n_rep
+        var = sum((x - mean) ** 2 for x in decode_tok_per_s_samples) / n_rep
+        decode_tok_per_s = mean
+        decode_tok_per_s_std = var ** 0.5
+    else:
+        n_rep = 1
+        decode_tok_per_s_std = 0.0
     return BenchResult(
         ttft_s=ttft_s, prefill_tok_per_s=prefill_tok_per_s,
         decode_tok_per_s=decode_tok_per_s,
@@ -106,4 +121,5 @@ def build_result(*, cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
         pct_of_peak_bw=achieved / cluster.aggregate_hbm_bw,
         analytical_floor_tok_per_s=floor_tok_s,
         pct_of_floor=(decode_tok_per_s / floor_tok_s) if floor_tok_s else 0.0,
-        telemetry=telemetry_summary)
+        telemetry=telemetry_summary,
+        n_repeats=n_rep, decode_tok_per_s_std=decode_tok_per_s_std)

@@ -21,20 +21,28 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
     engine.reset(plan=config.plan, dtype_bytes=config.dtype_bytes,
                  kv_dtype_bytes=config.kv_dtype_bytes, tp=config.tp, ep=config.ep,
                  seq_len=config.seq_len)
+    samples_tok_s = []
+    step_seconds = []
+    gpu_samples = []
+    ttft_s = 0.0
+    prefill_tok_per_s = 0.0
+    for rep in range(config.repeats):
+        pre = engine.prefill(list(range(config.prompt_tokens)))
+        ttft_s = pre.seconds + pre.first_token_seconds
+        prefill_tok_per_s = (pre.n_prompt_tokens / pre.seconds) if pre.seconds else float("inf")
+        for _ in range(config.warmup_steps):
+            engine.decode_step()
+        last_rep = rep == config.repeats - 1
+        if last_rep:
+            telemetry.start()
+        step_seconds = [engine.decode_step().seconds for _ in range(config.decode_tokens - 1)]
+        if last_rep:
+            gpu_samples = telemetry.stop()
+        total = sum(step_seconds)
+        samples_tok_s.append((len(step_seconds) / total) if total else float("inf"))
 
-    pre = engine.prefill(list(range(config.prompt_tokens)))
-    ttft_s = pre.seconds + pre.first_token_seconds
-    prefill_tok_per_s = (pre.n_prompt_tokens / pre.seconds) if pre.seconds else float("inf")
-
-    for _ in range(config.warmup_steps):
-        engine.decode_step()
-
-    telemetry.start()
-    step_seconds = [engine.decode_step().seconds for _ in range(config.decode_tokens - 1)]
-    gpu_samples = telemetry.stop()
-
-    # Energy window covers decode_tokens-1 steps; denominator uses decode_tokens — ~0.8% mismatch is intentional (first token folded into TTFT).
     summary = summarize_telemetry(gpu_samples, config.decode_tokens, sum(step_seconds))
     return build_result(cfg=cfg, cluster=cluster, config=config, ttft_s=ttft_s,
                         prefill_tok_per_s=prefill_tok_per_s,
-                        decode_step_seconds=step_seconds, telemetry_summary=summary)
+                        decode_step_seconds=step_seconds, telemetry_summary=summary,
+                        decode_tok_per_s_samples=samples_tok_s)

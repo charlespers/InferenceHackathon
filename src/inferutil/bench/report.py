@@ -4,6 +4,12 @@ from __future__ import annotations
 from .store import RunRecord
 
 
+def is_significant(mean_a: float, std_a: float, mean_b: float, std_b: float) -> bool:
+    """True when |mean_b - mean_a| exceeds combined run-to-run noise (~95%)."""
+    noise = 2.0 * ((std_a ** 2 + std_b ** 2) ** 0.5)
+    return abs(mean_b - mean_a) > noise
+
+
 def format_result(record: RunRecord) -> str:
     r = record.result
     c = record.config
@@ -17,8 +23,9 @@ def format_result(record: RunRecord) -> str:
         "  -- latency --",
         f"  TTFT         : {r.ttft_s*ms:8.2f} ms",
         f"  prefill      : {r.prefill_tok_per_s:8.1f} tok/s",
-        f"  decode       : {r.decode_tok_per_s:8.1f} tok/s   "
-        f"(TPOT p50 {r.tpot_p50_s*ms:.2f} / p95 {r.tpot_p95_s*ms:.2f} ms)",
+        f"  decode       : {r.decode_tok_per_s:8.1f} tok/s"
+        + (f" ±{r.decode_tok_per_s_std:.1f} (n={r.n_repeats})" if r.n_repeats > 1 else "")
+        + f"   (TPOT p50 {r.tpot_p50_s*1e3:.2f} / p95 {r.tpot_p95_s*1e3:.2f} ms)",
         "  -- bandwidth / roofline --",
         f"  bytes/token  : {r.bytes_per_token/1e9:8.2f} GB",
         f"  achieved BW  : {r.achieved_hbm_bw/1e12:8.2f} TB/s "
@@ -66,4 +73,6 @@ def format_compare(a: RunRecord, b: RunRecord) -> str:
         f"  {'temp max C':<16}{ra.telemetry.temp_c_max:>12.1f}"
         f"{rb.telemetry.temp_c_max:>12.1f}"
         f"{_delta(ra.telemetry.temp_c_max, rb.telemetry.temp_c_max):>12}",
+        f"  {'decode sig?':<16}"
+        f"{'SIGNIFICANT' if is_significant(ra.decode_tok_per_s, ra.decode_tok_per_s_std, rb.decode_tok_per_s, rb.decode_tok_per_s_std) else 'within-noise':>36}",
     ])

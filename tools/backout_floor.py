@@ -32,18 +32,47 @@ def w(k):  # weight-units verify cost for k positions (spec_moe_model.py)
     return 0.34 + 0.66 * (union(k) / TOPK)
 
 
+def fit_F(triples):
+    """Least-squares F from [(k, tau, S)]: V=tau/S, V = F + (1-F)·w(k) -> (V-w) = F·(1-w). Returns F or None."""
+    xs, ys = [], []
+    for k, tau, S, in [(t[0], t[1], t[2]) for t in triples]:
+        V, wk = tau / S, w(k)
+        xs.append(1 - wk); ys.append(V - wk)
+    den = sum(x * x for x in xs)
+    if den < 1e-9:
+        return None
+    return sum(x * y for x, y in zip(xs, ys)) / den
+
+
+def selftest():
+    """Round-trip: pick F_true, synthesize (k, tau, S) with S = tau / (F_true + (1-F_true)·w(k)), recover F."""
+    ok = True
+    print("backout_floor self-test (known F -> synthetic V=tau/S -> recovered F):")
+    for F_true in (0.86, 0.50, 0.20):
+        triples = []
+        for k in (2, 3, 5, 8):
+            tau = 1.0 + 0.3 * k                      # arbitrary accept length; F is independent of it
+            V = F_true + (1 - F_true) * w(k)
+            triples.append((k, tau, tau / V))        # S = tau / V
+        F = fit_F(triples)
+        err = abs(F - F_true)
+        ok &= err < 1e-6
+        print(f"  F_true={F_true:.2f} -> recovered {F:.6f}  ({'PASS' if err < 1e-6 else 'FAIL'})")
+    print(f"=> backout_floor inversion {'VALIDATED' if ok else 'BROKEN'} (exact on noise-free data).")
+    return ok
+
+
 def main():
+    import sys
+    if "--selftest" in sys.argv:
+        selftest(); return
     rows = [(k, tau, S, tau / S, w(k)) for (k, tau, S) in MEAS]
     print(f"  {'k':>3} {'tau':>5} {'S':>5} {'V=tau/S':>8} {'union':>6} {'w(k)':>6}")
     for k, tau, S, V, wk in rows:
         print(f"  {k:>3} {tau:>5.2f} {S:>5.2f} {V:>8.3f} {union(k):>6.1f} {wk:>6.2f}")
-    # Fit F by least squares to V = F + (1-F)·w  ->  V = F·(1-w) + w  ->  (V - w) = F·(1 - w)
-    xs = [(1 - wk) for (_, _, _, _, wk) in rows]
-    ys = [(V - wk) for (_, _, _, V, wk) in rows]
-    num = sum(x * y for x, y in zip(xs, ys)); den = sum(x * x for x in xs)
-    if den < 1e-9:
+    F = fit_F(MEAS)
+    if F is None:
         print("\n  need ≥2 DISTINCT tree sizes (different union) to separate F from the weight term."); return
-    F = num / den
     print(f"\n  ==> backed-out floor fraction F = {F:.3f}   (overhead-attribution.md measured ~0.86)")
     if F > 0.7:
         print("  FLOOR-BOUND: the verify is hidden under the floor (V≈1). Route-aware tree-shaping saves ~nothing")

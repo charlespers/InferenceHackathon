@@ -83,6 +83,15 @@ v2 into `k5_experts_warp.cu`); if no improvement → it's DRAM- or reduce-bound,
 split-K (fewer lanes/row, more rows/warp) — report Nsight so the planning agent designs it. Target: push
 blended K5 `e` from 0.46 toward ~0.50.
 
+Also test the **int4 expert GEMV** (the biggest *byte* lever — halves the dominant expert term):
+```bash
+/usr/local/cuda-12.6/bin/nvcc -arch=sm_90a -O3 --use_fast_math kernels/k5_int4_bench.cu -I kernels -o i4bench
+CUDA_VISIBLE_DEVICES=0 ./i4bench 3350   # fp8 winner vs int4 throughput + int4-unpack correctness
+```
+Record: int4 speedup vs fp8 (**2.0× = bandwidth-bound ideal; <2.0× = the nibble unpack is issue-bound**) +
+the int4 unpack `max_rel` (should be ~0). This is the key open question int4 raises — whether the unpack
+eats the byte win. Result decides whether int4 experts are worth wiring into the engine (E7) / cudarc path.
+
 ### E5 — Speculative decode acceptance (if a draft is wired)
 If EAGLE/MTP/n-gram drafting is available, measure `spec_accept_rate` (τ) + tok/s uplift via `x_summary`.
 

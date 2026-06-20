@@ -150,7 +150,7 @@ impl PlacementMap {
 struct PendingPrefetch {
     target_layer: usize,
     predicted_experts: Vec<ExpertId>,
-    actual_experts: Option<Vec<ExpertId>>, // filled in when layer completes
+    _actual_experts: Option<Vec<ExpertId>>, // filled in when layer completes
 }
 
 pub struct PrefetchScheduler<S: PrefetchSink> {
@@ -196,7 +196,7 @@ impl<S: PrefetchSink> PrefetchScheduler<S> {
         self.pending.push_back(PendingPrefetch {
             target_layer,
             predicted_experts: prediction.experts.clone(),
-            actual_experts: None,
+            _actual_experts: None,
         });
     }
 

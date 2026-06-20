@@ -17,7 +17,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use axum::{
@@ -30,7 +30,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;

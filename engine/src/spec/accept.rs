@@ -51,7 +51,7 @@ pub fn accept_multi_drafter(
     let mut accepted: Vec<TokenId> = Vec::with_capacity(k);
     let mut accept_mask: Vec<bool> = Vec::with_capacity(k);
     let mut winning_drafter: Option<usize> = None;
-    let mut bonus_token: TokenId;
+    let bonus_token: TokenId;
 
     'positions: for pos in 0..k {
         // Try each drafter at this position.

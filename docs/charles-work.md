@@ -19,19 +19,24 @@ the #1 lever is route-prefetch/spec (comms-bound) or int4/kernels (weight-bound)
 ## Doc map
 | Doc | What |
 |---|---|
-| `gpu-agent-experiments.md` | **The work order** — E0–E8, exact commands, go/no-go signals, Results Log |
+| `gpu-agent-experiments.md` | **The work order** — E0–E9, exact commands, go/no-go signals, Results Log |
+| `interpretation-playbook.md` | **measured value → next action** for every experiment (the data-to-lever map) |
 | `team-coordination.md` | How this fits `origin/main` (Rust engine + bench); cross-validation; comms reconciliation |
 | `next-levers-research.md` | Prioritized, vetted levers (engine baseline → n-gram spec → int4 → down-proj) |
+| `predicted-tok-s-matrix.md` | Predicted tok/s, all layouts×precision×ctx, at measured e=0.46 (TP8 ~261 vs EP ~94) |
 | `spec-decode-moe-tax.md` | Why their `SpecConfig draft_len=8` loses on the MoE; use k≈2–3 (for `engine/spec/`) |
+| `self-speculation-design.md` | Draft with the target's own shallow layers (no extra model/GPU); honest cost model |
+| `ep-placement-for-b1.md` | Their optimizer balances *average* load; B=1 needs per-step busiest-rank (co-activation) |
 | `b1-latency-architecture.md` | The 15-avenue first-principles research (H100 canonical) |
 | `b1-tp8-moe-rearchitecture-h200.md` | The TP8 MoE re-architecture spec (numbers ÷1.433 for this H100) |
 | `k5-kernel-results-h100.md` | The measured kernel optimization journey |
 
-## Kernel files (`kernels/`)
+## Kernel files (`kernels/`) + tools
 - `k5_experts.cu` (reference) · `k5_experts_warp.cu` (**measured winner**) · `k5_microbench.cu` (repro)
 - `k5_experts_warp2.cu` + `k5_downproj_bench.cu` (down-proj occupancy fix, for E4)
 - `k5_experts_int4.cu` + `k5_int4_bench.cu` (int4 byte lever — does the unpack eat the 2×? → E4)
-- `tools/verify_route_prediction.py` (validates the team's `predictor.rs` on a real MoE → E8)
+- `tools/verify_route_prediction.py` (E8, `predictor.rs`) · `tools/verify_self_speculation.py` (E9)
+- `tools/predict_matrix.py` (calibrated predictions from the team's model)
 
 ## Experiment queue (priority; see `gpu-agent-experiments.md` for commands)
 **E0** collective latency (cheapest, decides strategy) → **E1** FP8+EP engine baseline → **E4** kernel

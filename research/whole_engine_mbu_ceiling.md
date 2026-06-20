@@ -75,3 +75,21 @@ split of the remaining latency floor (anchored on the "K1 44%" profile note). Th
 measured-only evidence (router-alone bound = 325 tok/s). The clean confirmation is an Nsight per-kernel
 timeline on the real engine (E-attr) splitting kernel-busy-at-BW from per-op latency/gaps — the same trace
 that resolves the overhead fork.
+
+## CONFIRMED by the 352-tok/s single-binary (commit 52813ed) — fusion collapses the floor, as predicted
+Charles's `spec_step_e2e.cu` measured a **single-binary 8-GPU cuBLASLt fp8 forward at 352 tok/s plain**
+(2.34 ms) vs the vLLM Python engine's **76 tok/s** — a **4.6× jump from going single-binary/fused**. This is
+*exactly* this note's thesis: the gating issue is the per-op LATENCY floor, and removing it (compiled binary,
+cuBLASLt, no per-op Python/launch) unlocks the BW regime. **The 352 proxy explicitly models only the GEMM
+panels (qkv/o/gate-up/down ×94 + lm_head) + a K2 constant (500 µs) — it OMITS the router and the per-op
+norms**, i.e. the very latency-floor ops this note identified. They're omitted because in a single binary they
+*are* latency-negligible — which confirms the router's 2.26 ms in vLLM was per-op-launch overhead, not inherent
+compute. So 76 → 352 IS "the latency floor collapsing."
+- **Reconciliation, not refutation:** vLLM 76 (latency-bound, un-fused) and single-binary 352 (floor removed)
+  are the two ends of this note's argument. 352 ≈ 1.84 ms GEMMs (cuBLASLt e≈0.45) + 0.5 ms K2; with comms
+  added (~1 ms NVLS) it's ~260 plain — still above the ~200 the note said only fusion can cross.
+- **Honest caveats on the 352 (so it isn't over-banked):** (a) dummy-weight timing proxy; (b) it OMITS the
+  router + per-op norms — verify they actually fuse/overlap in the real single binary and don't re-add a floor;
+  (c) cuBLASLt GEMMs at e≈0.45 → MBU tuning still has headroom toward the ~1280 BW ceiling; (d) the spec
+  1048–1485 rides on this and re-confirms spec-as-GEMM flat-in-k. Net: the path is **single-binary/megakernel
+  (collapse the floor, 76→~260–352) → MBU tune (→ ~1280) → NVLS + spec** — fusion first, exactly as argued.

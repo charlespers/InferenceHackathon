@@ -22,6 +22,8 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
                  kv_dtype_bytes=config.kv_dtype_bytes, tp=config.tp, ep=config.ep,
                  seq_len=config.seq_len)
     samples_tok_s = []
+    ttft_samples = []
+    e2e_samples = []
     step_seconds = []
     gpu_samples = []
     last_breakdowns = []
@@ -31,6 +33,7 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
     for rep in range(config.repeats):
         pre = engine.prefill(list(range(config.prompt_tokens)))
         ttft_s = pre.seconds + pre.first_token_seconds
+        ttft_samples.append(ttft_s)
         prefill_tok_per_s = (pre.n_prompt_tokens / pre.seconds) if pre.seconds else float("inf")
         for _ in range(config.warmup_steps):
             engine.decode_step()
@@ -48,6 +51,7 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
             gpu_samples = telemetry.stop()
         total = sum(step_seconds)
         samples_tok_s.append((len(step_seconds) / total) if total else float("inf"))
+        e2e_samples.append(ttft_s + total)
 
     summary = summarize_telemetry(gpu_samples, config.decode_tokens, sum(step_seconds))
     quality = None
@@ -58,7 +62,8 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
                           prefill_tok_per_s=prefill_tok_per_s,
                           decode_step_seconds=step_seconds, telemetry_summary=summary,
                           decode_tok_per_s_samples=samples_tok_s,
-                          step_breakdowns=last_breakdowns, quality=quality)
+                          step_breakdowns=last_breakdowns, quality=quality,
+                          ttft_samples=ttft_samples, e2e_samples=e2e_samples)
     if collect_ids:
         # attach for callers that need a reference sequence (not part of the stored schema)
         object.__setattr__(result, "generated_token_ids", last_ids)

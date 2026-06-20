@@ -5,8 +5,9 @@ you which term to attack next. It speaks the **same OpenAI `/v1/chat/completions
 the UI streams, so one endpoint serves the demo and the benchmark. Stdlib-only (no installs).
 
 ## Files
-- `roofline.py` — byte budget + the fp8 bandwidth ceiling; given a measured TPOT, prints the
-  achieved fraction and the **dominant term**.
+- `roofline.py` — byte budget + the bandwidth ceiling; given a measured TPOT, prints **MFU, MBU,
+  arithmetic intensity vs the roofline ridge, the regime, and the dominant term** via principled
+  attribution (`argmax(weight_ms, kv_ms, kernel_gap_ms)` — not a hand-tuned threshold cascade).
 - `measure.py` — streams one request, times **TTFT / TPOT / decode tok/s** from the wall clock
   (not from a self-reported number); parses optional `x_summary`.
 - `sweep.py` — the **autoresearch driver**: the DoF search space + a **decision tree** mapping the
@@ -16,7 +17,24 @@ the UI streams, so one endpoint serves the demo and the benchmark. Stdlib-only (
 - **TTFT** — time to first streamed token (prefill).
 - **TPOT** — mean inter-token wall-clock latency during decode (the number to minimize).
 - **decode tok/s** — `(tokens-1)/(t_last-t_first)`.
-- **% of roofline** — achieved tok/s ÷ `bench/roofline.py` ceiling at that ctx/precision.
+- **MFU** — `2·N_active·tok/s / peak_FLOPS` (compute utilization; meaningful for prefill).
+- **MBU** — `bytes/token·tok/s / peak_BW` (bandwidth utilization; the decode number that matters).
+- **AI / ridge** — arithmetic intensity `FLOPs/byte` vs `peak_FLOPS/peak_BW`; below the ridge ⇒
+  memory-bound.
+- **% of roofline / floor** — achieved tok/s ÷ ceiling at that ctx/precision.
+
+## Analytical suite (`src/inferutil/bench`, no GPU required)
+The rigorous, statistically-honest version of this loop — runs on a laptop against the analytical
+roofline model (MockEngine) and, when the engine lands, against real streamed runs:
+```bash
+PYTHONPATH=src python -m inferutil.bench run --name fp8ep --dtype 1 --kv-dtype 2 --tp 2 --ep 8 --repeats 5
+PYTHONPATH=src python -m inferutil.bench diagnose --name fp8ep     # bottleneck → ranked next levers
+PYTHONPATH=src python -m inferutil.bench export --name fp8ep --format csv --out runs.csv
+```
+- Reports MFU/MBU, a full latency panel (TTFT / E2E / throughput / TPOT) with **Student-t 95% CIs**,
+  roofline regime, and a **bottleneck → ranked-lever** recommendation (predicted speedup + effort).
+- `run` also writes a reproducibility `*.manifest.json` (host, git commit, model hash, hardware).
+- Design rationale: `docs/superpowers/specs/2026-06-19-rigorous-benching-design.md`.
 
 ## Loop (use it the moment the engine is up)
 ```bash

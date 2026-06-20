@@ -6,6 +6,8 @@ from ..model import MoEConfig
 from ..hardware import Cluster
 from ..latency import decode_latency
 from .config import BenchConfig
+from .efficiency import compute_efficiency, peak_flops_for_dtype, Efficiency
+from .stats import summarize, stat_to_dict
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,8 @@ class BenchResult:
     decode_tok_per_s_std: float = 0.0
     measured_breakdown: "MeasuredBreakdown | None" = None
     quality: "object | None" = None    # QualityResult | None (avoids import cycle)
+    efficiency: "Efficiency | None" = None     # MFU / MBU / roofline bundle
+    latency: "dict | None" = None              # E2E / throughput / TPOT as Stat dicts
 
 
 def bytes_per_token(cfg: MoEConfig, seq_len: int, dtype_bytes: int,
@@ -107,11 +111,29 @@ def aggregate_breakdown(step_breakdowns) -> "MeasuredBreakdown | None":
         compute_s=sum(b.compute_s for b in bs) / n)
 
 
+def _latency_panel(*, ttft_samples, e2e_samples, throughput_samples,
+                   tpot_step_seconds, ttft_s, decode_tok_per_s, total_s) -> dict:
+    """The full latency view ('TTS' = E2E + throughput + per-token), each as a
+    distribution. Falls back to the single representative value when only one
+    repeat is available. All times in ms; throughput in tok/s."""
+    ms = 1e3
+    ttft_vals = [t * ms for t in (ttft_samples or [ttft_s])]
+    e2e_vals = [t * ms for t in (e2e_samples or [total_s])]
+    thr_vals = list(throughput_samples or [decode_tok_per_s])
+    tpot_vals = [s * ms for s in (tpot_step_seconds or [])]
+    return {
+        "ttft_ms": stat_to_dict(summarize(ttft_vals)),
+        "e2e_ms": stat_to_dict(summarize(e2e_vals)),
+        "throughput_tok_s": stat_to_dict(summarize(thr_vals)),
+        "tpot_ms": stat_to_dict(summarize(tpot_vals)),
+    }
+
+
 def build_result(*, cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
                  ttft_s: float, prefill_tok_per_s: float, decode_step_seconds: list,
                  telemetry_summary: TelemetrySummary,
                  decode_tok_per_s_samples=None, step_breakdowns=None,
-                 quality=None) -> BenchResult:
+                 quality=None, ttft_samples=None, e2e_samples=None) -> BenchResult:
     steps_sorted = sorted(decode_step_seconds)
     n = len(decode_step_seconds)
     total_decode = sum(decode_step_seconds)
@@ -134,12 +156,28 @@ def build_result(*, cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
     else:
         n_rep = 1
         decode_tok_per_s_std = 0.0
+    total_s = ttft_s + total_decode
+    # --- efficiency bundle: MFU / MBU / roofline (active-param accounting) ---
+    weight_bytes = cfg.active_params * config.dtype_bytes
+    kv_bytes = config.seq_len * cfg.kv_bytes_per_token(config.kv_dtype_bytes)
+    peak_flops = peak_flops_for_dtype(
+        cluster.gpu.bf16_flops, cluster.gpu.fp8_flops, config.dtype_bytes) * cluster.n_gpus
+    efficiency = compute_efficiency(
+        active_params=cfg.active_params, weight_bytes=weight_bytes,
+        bytes_per_token=bpt, kv_bytes=kv_bytes, prompt_tokens=config.prompt_tokens,
+        prefill_tok_s=prefill_tok_per_s, decode_tok_s=decode_tok_per_s,
+        peak_flops=peak_flops, peak_bw=cluster.aggregate_hbm_bw)
+    latency = _latency_panel(
+        ttft_samples=ttft_samples, e2e_samples=e2e_samples,
+        throughput_samples=decode_tok_per_s_samples,
+        tpot_step_seconds=decode_step_seconds, ttft_s=ttft_s,
+        decode_tok_per_s=decode_tok_per_s, total_s=total_s)
     return BenchResult(
         ttft_s=ttft_s, prefill_tok_per_s=prefill_tok_per_s,
         decode_tok_per_s=decode_tok_per_s,
         tpot_p50_s=percentile(steps_sorted, 0.5),
         tpot_p95_s=percentile(steps_sorted, 0.95),
-        total_s=ttft_s + total_decode, n_decode_tokens=config.decode_tokens,
+        total_s=total_s, n_decode_tokens=config.decode_tokens,
         bytes_per_token=bpt, achieved_hbm_bw=achieved,
         pct_of_peak_bw=achieved / cluster.aggregate_hbm_bw,
         analytical_floor_tok_per_s=floor_tok_s,
@@ -147,4 +185,4 @@ def build_result(*, cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
         telemetry=telemetry_summary,
         n_repeats=n_rep, decode_tok_per_s_std=decode_tok_per_s_std,
         measured_breakdown=aggregate_breakdown(step_breakdowns),
-        quality=quality)
+        quality=quality, efficiency=efficiency, latency=latency)

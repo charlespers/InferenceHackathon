@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 from .store import RunRecord
+from .attribution import diagnose
+
+
+def _pct(x) -> str:
+    return f"{x*100:.1f}%" if x is not None else "—"
 
 
 def is_significant(mean_a: float, std_a: float, mean_b: float, std_b: float) -> bool:
@@ -26,6 +31,7 @@ def format_result(record: RunRecord) -> str:
         f"  decode       : {r.decode_tok_per_s:8.1f} tok/s"
         + (f" ±{r.decode_tok_per_s_std:.1f} (n={r.n_repeats})" if r.n_repeats > 1 else "")
         + f"   (TPOT p50 {r.tpot_p50_s*1e3:.2f} / p95 {r.tpot_p95_s*1e3:.2f} ms)",
+        f"  E2E (total)  : {r.total_s*ms:8.2f} ms",
         "  -- bandwidth / roofline --",
         f"  bytes/token  : {r.bytes_per_token/1e9:8.2f} GB",
         f"  achieved BW  : {r.achieved_hbm_bw/1e12:8.2f} TB/s "
@@ -33,6 +39,23 @@ def format_result(record: RunRecord) -> str:
         f"  vs floor     : {r.decode_tok_per_s:8.1f} / "
         f"{r.analytical_floor_tok_per_s:.1f} tok/s = "
         f"{r.pct_of_floor*100:.1f}% of floor",
+    ]
+    eff = r.efficiency
+    if eff is not None:
+        ai = f"{eff.ai_decode:.2f}" if eff.ai_decode is not None else "—"
+        ridge = f"{eff.roofline_ridge:.0f}" if eff.roofline_ridge is not None else "—"
+        lines += [
+            "  -- efficiency (roofline) --",
+            f"  MFU          : prefill {_pct(eff.mfu_prefill)} / decode {_pct(eff.mfu_decode)}",
+            f"  MBU (decode) : {_pct(eff.mbu_decode)}   (KV byte share {_pct(eff.kv_byte_share)})",
+            f"  AI decode    : {ai} FLOP/B   ridge {ridge}  -> {eff.regime_decode}",
+        ]
+    b = diagnose(r)
+    lines += [
+        "  -- bottleneck --",
+        f"  dominant     : {b.dominant_term} ({b.share*100:.0f}% of time, "
+        f"conf {b.confidence*100:.0f}%)",
+        f"  -> {b.note}",
     ]
     mb = r.measured_breakdown
     if mb is not None:
@@ -55,6 +78,30 @@ def format_result(record: RunRecord) -> str:
         ]
     else:
         lines.append("  -- device telemetry unavailable --")
+    return "\n".join(lines)
+
+
+def format_diagnosis(record: RunRecord, levers=None) -> str:
+    """Bottleneck diagnosis + ranked next-lever recommendations for one run."""
+    b = diagnose(record.result)
+    ai = f"{b.ai_decode:.2f}" if b.ai_decode is not None else "—"
+    ridge = f"{b.ridge:.0f}" if b.ridge is not None else "—"
+    lines = [
+        f"== DIAGNOSIS: {record.config.name}  [{record.runid}] ==",
+        f"  regime       : {b.regime}  (AI {ai} vs ridge {ridge} FLOP/B)",
+        f"  dominant     : {b.dominant_term}  ({b.share*100:.0f}% of per-token time)",
+        f"  runner-up    : {b.second_term}  ({b.second_share*100:.0f}%)  "
+        f"confidence {b.confidence*100:.0f}%",
+        f"  headroom     : {b.headroom_to_floor*100:.0f}% below analytical floor",
+        f"  -> {b.note}",
+    ]
+    if levers:
+        lines.append("  -- ranked next levers (predicted) --")
+        lines.append(f"  {'lever':<22}{'tok/s':>10}{'speedup':>9}{'effort':>8}")
+        for lv in levers:
+            lines.append(f"  {lv.name:<22}{lv.predicted_tok_s:>10.1f}"
+                         f"{lv.speedup:>8.2f}x{lv.effort:>8}")
+            lines.append(f"      {lv.rationale}")
     return "\n".join(lines)
 
 

@@ -7,14 +7,20 @@ import os
 import socket
 from datetime import datetime
 
+import sys
+
 from ..model import QWEN3_235B
 from ..hardware import GPUS, Cluster
 from .config import BenchConfig
 from .engine import MockEngine
 from .runner import run_benchmark
 from .telemetry import NvmlTelemetry, NullTelemetry
-from .store import (write_run, load_run, load_latest, result_to_x_summary, RunRecord)
-from .report import format_result, format_compare
+from .store import (write_run, load_run, load_latest, load_all,
+                    result_to_x_summary, RunRecord, export_csv, export_jsonl)
+from .report import format_result, format_compare, format_diagnosis
+from .attribution import diagnose
+from .levers import recommend
+from .manifest import build_manifest
 from .gate import Thresholds, evaluate
 
 DEFAULT_RESULTS_DIR = "results"
@@ -24,7 +30,14 @@ def _build_config(args) -> BenchConfig:
     return BenchConfig(
         name=args.name, plan=args.plan, dtype_bytes=args.dtype,
         kv_dtype_bytes=args.kv_dtype, tp=args.tp, ep=args.ep,
-        prompt_tokens=args.prompt, decode_tokens=args.decode)
+        prompt_tokens=args.prompt, decode_tokens=args.decode, repeats=args.repeats)
+
+
+def _cluster_from_env(rec: RunRecord) -> Cluster:
+    gpu = rec.env.get("gpu") or "H100-SXM-80GB"
+    if gpu not in GPUS:
+        gpu = "H100-SXM-80GB"
+    return Cluster(gpu=GPUS[gpu], n_gpus=rec.env.get("n_gpus") or 8)
 
 
 def _cmd_run(args) -> None:
@@ -51,11 +64,16 @@ def _cmd_run(args) -> None:
                             "driver_version": driver_version},
                        result=result)
     path = write_run(record, args.results_dir)
+    manifest = build_manifest(QWEN3_235B, cluster, config, cli=" ".join(sys.argv),
+                              runid=runid, driver_version=driver_version)
+    mpath = os.path.join(args.results_dir, config.name, runid + ".manifest.json")
+    with open(mpath, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
     if args.json:
         print(json.dumps(result_to_x_summary(record), indent=2))
     else:
         print(format_result(record))
-        print(f"\nsaved -> {path}")
+        print(f"\nsaved -> {path}\nmanifest -> {mpath}")
 
 
 def _resolve(args) -> RunRecord:
@@ -91,6 +109,26 @@ def _cmd_gate(args) -> None:
         raise SystemExit(1)
 
 
+def _cmd_diagnose(args) -> None:
+    rec = _resolve(args)
+    cluster = _cluster_from_env(rec)
+    b = diagnose(rec.result)
+    levers = recommend(QWEN3_235B, cluster, rec.config, bottleneck=b,
+                       min_speedup=args.min_speedup)
+    print(format_diagnosis(rec, levers))
+
+
+def _cmd_export(args) -> None:
+    records = load_all(args.name, args.results_dir)
+    if not records:
+        raise SystemExit(f"no runs for '{args.name}' in {args.results_dir}")
+    if args.format == "csv":
+        export_csv(records, args.out)
+    else:
+        export_jsonl(records, args.out)
+    print(f"exported {len(records)} run(s) -> {args.out}")
+
+
 def _cmd_compare(args) -> None:
     for runid in (args.a, args.b):
         path = os.path.join(args.results_dir, args.name, runid + ".json")
@@ -118,6 +156,8 @@ def main(argv=None) -> None:
     r.add_argument("--ep", type=int, default=8)
     r.add_argument("--prompt", type=int, default=512)
     r.add_argument("--decode", type=int, default=128)
+    r.add_argument("--repeats", type=int, default=5,
+                   help="full-run repeats for variance/confidence intervals")
     r.add_argument("--efficiency", type=float, default=1.0,
                    help="MockEngine BW efficiency (1.0 = analytical floor)")
     r.add_argument("--jitter", type=float, default=0.0)
@@ -138,6 +178,20 @@ def main(argv=None) -> None:
     gp.add_argument("--min-pct-floor", type=float, default=None)
     gp.add_argument("--min-quality", type=float, default=None)
     gp.set_defaults(func=_cmd_gate)
+
+    dp = sub.add_parser("diagnose",
+                        help="diagnose the bottleneck and rank next levers")
+    dp.add_argument("--name", default="default")
+    dp.add_argument("runid", nargs="?", default="latest")
+    dp.add_argument("--min-speedup", type=float, default=1.02,
+                    help="drop levers predicting less than this speedup")
+    dp.set_defaults(func=_cmd_diagnose)
+
+    ep = sub.add_parser("export", help="export stored runs to csv/jsonl")
+    ep.add_argument("--name", default="default")
+    ep.add_argument("--format", choices=["csv", "jsonl"], default="csv")
+    ep.add_argument("--out", required=True)
+    ep.set_defaults(func=_cmd_export)
 
     cp = sub.add_parser("compare", help="diff two stored runs")
     cp.add_argument("--name", default="default")

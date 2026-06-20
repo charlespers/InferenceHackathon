@@ -216,11 +216,22 @@ control degrades — so the hook genuinely perturbs the all-reduce. Even the **g
 (K=2, reuse the all-reduce result from 2 layers back) yields **0% agreement** — output is gibberish
 from the first decode token.
 
-**Conclusion (honest, scoped):** the *no-retrain, runtime-substitution* form of stale-TP is **dead**
-for Qwen3-235B B=1 decode. This **confirms the literature prior** (Ladder-Residual / Kog DTP both need
-training). It does NOT refute stale-TP-with-retraining (Ladder works — 23.7%/30.8% at B=1/8×H100), but
-that requires ~3B-token retraining → **out of hackathon scope.** Error-feedback / attention-exact
-recovery (the CONDITIONAL branch) is implausible to bridge 0.000→0.99 and is not pursued.
+**Predicted-proxy follow-up (Charles's GO candidate, measured 10:46 UTC).** Charles proposed that a
+*predicted* post-AR hidden (not a stale copy) could avoid the router flip. Tested the cheapest such
+predictor — `predicted = local_partial × world_size` (right expected magnitude, this layer's local
+direction): **also catastrophic.** `lyr_pred_k2 = 0.025`, `lyr_pred_k4 = 0.018` agreement — same
+ballpark as stale (0.000) and local (0.023). No crash; hook confirmed active on all 8 workers.
+**Mechanism:** scaling fixes magnitude but not *direction* — the local partial is missing 7/8 of the
+sum, so the router still flips. **This generalizes the kill: ANY predictor built from a single rank's
+local information cannot recover the cross-rank sum well enough** (it's an information barrier, not a
+tuning problem). DirectProxy predicts from *routing history* — same local/historical-info class — so
+it is very unlikely to clear a bar that right-magnitude prediction misses by ~40×.
+
+**Conclusion (complete kill):** the *no-retrain, runtime-substitution* form of stale-TP — in ALL tested
+variants (stale-reuse, local, temporal, predicted-from-local) — is **dead** for Qwen3-235B B=1 decode.
+This **confirms the literature prior** (Ladder-Residual / Kog DTP both need training). It does NOT
+refute stale-TP-with-retraining (Ladder works — 23.7%/30.8% at B=1/8×H100), but that requires
+~3B-token retraining → **out of hackathon scope.**
 
 **Why it fails (mechanism):** the substituted value is the all-reduce *output* (a delta added to the
 residual). Reusing a 2-layer-old delta as the current layer's delta is a large, wrong perturbation —

@@ -1,0 +1,83 @@
+# Exact deferred-overlap — LOOP-C pivot (lossless comms-floor lever)
+
+**Date:** 2026-06-20 · **Author:** djamoils (LOOP-C) · **Status:** design + handoff to Charles's kernel
+**Pivot from:** `research/n4_speculative_stale_tp.md` (runtime stale-TP = NO-GO, measured 0.000–0.025)
+
+> **Why this, why now.** Stale/predicted TP is dead (substituting the all-reduce from local info
+> flips the router → gibberish; retraining is out of scope — weeks + 3.76 TB optimizer state vs 640 GB).
+> But the *overlap ceiling* stale-TP pointed at is reachable **losslessly**: don't substitute the
+> collective, **overlap the EXACT collective with the next op's HBM weight-stream.** Same ~roofline
+> prize (`tools/stale_tp_ceiling.py`), zero quality risk, no retraining.
+
+## 1. The mechanism (and the honest B=1 subtlety)
+
+At B=1 the per-layer cost is **weight-read time** (the GEMV ≈ the HBM read; compute ≈ 0). The TP
+all-reduce (NVLink/NVSwitch) and the weight read (HBM) use **different hardware paths** → they *can*
+run concurrently. The catch (`comms_floor.md` §3): the all-reduce output is the **activation** the next
+op consumes, so the next GEMV's *compute* must wait for it. But the next op's **weight LOAD from HBM
+does not depend on the activation** — only the final multiply does. So:
+
+- **Overlap = issue the NVLS all-reduce while streaming the next matmul's weights from HBM.**
+  Hidden per collective = `min(AR_latency, next_weight_read)`. The multiply itself (tiny at B=1) waits
+  for the reduced activation, then runs against already-resident weights.
+
+This is **lossless** — the exact collective still runs; only its *latency* is hidden behind a read
+that was going to happen anyway.
+
+**Why it's a kernel feature, not a config (the real constraint).** `comms_floor.md` §3 is right that
+stock vLLM can't do this at B=1: async-TP needs chunked GEMMs (M≫1), and there's no "prefetch this
+layer's weights" call. The way to actually overlap an 8 KB NVLS reduction against a weight stream at
+B=1 is a **persistent megakernel** (MPK / Charles's K6) that software-pipelines at SM granularity:
+some SMs run the multimem in-switch reduction while others stream the next weight tile. So **this lever
+lives inside Charles's megakernel + NVLS kernel** — LOOP-C's role is the schedule + the ceiling, not a
+separate from-scratch kernel.
+
+## 2. What can overlap at B=1 (dependency map, per layer)
+
+Two collectives/layer (TP=8): AR-A after attention o_proj, AR-M after MoE down-proj.
+
+| collective | produces | next consumer | overlap target (HBM read, activation-independent) |
+|---|---|---|---|
+| **AR-A** (post-attn) | attn output → added to residual | same layer's MLP/MoE gate+up | **prefetch MoE gate/up expert weights** for the routed experts while AR-A is in flight |
+| **AR-M** (post-MoE) | layer output residual | next layer's QKV proj | **prefetch layer L+1's QKV weights** while AR-M is in flight |
+
+At B=1 the cover (one op's weight read) is ~8.3 µs at fp8 / ~16.6 µs at bf16 per layer (the active
+slice). So an NVLS reduction at **C ≤ ~4 µs (fp8)** is *fully* hidden — see ceiling table below.
+
+## 3. The prize (from `tools/stale_tp_ceiling.py`; the overlap math is identical for exact)
+
+The ceiling tool's "+overlap" column is **lossless here** (the mechanism is the same; only correctness
+differs from the killed staleness variant):
+
+| per-collective C | fp8 comms exposed | tok/s (fp8) |
+|---|---|---|
+| 16 µs (today) | 3.01 ms | 257 |
+| 7 µs (multimem one-shot) | 0.54 ms | 706 |
+| **≤4 µs (Charles's NVLS, fully hidden)** | **~0** | **~1218 (roofline)** |
+
+So **fp8 + exact deferred-overlap + Charles's NVLS → ~roofline**, losslessly. This is the same number
+Charles cited for the stale path (`docs/path-to-1000.md`), now **without** the quality gamble.
+
+## 4. Stacking (honest, sub-multiplicative — per Charles `660ef9f`)
+
+- **Spec-decode (EAGLE3)** amortizes the *collective count* across accepted tokens.
+- **Exact deferred-overlap + NVLS** hides the *per-collective latency* that remains.
+  These attack different factors and compose — but as the regime flips floor→weight-bound (comms
+  hidden), the optimal spec-tree shrinks; don't multiply naively. Re-fit with Charles's
+  `tree_spec_optimizer` + `backout_floor` once comms is hidden.
+
+## 5. LOOP-C deliverables for this lever
+1. **This design + the SM-pipelining schedule** (§2 dependency map → which weights to prefetch per
+   collective) — hand to Charles for the K6/NVLS kernel.
+2. **`tools/stale_tp_ceiling.py`** — quantifies the prize and the C-threshold (≤~4 µs at fp8) that
+   Charles's NVLS must hit; re-runnable at bf16/fp8.
+3. **A correctness gate**: exact deferred-overlap is lossless *by construction* (the collective is
+   unchanged), so the gate is a numerical-identity check (token-exact vs baseline), not a quality
+   sweep — much cheaper than the staleness probe. Reuse `tools/quality_compare.py` for parity == 1.0.
+
+## 6. Open questions / next
+- Confirm vLLM/megakernel can issue an NVLS multimem reduction on a subset of SMs concurrent with a
+  weight-stream at B=1 (Charles's `measure_collective.sh` + K6 wiring).
+- Measure real `C` for the multimem one-shot on this 8×H100 NVSwitch (does it beat 16 µs → reach ≤4 µs?).
+- If C can't get below the fp8 cover (~4 µs), the lever still pays partially (706 tok/s at 7 µs) — quantify.
+</content>

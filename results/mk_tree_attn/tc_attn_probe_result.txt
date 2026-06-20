@@ -27,3 +27,13 @@ The bulk of the residual is the SEPARATE NAIVE SOFTMAX KERNEL: uncoalesced strid
 col-major, ldc=M -> consecutive t are M apart) + 3 passes, scaling with the M warp count. A FUSED FA kernel
 computes softmax INLINE during the GEMM accumulation (no separate pass, no stride-M spill) -> removes this
 residual and should approach the GEMM-only ~1.0x. Net conclusion unchanged (FUSE it), mechanism corrected.
+
+--- FULL TC attention v2 (COALESCED softmax, scores [ctx x M]) tc_attn_full2.cu/tcf2 — validated 0.52% ---
+ctx=4096:  M=1 66.88us  M=4 64.63 (0.97x)  M=8 66.84 (1.00x)  M=16 70.41 (1.05x)
+ctx=8192:  M=1 119.94us M=4 121.45(1.01x)  M=8 124.79(1.04x)  M=16 133.59(1.11x)
+=> FULL attention (QK^T + softmax + P.V) is FLAT IN M (1.0-1.05x@M=8), numerically correct. The v1 residual
+WAS the naive softmax's uncoalesced stride-M reads; storing scores [ctx x M] (softmax over the contiguous
+leading dim) fixes it. So even a NON-fused cuBLAS split achieves flat-in-M attention; a fused FA kernel would
+only improve absolutes. vs warp-shuffle k2b M=8=165us, TC-split=67us = ~2.5x faster AND flat.
+VALIDATED LEVER: TC verify attention removes the K2 M-tax. Build it (fp8 KV + tree/causal mask + RoPE);
+M=1 plain decode keeps warp-shuffle (TC underfills there).

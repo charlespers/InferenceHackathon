@@ -2,6 +2,7 @@ pub mod optimizer;
 pub mod pipeline;
 pub mod predictor;
 pub mod scheduler;
+pub mod sim;
 pub mod stats;
 pub mod types;
 

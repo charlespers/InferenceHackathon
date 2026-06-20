@@ -21,19 +21,19 @@ DOF = {
     "draft_len":    [0, 4, 6],
 }
 
-# Decision tree: dominant term -> ordered next levers to try.
+# Decision tree: dominant term -> ordered next levers to try. Keys match the
+# principled dominant_term vocabulary from roofline.analyze (weight_bw / kv_bw /
+# comms / kernel_gap / compute).
 NEXT_LEVER = {
-    "memory-bandwidth": ["weight_dtype: fp8->int4 on experts", "spec: ngram->eagle3", "raise draft_len"],
-    "KV-bandwidth":     ["kv_dtype: fp16->fp8", "shorten ctx / prefix-KV reuse", "KV compression"],
-    "comms/launch":     ["layout: ep8->tp4ep2->tp8 (fewer collectives)", "graph: off->on", "low-latency all-to-all (NVSHMEM/DeepEP)"],
-    "weight-bandwidth": ["weight_dtype: bf16->fp8->int4", "check dequant not compute-bound (Nsight)"],
+    "weight_bw":  ["weight_dtype: bf16->fp8->int4 on experts", "spec: ngram->eagle3", "raise draft_len"],
+    "kv_bw":      ["kv_dtype: fp16->fp8", "shorten ctx / prefix-KV reuse", "KV compression"],
+    "comms":      ["layout: ep8->tp4ep2->tp8 (fewer collectives)", "graph: off->on", "low-latency all-to-all (NVSHMEM/DeepEP)"],
+    "kernel_gap": ["graph: off->on (CUDA graphs)", "fused dequant", "kernel tuning (Nsight Compute)"],
+    "compute":    ["unusual at B=1; check dequant isn't on the math path (Nsight)"],
 }
 
 def classify(term):
-    for k in NEXT_LEVER:
-        if k in term:
-            return NEXT_LEVER[k]
-    return ["inspect Nsight; term unclear"]
+    return NEXT_LEVER.get(term, ["inspect Nsight; term unclear"])
 
 def run(base, ctx, decode, engine, label, weight_bytes, kv_bytes, out):
     m = measure.stream_once(base, ("ctx " * ctx).strip() or "hi", decode, engine)

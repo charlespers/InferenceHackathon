@@ -10,7 +10,8 @@
 #include <cuda_runtime.h>
 #include "common.cuh"
 using namespace q3;
-#include "k5_experts.cu"        // reference k5_experts_fused
+#define K5_NO_MAIN              // pull in kernels + reference, but not k5_experts.cu's own main()
+#include "k5_experts.cu"        // reference k5_experts_fused (+ k5a_gateup/k5b_down/k5_reference)
 #include "k5_experts_warp.cu"   // k5a_gateup_warp, k5b_down_warp (the winner)
 
 #define CK(x) do{ cudaError_t e_=(x); if(e_!=cudaSuccess){ \

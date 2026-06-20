@@ -15,6 +15,8 @@
 //! Losslessness: this only changes WHICH tokens are proposed; speculative-sampling acceptance is
 //! exact for any draft distribution. Route-awareness trades a little acceptance for a smaller union.
 
+use crate::routing::types::ExpertId;
+use crate::spec::adaptive_verify::{adaptive_verify_depth, VerifyPlan};
 use crate::spec::route_aware::{Candidate, ExpertUnion, RouteAwarePolicy};
 use crate::spec::types::{DraftProposal, TokenId};
 
@@ -61,6 +63,41 @@ impl<S: CandidateSource> RouteAwareDrafter<S> {
             }
         }
         (DraftProposal { drafter_id: 0, tokens, logprobs }, union)
+    }
+
+    /// Build the route-aware chain AND choose the verify depth in one call — the full per-round plan.
+    ///
+    /// Returns the proposal, the per-position predicted expert sets (what the verify would read),
+    /// and the [`VerifyPlan`] from [`adaptive_verify_depth`] (how far to actually verify, given the
+    /// floor fraction `F`). Accept-prob estimates feed adaptive verify; we use the EVICT proxy of
+    /// the draft model's own confidence, `min(1, exp(draft_logprob))` — a wrong estimate only costs
+    /// throughput, never correctness. `None` plan iff no candidate was produced.
+    pub fn draft_and_plan(
+        &self,
+        context: &[TokenId],
+        depth: usize,
+        width: usize,
+        floor_fraction: f32,
+    ) -> (DraftProposal, Vec<Vec<ExpertId>>, Option<VerifyPlan>) {
+        let mut tokens: Vec<TokenId> = Vec::with_capacity(depth);
+        let mut logprobs: Vec<f32> = Vec::with_capacity(depth);
+        let mut experts_per_pos: Vec<Vec<ExpertId>> = Vec::with_capacity(depth);
+        let mut union = ExpertUnion::new();
+        for _ in 0..depth {
+            let cands = self.source.candidates(context, &tokens, width);
+            match self.policy.select_one(&cands, &mut union) {
+                Some(i) => {
+                    tokens.push(cands[i].token);
+                    logprobs.push(cands[i].draft_logprob);
+                    experts_per_pos.push(cands[i].experts.clone());
+                }
+                None => break,
+            }
+        }
+        let accept_probs: Vec<f32> =
+            logprobs.iter().map(|&lp| lp.exp().clamp(0.0, 1.0)).collect();
+        let plan = adaptive_verify_depth(&accept_probs, &experts_per_pos, floor_fraction);
+        (DraftProposal { drafter_id: 0, tokens, logprobs }, experts_per_pos, plan)
     }
 }
 
@@ -135,5 +172,34 @@ mod tests {
         }
         let e = RouteAwareDrafter::new(EmptySource, 1.0).draft_chain(&[1], 4, 2);
         assert!(e.0.tokens.is_empty());
+    }
+
+    #[test]
+    fn draft_and_plan_returns_consistent_chain_experts_and_verify_depth() {
+        // High draft confidence (logprob ~ -0.1 → accept-prob ~0.9) + overlapping experts →
+        // adaptive verify should keep a healthy depth.
+        let cands = vec![
+            cand(10, -0.1, &[0, 1, 2, 3, 4, 5, 6, 7]),
+            cand(11, -0.2, &[0, 1, 2, 3, 4, 5, 6, 7]),
+        ];
+        let d = RouteAwareDrafter::new(FixedSource { cands }, 1.0);
+        let (prop, experts, plan) = d.draft_and_plan(&[1, 2], 4, 2, 0.86);
+        assert_eq!(prop.tokens.len(), 4);
+        assert_eq!(experts.len(), 4, "one expert-set per drafted position");
+        let p = plan.expect("a plan when there are candidates");
+        assert!(p.depth >= 1 && p.depth <= 4, "verify depth within chain ({})", p.depth);
+        assert!(p.emitted >= 1.0, "emitted includes the bonus token");
+        // all positions reuse [0..7] → union stays 8, not 32
+        assert_eq!(p.union_size, 8);
+    }
+
+    #[test]
+    fn draft_and_plan_empty_source_has_no_plan() {
+        struct EmptySource;
+        impl CandidateSource for EmptySource {
+            fn candidates(&self, _c: &[TokenId], _ch: &[TokenId], _w: usize) -> Vec<Candidate> { vec![] }
+        }
+        let (prop, experts, plan) = RouteAwareDrafter::new(EmptySource, 1.0).draft_and_plan(&[1], 3, 2, 0.0);
+        assert!(prop.tokens.is_empty() && experts.is_empty() && plan.is_none());
     }
 }

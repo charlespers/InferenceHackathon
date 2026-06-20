@@ -69,3 +69,20 @@ cd ui && npm run e2e            # end-to-end smoke (needs the mock running on :8
 - `docs/h100-tuning-playbook.md` — 8×H100 latency tuning playbook
 - `docs/superpowers/specs/2026-06-19-multigpu-inference-ui-design.md` — UI design spec
 - `docs/superpowers/plans/2026-06-19-multigpu-inference-ui.md` — implementation plan
+
+## Benchmark harness (`inferutil.bench`)
+
+Offline B=1 decode benchmarks measured against the analytical roofline. Runs
+today on a `MockEngine` (no GPU); a `ConiferEngine` slots in behind the same
+`Engine` seam when the engine lands.
+
+```bash
+PYTHONPATH=src python -m inferutil.bench run --name fp8-hybrid --dtype 1 --plan hybrid --tp 2 --ep 8
+PYTHONPATH=src python -m inferutil.bench report --name fp8-hybrid          # latest run
+PYTHONPATH=src python -m inferutil.bench compare <runidA> <runidB> --name fp8-hybrid
+```
+
+Each run captures TTFT, decode/prefill tok/s, TPOT p50/p95, derived achieved
+bandwidth (% of peak and % of analytical floor), and NVML device telemetry
+(temps, util, power, energy/token, per-GPU imbalance). Results are JSON under
+`results/<name>/` and diffable run-to-run.

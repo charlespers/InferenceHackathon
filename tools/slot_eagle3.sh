@@ -23,7 +23,13 @@ LOG=/alloc/data/slot_eagle3.log
 SCHED=/alloc/data/danielAgentScheduling.md
 MODEL=${MODEL:-Qwen/Qwen3-235B-A22B-Instruct-2507-FP8}
 HEAD=nm-testing/Qwen3-235B-A22B-EAGLE3-converted-speculators-lmsys
-spec_cfg () { echo "{\"method\":\"eagle3\",\"model\":\"$HEAD\",\"num_speculative_tokens\":$1,\"draft_tensor_parallel_size\":1}"; }
+# draft_tensor_parallel_size=8 (Charles, docs/eagle3-draft-tp.md): at B=1 the 1B head is
+# BANDWIDTH-bound — draft_tp=1 reads ~2GB on one rank (~0.6ms x k ~3ms/round, confounds the
+# F-backout since it scales with k); draft_tp=8 reads 0.25GB/GPU + ~32us AR (~6x faster) and
+# keeps the aux hidden states TP8-sharded (no gather). Fallback to 1 if the head won't shard
+# (4 KV heads over 8 ranks). Eager-first reveals a load failure fast.
+DRAFT_TP=${DRAFT_TP:-8}
+spec_cfg () { echo "{\"method\":\"eagle3\",\"model\":\"$HEAD\",\"num_speculative_tokens\":$1,\"draft_tensor_parallel_size\":$DRAFT_TP}"; }
 PORT=8077
 # Two tree sizes so V at k1 and k2 over-determine the floor F (Charles' backout_floor.py):
 # V(k)=F+(1-F)(0.34+0.66*union(k)/8). NSPEC1 = primary (de-risk + parity); NSPEC2 = opportunistic
@@ -74,6 +80,7 @@ launch_measure () {
     echo "  scraped $(wc -l < "$OUT/metrics_$label.txt" 2>/dev/null || echo 0) spec metric lines -> metrics_$label.txt" >> "$LOG"
   fi
   kill $vpid 2>/dev/null; sleep 20    # free HBM before the next launch
+  LAST_OK=$ok                          # so callers can fall back on failure
 }
 
 # stale-lock cleanup (>20 min) then atomic acquire
@@ -85,6 +92,12 @@ if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
 
   # 1) EAGLE3 @ k=NSPEC1 — de-risk + accept-length + lossless capture (most important)
   launch_measure "eagle3_$MODE" "$EAGER --speculative-config $(spec_cfg $NSPEC1)" 0.85
+  # FALLBACK: if draft_tp=8 won't load (4 KV heads / 8 ranks), retry the de-risk run at draft_tp=1
+  if [ "${LAST_OK:-0}" -ne 1 ] && [ "$DRAFT_TP" != "1" ] && [ "$(mins)" -lt 54 ]; then
+    echo "draft_tp=$DRAFT_TP failed — falling back to draft_tp=1 for the de-risk run" >> "$LOG"
+    DRAFT_TP=1
+    launch_measure "eagle3_$MODE" "$EAGER --speculative-config $(spec_cfg $NSPEC1)" 0.85
+  fi
 
   # 2) baseline FP8 in the SAME mode — so S=tok/s(eagle3)/tok/s(base) and V=tau/S are valid
   #    (matched floor in both). If time remains.

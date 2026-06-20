@@ -263,15 +263,21 @@ static void chunked_compute(RankState& S, int nchunks, cudaEvent_t* ev) {
     if (len <= 0) break;
     ov_make_chunk<<<132, 256, 0, S.compute>>>(S.part, base, len, S.rank);
     CK(cudaEventRecord(ev[c], S.compute));                         // chunk c ready
+    // Issue the comm stream's wait for chunk c HERE, in the (NCCL-free) compute phase, NOT
+    // interleaved between ncclGroupStart/End. The wait is stream-ordered on S.comms and the
+    // chunk's all-reduce is enqueued on the SAME stream at ncclGroupEnd, so the gate (wait[c]
+    // then AR[c]) is preserved while keeping the NCCL group region pure NCCL calls.
+    CK(cudaStreamWaitEvent(S.comms, ev[c], 0));                    // comm stream waits for chunk c only
   }
 }
-static void chunked_collective(RankState& S, int nchunks, cudaEvent_t* ev) {  // inside the outer group
+static void chunked_collective(RankState& S, int nchunks, cudaEvent_t* /*ev*/) {  // inside the outer group
   const int base_len = (HIDDEN + nchunks - 1) / nchunks;
   for (int c = 0; c < nchunks; ++c) {
     const int base = c * base_len;
     const int len  = std::min(base_len, HIDDEN - base);
     if (len <= 0) break;
-    CK(cudaStreamWaitEvent(S.comms, ev[c], 0));                    // comm stream waits for chunk c only
+    // No CUDA-runtime calls inside the group: the per-chunk waits were already enqueued on
+    // S.comms in chunked_compute(); these all-reduces land after them in stream order.
     NK(ncclAllReduce(S.part + base, S.part + base, len, ncclFloat32, ncclSum, S.comm, S.comms));
   }
 }
@@ -394,6 +400,7 @@ int main(int argc, char** argv) {
     for (int it = 0; it < WARM; ++it) { run_step(compute_one, coll_one); sync_all(R); }
     cudaEvent_t e0, e1; CK(cudaSetDevice(0)); CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     sync_all(R);
+    CK(cudaSetDevice(0));                       // sync_all left device 7 current; e0 lives on device 0
     CK(cudaEventRecord(e0, R[0].compute));
     for (int it = 0; it < IT; ++it) { run_step(compute_one, coll_one); sync_all(R); }
     CK(cudaSetDevice(0)); CK(cudaEventRecord(e1, R[0].compute)); CK(cudaEventSynchronize(e1));
@@ -438,7 +445,10 @@ int main(int argc, char** argv) {
   printf("  %-32s %10.2f us  (reduce-as-you-go, %d chunks)\n", "B: chunked all-reduce", ms_chunk*1e3, NCHUNKS);
   printf("  %-32s %10.2f us  (reduce || next-layer K1)\n", "C: layer-pipeline prefetch", ms_pipe*1e3);
 
-  // Overlap fraction for scheme C against the ideal serial sum (collective + compute on one stream).
+  // Fraction of the naive serial SUM (collective + compute on one stream) saved by scheme C.
+  // NOTE: this is "fraction of the serial sum saved", not "fraction of compute overlapped" — when
+  // the shorter operand is fully hidden it reports short/(coll+comp); the downstream exposed_coll_us
+  // is the number that actually matters and it is computed exactly below.
   const double ideal_serial_us = coll_us + comp_us;
   const double ovC = ideal_serial_us > 0 ? (1.0 - (ms_pipe*1e3) / ideal_serial_us) : 0.0;
   // How much of the collective is hidden in scheme C: serial_pair - overlapped = hidden; / coll.
@@ -450,7 +460,7 @@ int main(int argc, char** argv) {
   printf("\n-- overlap analysis (scheme C: collective hidden behind next-layer K1) --\n");
   printf("  ideal serial (coll + compute)      %10.2f us\n", ideal_serial_us);
   printf("  overlapped (scheme C)              %10.2f us\n", ms_pipe*1e3);
-  printf("  overlap fraction (1 - ov/serial)   %10.1f %%\n", 100.0 * ovC);
+  printf("  serial-sum saved (1 - ov/serial)   %10.1f %%\n", 100.0 * ovC);
   printf("  collective hidden                  %10.2f us  (%.1f%% of the %.2f us collective)\n",
          hidden_us, 100.0 * coll_hidden_frac, coll_us);
   printf("  EXPOSED collective / layer         %10.2f us  (was %.2f us serial)\n", exposed_coll_us, coll_us);
@@ -471,6 +481,9 @@ int main(int argc, char** argv) {
          chunk_exposed_us, ms_ser*1e3);
 
   printf("\nNOTES:\n");
+  printf("  * Timing uses a per-iter sync_all(), so each iter measures SINGLE-LAYER overlap latency;\n");
+  printf("    the x%d per-token figure assumes zero cross-layer pipeline fill and is thus an UPPER\n", N_COLL);
+  printf("    BOUND on the benefit (steady-state pipelining would do at least this well).\n");
   printf("  * Scheme C overlaps the per-layer collective with the NEXT layer's independent QKV GEMV;\n");
   printf("    the more independent compute per layer (full K1+K2+K3 prologue, ~tens of us at TP8), the\n");
   printf("    closer the exposed collective -> 0.  This PoC overlaps only K1, a LOWER bound on hiding.\n");

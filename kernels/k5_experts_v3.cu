@@ -382,17 +382,24 @@ struct Bufs {
   float* a_d; float* h_d; int E;
 };
 
-static bool launch_cfg(const V3Cfg& c, const Bufs& b, int maxSmem, cudaStream_t s,
-                       FnA fa, FnB fb) {
+// Opt in to >48KB dynamic smem for this config's A/B kernels. Call ONCE per config before timing;
+// keeping it out of the hot launch path avoids two redundant host-side setAttribute calls per iter
+// that would otherwise serialize host issue and pessimize the swept us/tok numbers.
+static bool set_cfg_smem(const V3Cfg& c, const Bufs& b, int maxSmem, FnA fa, FnB fb) {
   size_t sa = smemA(c), sb = smemB(c, b.E);
   if ((int)sa > maxSmem || (int)sb > maxSmem) return false;
   cudaFuncSetAttribute((const void*)fa, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sa);
   cudaFuncSetAttribute((const void*)fb, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sb);
+  return true;
+}
+
+// Hot path: just the two launches (smem already opted in via set_cfg_smem).
+static void launch_cfg(const V3Cfg& c, const Bufs& b, cudaStream_t s, FnA fa, FnB fb) {
+  size_t sa = smemA(c), sb = smemB(c, b.E);
   int ctasA = ctas_for(b.E * MOE_INTER, c.R, c.block);
   int ctasB = ctas_for(b.E * HIDDEN,    c.R, c.block);
   fa<<<ctasA, c.block, sa, s>>>(b.y_d, b.sel_d, b.Wgu_d, b.Sgu_d, b.a_d, b.E);
   fb<<<ctasB, c.block, sb, s>>>(b.sel_d, b.selw_d, b.Wd_d, b.Sd_d, b.a_d, b.h_d, b.E);
-  return true;
 }
 
 int main(int argc, char** argv) {
@@ -510,9 +517,11 @@ int main(int argc, char** argv) {
              c.R, c.STAGES, c.block, sa, sb, "-", "-", "-", "skip(smem)");
       continue;
     }
+    // opt in to this config's smem ONCE (kept out of the timed loop below)
+    if (!set_cfg_smem(c, b, maxSmem, en.fa, en.fb)) continue;
     // correctness for THIS config
     CK(cudaMemset(h_d, 0, HIDDEN * sizeof(float)));
-    if (!launch_cfg(c, b, maxSmem, 0, en.fa, en.fb)) continue;
+    launch_cfg(c, b, 0, en.fa, en.fb);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
     std::vector<float> got(HIDDEN, 0.0f);
     CK(cudaMemcpy(got.data(), h_d, HIDDEN * sizeof(float), cudaMemcpyDeviceToHost));
@@ -520,7 +529,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < HIDDEN; ++i) max_abs = std::max(max_abs, fabs((double)ref[i] - (double)got[i]));
     bool ok = max_abs < 1e-2;
 
-    auto runAB = [&]() { launch_cfg(c, b, maxSmem, 0, en.fa, en.fb); };
+    auto runAB = [&]() { launch_cfg(c, b, 0, en.fa, en.fb); };
     float msAB = bench(runAB);
     CK(cudaGetLastError());
     double gb = gbps(bytesT, msAB);

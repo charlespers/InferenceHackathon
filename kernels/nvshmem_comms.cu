@@ -252,10 +252,32 @@ int main(int argc, char** argv) {
   CK(cudaMemcpy(a2s, h_a2s.data(), sizeof(float) * (size_t)npes * A2A_CHUNK, cudaMemcpyHostToDevice));
 
   const int block = 1024;   // one CTA; 1024 threads cover 16 KB in 4 grid-stride steps.
+  int n_ar = AR_N, n_chunk = A2A_CHUNK;   // addressable copies for collective_launch arg array.
+
+  // CRITICAL: kernels that call synchronizing/collective NVSHMEM device APIs (barrier_all_block,
+  // *_reduce_block) MUST be launched with nvshmemx_collective_launch, not the <<<>>> syntax —
+  // otherwise NVSHMEM's inter-PE sync state is never set up and the first device barrier hangs.
+  // These helpers wrap collective_launch for our exact (1 block, `block` threads, stream s) shape.
+  const dim3 grid1(1), blk(block);
+  auto launch_ar_recd = [&](float* a, float* r){
+    void* args[] = { (void*)&a, (void*)&r, (void*)&n_ar };
+    int rc = nvshmemx_collective_launch((const void*)ar_recdouble_block, grid1, blk, args, 0, s);
+    if (rc != 0) { printf("PE %d: collective_launch(ar_recd) rc=%d\n", mype, rc); nvshmem_global_exit(3); }
+  };
+  auto launch_ar_lib = [&](float* d, float* sp){
+    void* args[] = { (void*)&d, (void*)&sp, (void*)&n_ar };
+    int rc = nvshmemx_collective_launch((const void*)ar_nvshmem_block, grid1, blk, args, 0, s);
+    if (rc != 0) { printf("PE %d: collective_launch(ar_lib) rc=%d\n", mype, rc); nvshmem_global_exit(3); }
+  };
+  auto launch_a2a = [&](float* sp, float* r){
+    void* args[] = { (void*)&sp, (void*)&r, (void*)&n_chunk };
+    int rc = nvshmemx_collective_launch((const void*)a2a_put_block, grid1, blk, args, 0, s);
+    if (rc != 0) { printf("PE %d: collective_launch(a2a) rc=%d\n", mype, rc); nvshmem_global_exit(3); }
+  };
 
   // ================================ CORRECTNESS ================================================
   // --- (a) recursive-doubling all-reduce ---
-  ar_recdouble_block<<<1, block, 0, s>>>(acc, recv, AR_N);
+  launch_ar_recd(acc, recv);
   CK(cudaStreamSynchronize(s));
   nvshmem_barrier_all();
   {
@@ -275,7 +297,7 @@ int main(int argc, char** argv) {
   }
 
   // --- (b) NVSHMEM library all-reduce (out-of-place lsrc -> ldst) ---
-  ar_nvshmem_block<<<1, block, 0, s>>>(ldst, lsrc, AR_N);
+  launch_ar_lib(ldst, lsrc);
   CK(cudaStreamSynchronize(s));
   nvshmem_barrier_all();
   {
@@ -295,7 +317,7 @@ int main(int argc, char** argv) {
   }
 
   // --- (c) all-to-all ---
-  a2a_put_block<<<1, block, 0, s>>>(a2s, a2r, A2A_CHUNK);
+  launch_a2a(a2s, a2r);
   CK(cudaStreamSynchronize(s));
   nvshmem_barrier_all();
   {
@@ -323,33 +345,36 @@ int main(int argc, char** argv) {
   cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
   float us_recd = 0.f, us_lib = 0.f, us_a2a = 0.f;
 
-  // helper: re-seed acc each warmup/timed iter via a tiny device memcpy (kept off the critical path
-  // by reloading from lsrc which is untouched).  We just reduce lsrc copied into acc.
-  auto reseed = [&](){ CK(cudaMemcpyAsync(acc, lsrc, sizeof(float)*AR_N, cudaMemcpyDeviceToDevice, s)); };
+  // NOTE on methodology: latency is the cost of put+barrier, which is INDEPENDENT of the buffer
+  // contents, so we do NOT reseed inside the timed loop (a per-iter 16 KB D2D memcpy would add its
+  // own launch/copy latency and make the three collectives non-comparable). After the first iter
+  // `acc` holds a running (numerically meaningless) sum — irrelevant to the barrier-bound timing,
+  // and correctness was already proven above on real data.
 
   // ---- (a) recursive-doubling all-reduce latency ----
-  for (int it = 0; it < warmup; ++it) { reseed(); ar_recdouble_block<<<1, block, 0, s>>>(acc, recv, AR_N); }
+  launch_ar_recd(acc, recv);   // re-seed once from the proven run is unnecessary for timing.
+  for (int it = 0; it < warmup; ++it) launch_ar_recd(acc, recv);
   CK(cudaStreamSynchronize(s)); nvshmem_barrier_all();
   CK(cudaEventRecord(e0, s));
-  for (int it = 0; it < iters; ++it) { reseed(); ar_recdouble_block<<<1, block, 0, s>>>(acc, recv, AR_N); }
+  for (int it = 0; it < iters; ++it) launch_ar_recd(acc, recv);
   CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1));
   { float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); us_recd = ms * 1e3f / iters; }
   nvshmem_barrier_all();
 
   // ---- (b) NVSHMEM library all-reduce latency ----
-  for (int it = 0; it < warmup; ++it) ar_nvshmem_block<<<1, block, 0, s>>>(ldst, lsrc, AR_N);
+  for (int it = 0; it < warmup; ++it) launch_ar_lib(ldst, lsrc);
   CK(cudaStreamSynchronize(s)); nvshmem_barrier_all();
   CK(cudaEventRecord(e0, s));
-  for (int it = 0; it < iters; ++it) ar_nvshmem_block<<<1, block, 0, s>>>(ldst, lsrc, AR_N);
+  for (int it = 0; it < iters; ++it) launch_ar_lib(ldst, lsrc);
   CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1));
   { float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); us_lib = ms * 1e3f / iters; }
   nvshmem_barrier_all();
 
   // ---- (c) all-to-all latency ----
-  for (int it = 0; it < warmup; ++it) a2a_put_block<<<1, block, 0, s>>>(a2s, a2r, A2A_CHUNK);
+  for (int it = 0; it < warmup; ++it) launch_a2a(a2s, a2r);
   CK(cudaStreamSynchronize(s)); nvshmem_barrier_all();
   CK(cudaEventRecord(e0, s));
-  for (int it = 0; it < iters; ++it) a2a_put_block<<<1, block, 0, s>>>(a2s, a2r, A2A_CHUNK);
+  for (int it = 0; it < iters; ++it) launch_a2a(a2s, a2r);
   CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1));
   { float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); us_a2a = ms * 1e3f / iters; }
   nvshmem_barrier_all();

@@ -292,12 +292,14 @@ extern "C" __global__ void k1k2_epilogue(
 // =================================================================================================
 // K2 — single-launch cooperative flash-decode (partial + reduce fused).
 //
-// The bench-measured K2 is overhead/latency bound (tiny ~4 MB KV read). Two costs dominate: the two
-// separate kernel launches + the HBM round-trip of the partial (m,l,acc) buffers between them. We
-// kill both by computing the partials, doing ONE grid.sync(), then having one warp per q_head merge
-// the partials straight out of a grid-resident scratch — no second launch, no extra DtoH/HtoD of the
-// big part_acc, no relaunch latency. The KV stream itself uses the k2 coalesced fp8 idiom with 2x
-// time unrolling so each warp keeps two independent K (and V) loads in flight (shorter dep chains).
+// The bench-measured K2 is overhead/latency bound (tiny ~4 MB KV read). The dominant avoidable cost is
+// the SECOND kernel LAUNCH + relaunch latency of the separate reduce pass. We kill it by computing the
+// partials, doing ONE grid.sync(), then having one warp per q_head merge the partials straight out of
+// grid-resident scratch — no second launch, no relaunch latency. (The partials (m,l,acc) still live in
+// device global memory and are written then read back, exactly as in the two-kernel path; they are
+// tiny so they stay L2-resident — we do NOT eliminate that round-trip, only the extra launch.) The KV
+// stream uses the k2 coalesced fp8 idiom with 2x time unrolling so each warp keeps two independent K
+// (and V) loads in flight (shorter dependent online-softmax chain).
 //
 // Grid is launched cooperatively: grid.x = n_splits, grid.y groups q_heads (4 warps/CTA). The merge
 // step is done by the first n_splits-independent set of warps (split 0 CTAs), one warp per q_head.
@@ -684,12 +686,13 @@ int main(int argc, char** argv) {
   int Sused = k2v2_launch_coop(d_q2,d_KC,d_VC,d_kks,d_kvs,ctx_len,d_pm,d_pl,d_pacc,d_attn,n_splits);
   CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
   bool coop_ok = (Sused > 0);
-  std::vector<float> attn(Q_DIM); CK(cudaMemcpy(attn.data(),d_attn,Q_DIM*4,cudaMemcpyDeviceToHost));
-  double e_at=0; for (int i=0;i<Q_DIM;i++) e_at=std::max(e_at,(double)std::fabs(attn[i]-out_ref[i]));
-  if (coop_ok)
+  if (coop_ok) {
+    // Only read/compare d_attn when the cooperative kernel actually ran and wrote it.
+    std::vector<float> attn(Q_DIM); CK(cudaMemcpy(attn.data(),d_attn,Q_DIM*4,cudaMemcpyDeviceToHost));
+    double e_at=0; for (int i=0;i<Q_DIM;i++) e_at=std::max(e_at,(double)std::fabs(attn[i]-out_ref[i]));
     printf("K2  max-abs-err:  attn_out=%.3e  (coop splits=%d) -> %s (<1e-2)\n",
            e_at, Sused, (e_at<1e-2?"PASS":"FAIL"));
-  else
+  } else
     printf("K2  cooperative launch did not fit on this GPU (grid too large for resident-all);\n"
            "    caller should fall back to the two-kernel path. (no coop timing below)\n");
 
@@ -706,7 +709,10 @@ int main(int argc, char** argv) {
   K1Plan KP = k1k2_plan();
   printf("\nK1 (QKV GEMV)  Wqkv read %.1f MB   block=%d CTAs=%d smem=%.1fKB\n",
          k1_bytes/1e6, KP.block, KP.ctas, KP.smem/1024.0);
-  printf("  %.2f us/token   %.0f GB/s   %.1f%% MBU   -> %s (target >45%%)\n",
+  // METRIC: weight-movement MBU = Wqkv bytes / time / HBM peak. Apples-to-apples with the 904 GB/s
+  // baseline (which also counted only the weight read); it excludes the small activation reads
+  // (h + w_in_norm, ~2x16KB/CTA) and the proj write, so true HBM utilization is slightly higher.
+  printf("  %.2f us/token   %.0f GB/s   %.1f%% weight-movement MBU   -> %s (target >45%%)\n",
          ms1*1e3, k1_gbps, 100.0*k1_gbps/PEAK, (100.0*k1_gbps/PEAK>=45.0?"HIT":"below"));
 
   // K2 (cooperative single-launch), only if it fit

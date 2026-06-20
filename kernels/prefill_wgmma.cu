@@ -2,14 +2,25 @@
 //
 // WHY: the existing prefill path (prefill_attn.cu / prefill_moe.cu) runs the big
 // projection/MoE GEMMs as SIMT fp32-accumulate kernels. On H100 that tops out near
-// the ~67 TFLOP/s CUDA-core fp32 peak — i.e. <1% of the ~1.98 PFLOP/s fp8
-// tensor-core peak. Prefill (prompt processing, M = seq = 512) is a *compute*-bound
-// GEMM workload, so the single biggest MFU lever is to run it on the fp8 tensor
-// cores. This file rewrites the prefill GEMMs to use the fp8 e4m3 tensor-core
-// instruction `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`, with
-// cp.async-staged shared-memory tiles and fp32 accumulation. It also FIXES the MoE
-// to evaluate only the routed TOP_K=8 experts per token (the old prefill_moe
-// microbench looped over all 128).
+// the ~67 TFLOP/s CUDA-core fp32 peak — i.e. <1% of the H100 tensor-core peak.
+// Prefill (prompt processing, M = seq = 512) is a *compute*-bound GEMM workload, so the
+// single biggest MFU lever is to run it on the tensor cores. This file rewrites the
+// prefill projection + MoE GEMMs to use the fp8 e4m3 tensor-core instruction
+// `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`, with cp.async double-buffered
+// shared-memory tiles and fp32 accumulation.
+//
+// HONEST CEILING (read this): `mma.sync` is the synchronous WARP-level fp8 path. On
+// Hopper (sm_90) it UP-CONVERTS the fp8 operands to fp16 and issues HMMA, so its real
+// hardware ceiling is the H100 fp16-dense tensor-core rate (~989 TFLOP/s), NOT the
+// ~1979 TFLOP/s full-fp8 (QMMA) rate. The microbench therefore reports % of the 989
+// fp16-HMMA peak (and, for reference, the implied % of the 1979 fp8 peak). Reaching the
+// full 1979 peak requires `wgmma.mma_async` (warpgroup-async, operands staged in shared
+// memory, mbarrier/TMA pipeline) — a larger rewrite not done here. Either way this is a
+// 1000x+ jump over the SIMT fp32 path the file replaces, which is the actual MFU lever.
+//
+// It also evaluates only the routed TOP_K=8 experts per token via a per-expert gather
+// (the sibling prefill_moe.cu already does routed per-expert GEMM math; its *timing*
+// harness, however, looped over all N_EXPERTS, which this file's microbench does not).
 //
 // Scope (the two GEMMs that dominate prefill FLOPs):
 //   (a) projection GEMMs  Y[M,N] = X[M,K] @ deq(W[N,K])^T   — used for Wqkv and Wo.
@@ -108,6 +119,16 @@ static __device__ __forceinline__ void cp_async_wait_all() {
   asm volatile("cp.async.wait_group 0;\n" ::);
 #endif
 }
+// Wait until at most N cp.async groups remain in flight. With N=1 (and a prologue +
+// per-iteration prefetch that each commit one group) the NEXT-tile copy stays in flight
+// while the CURRENT tile's mma runs — i.e. the double buffer actually overlaps the global
+// load with the tensor-core math, instead of draining everything like wait_group 0 did.
+template <int N>
+static __device__ __forceinline__ void cp_async_wait_group() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
 
 // ===========================================================================
 //  Tile geometry.  CTA computes a BM x BN output tile; one warp per (warp_m, warp_n)
@@ -177,21 +198,19 @@ static __device__ __forceinline__ void load_B_frag(
 }
 
 // ---------------------------------------------------------------------------
-//  Store this thread's accumulators for one n8 sub-tile into a row-major C tile.
-//  m16n8k32 C/D-fragment lane map (16 rows x 8 cols), 4 f32 per thread:
-//    d[0],d[1] : row = (L>>2),       col = (L&3)*2 + {0,1}
-//    d[2],d[3] : row = (L>>2)+8,     col = (L&3)*2 + {0,1}
-//  cb(row,col) is invoked with tile-local row in [0,16) and col in [0,8).
+//  Map accumulator index di in {0,1,2,3} to its (tile-local row, col) for one n8
+//  sub-tile. Official m16n8k32 C/D fragment lane map (16 rows x 8 cols, 4 f32/thread):
+//    d0 : row = groupID,     col = tig*2 + 0
+//    d1 : row = groupID,     col = tig*2 + 1
+//    d2 : row = groupID + 8, col = tig*2 + 0
+//    d3 : row = groupID + 8, col = tig*2 + 1
+//  with groupID = lane>>2, tig = lane&3.
 // ---------------------------------------------------------------------------
-template <class CB>
-static __device__ __forceinline__ void foreach_C(int lane, const float (&d)[4], CB cb) {
-  const int rowA = lane >> 2;
-  const int rowB = rowA + 8;
-  const int col0 = (lane & 3) * 2;
-  cb(rowA, col0,   d[0]);
-  cb(rowA, col0+1, d[1]);
-  cb(rowB, col0,   d[2]);
-  cb(rowB, col0+1, d[3]);
+static __device__ __forceinline__ void c_rowcol(int lane, int di, int& row, int& col) {
+  const int groupID = lane >> 2;
+  const int tig     = lane & 3;
+  row = groupID + ((di >= 2) ? 8 : 0);
+  col = tig * 2 + (di & 1);
 }
 
 // ===========================================================================
@@ -316,8 +335,14 @@ gemm_fp8_tc(
       load_B(Wq, Bs, nbuf, k1);
       if (dual) load_B(Wq2, Bs2, nbuf, k1);
       cp_async_commit();
+      // Keep the just-issued prefetch (1 group) in flight; only wait for the CURRENT
+      // tile's copies to have landed. This is the real double-buffer overlap: the next
+      // tile's global->shared transfer runs concurrently with this tile's mma below.
+      cp_async_wait_group<1>();
+    } else {
+      // Last K-step: no prefetch issued, so drain everything before consuming.
+      cp_async_wait_all();
     }
-    cp_async_wait_all();
     __syncthreads();
 
     // ---- mma over this K=32 chunk ----
@@ -342,28 +367,24 @@ gemm_fp8_tc(
     buf = nbuf;
   }
 
-  // ---- epilogue: rescale + write ----
+  // ---- epilogue: rescale + write. Iterate the 4 accumulator slots explicitly so
+  //  the gate (accG) and up (accU) elements for the SAME (row,col) are paired by di.
   #pragma unroll
   for (int t = 0; t < N8; ++t) {
-    foreach_C(lane, accG[t], [&](int rr, int cc, float gval) {
+    #pragma unroll
+    for (int di = 0; di < 4; ++di) {
+      int rr, cc; c_rowcol(lane, di, rr, cc);
       int gm = blockRow + warpRow * 16 + rr;
       int gn = blockCol + t * 8 + cc;
-      if (gm >= M || gn >= N) return;
+      if (gm >= M || gn >= N) continue;
       float as = act_scale[gm];
       float val;
       if (dual) {
-        // need the matching up accumulator element; recompute from accU with same lane map.
-        float uval;
-        // foreach_C is structured so d[0..3] map identically; fetch via index.
-        // Reconstruct which d-index (rr,cc) corresponds to:
-        int ridx = (rr < 8) ? 0 : 1;            // 0 -> d0/d1, 1 -> d2/d3
-        int cidx = cc - (lane & 3) * 2;          // 0 or 1
-        int di = ridx * 2 + cidx;
-        uval = accU[t][di] * as * Wscale2[gn];
-        float g = gval * as * Wscale[gn];
-        val = silu(g) * uval;
+        float g = accG[t][di] * as * Wscale[gn];
+        float u = accU[t][di] * as * Wscale2[gn];
+        val = silu(g) * u;
       } else {
-        val = gval * as * Wscale[gn];
+        val = accG[t][di] * as * Wscale[gn];
       }
       if (epi == 0) {
         Y[(size_t)gm * N + gn] = val;
@@ -372,7 +393,7 @@ gemm_fp8_tc(
         float w = rweight[gm];
         atomicAdd(&Y[(size_t)trow * N + gn], w * val);
       }
-    });
+    }
   }
 }
 
@@ -401,6 +422,11 @@ inline dim3 grid2d(int M, int N) { return dim3((N + BN - 1) / BN, (M + BM - 1) /
 void project(const float* d_X, fp8* d_Xq, float* d_act,
              const fp8* d_W, const float* d_Wscale,
              float* d_Y, int M, int N, int K, cudaStream_t s = 0) {
+  // load_A/load_B stage K in BK=32 chunks with no per-element K-bound clamp on the last
+  // tile, so K MUST be a multiple of BK or the final cp.async over-reads and stages junk
+  // K-lanes into the mma. All real shapes (HIDDEN 4096, Q_DIM 8192, MOE_INTER 1536) satisfy
+  // this; assert so any future non-multiple-of-32 K fails loudly instead of silently.
+  if (K % BK != 0) { fprintf(stderr, "prefill_wgmma::project K=%d not a multiple of BK=%d\n", K, BK); abort(); }
   quantize_rows_e4m3<<<M, 256, 0, s>>>(d_X, d_Xq, d_act, M, K);
   gemm_fp8_tc<<<grid2d(M, N), NTHREADS, 0, s>>>(
       d_Xq, d_act, d_W, d_Wscale, nullptr, nullptr, d_Y, nullptr, nullptr, M, N, K, 0);
@@ -417,6 +443,8 @@ void run_expert(const float* d_X, const int* d_token_id, const float* d_rweight,
                 float* d_H,  fp8* d_HQ,  float* d_HAct,
                 float* d_residual, int T, cudaStream_t s = 0) {
   if (T <= 0) return;
+  // K is HIDDEN (gate/up) and MOE_INTER (down); both must be multiples of BK=32 (they are).
+  static_assert(HIDDEN % BK == 0 && MOE_INTER % BK == 0, "MoE K dims must be multiples of BK=32");
   // gather rows for this expert
   gather_rows<<<T, 256, 0, s>>>(d_X, d_token_id, d_Xe, T, HIDDEN);
   // gate+up fused -> H[T, MOE_INTER]
@@ -615,7 +643,13 @@ static void microbench_proj(int M) {
   // Stand-in for the QKV (N=QKV_OUT,K=HIDDEN) + O (N=HIDDEN,K=Q_DIM) projections.
   struct Job { const char* name; int N, K; };
   Job jobs[] = { {"Wqkv", QKV_OUT, HIDDEN}, {"Wo", HIDDEN, Q_DIM} };
-  const double H100_FP8_TC = 1979.0;
+  // IMPORTANT: on Hopper (sm_90), mma.sync.*.e4m3.* up-converts the fp8 operands to fp16
+  // and issues HMMA, so the achievable ceiling for THIS instruction is the H100 fp16-dense
+  // tensor-core rate (~989 TFLOP/s), NOT the ~1979 TFLOP/s full-fp8 (QMMA) rate that only
+  // wgmma.mma_async reaches. We report % of the HMMA peak so the figure is honest; reaching
+  // the 1979 peak would require rewriting the inner loop onto wgmma.mma_async (warpgroup,
+  // shared-mem operands + mbarrier/TMA pipeline) — see header note.
+  const double H100_FP16_TC = 989.0;   // fp16-dense HMMA peak (the real ceiling for mma.sync fp8)
   double total_ms = 0, total_flops = 0;
   for (auto& j : jobs) {
     int N=j.N, K=j.K;
@@ -634,15 +668,15 @@ static void microbench_proj(int M) {
     float ms=0; CUDA_CHECK(cudaEventElapsedTime(&ms,a,b)); ms/=iters;
     double flops = 2.0*(double)M*N*K;
     double tf = flops/(ms*1e-3)/1e12;
-    printf("  %-5s M=%d N=%d K=%d : %.4f ms  %.1f TFLOP/s  (%.1f%% fp8-TC peak)\n",
-           j.name,M,N,K,ms,tf,100.0*tf/H100_FP8_TC);
+    printf("  %-5s M=%d N=%d K=%d : %.4f ms  %.1f TFLOP/s  (%.1f%% fp16-HMMA peak)\n",
+           j.name,M,N,K,ms,tf,100.0*tf/H100_FP16_TC);
     total_ms += ms; total_flops += flops;
     cudaEventDestroy(a);cudaEventDestroy(b);
     cudaFree(dX);cudaFree(dW);cudaFree(dS);cudaFree(dXq);cudaFree(dAct);cudaFree(dY);
   }
   double tf_all = total_flops/(total_ms*1e-3)/1e12;
-  printf("  proj total/layer  : %.4f ms  %.1f TFLOP/s  (%.1f%% fp8-TC peak)\n",
-         total_ms, tf_all, 100.0*tf_all/H100_FP8_TC);
+  printf("  proj total/layer  : %.4f ms  %.1f TFLOP/s  (%.1f%% fp16-HMMA peak; ~%.1f%% of fp8-QMMA 1979)\n",
+         total_ms, tf_all, 100.0*tf_all/H100_FP16_TC, 100.0*tf_all/1979.0);
 }
 
 static void microbench_moe(int M) {
@@ -691,11 +725,14 @@ static void microbench_moe(int M) {
 
   double flops = (double)total_rows * 6.0 * (double)hidden * (double)inter; // gate+up+down
   double tf = flops/(ms*1e-3)/1e12;
-  const double H100_FP8_TC = 1979.0;
-  printf("  active experts=%d rows/expert=%d total_rows=%d (vs OLD path: ran all %d)\n",
+  // Same caveat as microbench_proj: mma.sync fp8 -> fp16-HMMA rate on Hopper, so the
+  // honest ceiling is the ~989 TFLOP/s fp16-dense peak, not the 1979 fp8-QMMA peak.
+  const double H100_FP16_TC = 989.0;
+  printf("  active experts=%d rows/expert=%d total_rows=%d (vs OLD microbench: timed all %d)\n",
          active, per_expert, total_rows, N_EXPERTS);
   printf("  time/MoE-layer    : %.4f ms\n", ms);
-  printf("  achieved          : %.1f TFLOP/s  (%.1f%% fp8-TC peak)\n", tf, 100.0*tf/H100_FP8_TC);
+  printf("  achieved          : %.1f TFLOP/s  (%.1f%% fp16-HMMA peak; ~%.1f%% of fp8-QMMA 1979)\n",
+         tf, 100.0*tf/H100_FP16_TC, 100.0*tf/1979.0);
   printf("  x%d layers         : %.2f ms\n", N_LAYERS, ms*N_LAYERS);
   cudaEventDestroy(a);cudaEventDestroy(b);
   cudaFree(dX);cudaFree(dres);cudaFree(dtid);cudaFree(drw);

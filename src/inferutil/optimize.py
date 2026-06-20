@@ -280,6 +280,53 @@ def plain_decode_ceiling() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Sensitivity: under WHICH (overhead residual, comms-overlap) does plain decode
+# reach 1000? This is the crux the loop exposed — solve for the boundary instead
+# of asserting it. Plain decode (fp8 weight 0.78, kv 0.05) reaches 1000 iff:
+#   overhead_residual + (1 - overlap_frac)*comms_nvls + 0.78 + 0.05 <= 1.00 ms
+# where comms_nvls = 188 * 3.84 µs = 0.72 ms (NVLS-fast, before overlap credit).
+# ---------------------------------------------------------------------------
+COMMS_NVLS_MS = N_COLLECTIVES * 3.84e-3   # 0.722 ms — NVLS-fast, not yet overlapped
+FP8_WEIGHT_MS = 0.78
+KV_SHORT_MS = 0.05
+
+
+def plain_tok_s(overhead_ms: float, overlap_frac: float,
+                weight_ms: float = FP8_WEIGHT_MS) -> float:
+    comms = (1.0 - max(0.0, min(1.0, overlap_frac))) * COMMS_NVLS_MS
+    return TPOT(overhead_ms=overhead_ms, comms_ms=comms,
+                weight_ms=weight_ms, kv_ms=KV_SHORT_MS).tok_s
+
+
+def min_overlap_for_1000(overhead_ms: float, target: float = 1000.0) -> Optional[float]:
+    """Minimum comms-overlap fraction that lets PLAIN decode hit `target` at a
+    given megakernel overhead residual. None if unreachable even at full overlap."""
+    budget = 1000.0 / target            # total TPOT budget in ms (1.0 ms for 1000)
+    slack = budget - overhead_ms - weight_ms_floor() - KV_SHORT_MS
+    if slack >= COMMS_NVLS_MS:
+        return 0.0                      # reaches target with no overlap at all
+    if slack < 0:
+        return None                     # overhead+weight already blow the budget
+    return 1.0 - slack / COMMS_NVLS_MS   # need to hide this fraction of comms
+
+
+def weight_ms_floor() -> float:
+    return FP8_WEIGHT_MS
+
+
+def sensitivity_grid(overheads=(0.0, 0.25, 0.50, 0.75),
+                     overlaps=(0.0, 0.5, 0.76, 1.0)) -> List[dict]:
+    """Plain-decode tok/s across the two uncertain knobs, with a 1000 flag."""
+    grid = []
+    for oh in overheads:
+        row = {"overhead_ms": oh, "min_overlap_for_1000": min_overlap_for_1000(oh)}
+        for ov in overlaps:
+            row[f"ov{ov}"] = plain_tok_s(oh, ov)
+        grid.append(row)
+    return grid
+
+
+# ---------------------------------------------------------------------------
 # CLI / report
 # ---------------------------------------------------------------------------
 def _fmt_tpot(t: TPOT) -> str:
@@ -336,6 +383,25 @@ def report() -> str:
     P("      NOTE: this exposes a real tension between two team docs (path-to-1000's 865")
     P("      ceiling assumes comms is NOT overlapped; comms-breakthrough says it is). The")
     P("      single measurement that resolves it: e2e TPOT with deferred-overlap in k6.")
+    P("")
+    P("-" * 84)
+    P("SENSITIVITY  (plain-decode tok/s vs the 2 uncertain knobs; * = clears 1000):")
+    P("-" * 84)
+    P("  rows = megakernel overhead residual (ms); cols = comms-overlap fraction hidden")
+    P(f"  {'overhead':>10s} | {'0% hidden':>10s} {'50%':>8s} {'76%':>8s} {'100%':>8s} | min-overlap→1000")
+    for r in sensitivity_grid():
+        cells = []
+        for ov in (0.0, 0.5, 0.76, 1.0):
+            v = r[f"ov{ov}"]
+            cells.append(f"{v:6.0f}{'*' if v >= 1000 else ' '}")
+        need = r["min_overlap_for_1000"]
+        need_s = "unreachable" if need is None else f"{need*100:.0f}% hidden"
+        P(f"  {r['overhead_ms']:8.2f}ms | {cells[0]:>10s} {cells[1]:>8s} {cells[2]:>8s} "
+          f"{cells[3]:>8s} | {need_s}")
+    P("  READ: plain decode reaches 1000 ONLY in the top-right corner — overhead≈0 AND")
+    P("  ≥76% of comms hidden. At any realistic overhead residual (≥0.25 ms) plain decode")
+    P("  CANNOT reach 1000 even with perfectly-hidden comms. That corner is two unmeasured")
+    P("  kernel bets stacked; spec (below) clears 1000 without either bet.")
     P("")
     P("-" * 84)
     P("SPEC DECODE  (the ROBUST path; docs/why-spec-wins.md, spec-decode-floor-bound.md):")

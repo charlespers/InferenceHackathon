@@ -3,7 +3,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from inferutil.optimize import (
     TPOT, MEASURED_BASELINE, MEASURED_BASELINE_TOK_S, corroborate_weight,
-    optimize, apply_spec, plain_decode_ceiling, report, LEVERS)
+    optimize, apply_spec, plain_decode_ceiling, report, LEVERS,
+    plain_tok_s, min_overlap_for_1000, sensitivity_grid)
 
 
 def test_baseline_reproduces_measured_tok_s():
@@ -76,6 +77,29 @@ def test_every_lever_has_status_and_source():
         assert lv.status in ("MEASURED", "PREDICTED", "MISSING")
         assert lv.source, f"{lv.name} missing a doc citation"
         assert lv.targets in ("overhead", "comms", "weight", "kv")
+
+
+def test_sensitivity_plain_1000_needs_zero_overhead_and_high_overlap():
+    # plain decode reaches 1000 ONLY at overhead~0 AND comms mostly hidden
+    assert plain_tok_s(0.0, 1.0) >= 1000.0          # top-right corner clears it
+    assert plain_tok_s(0.0, 0.5) < 1000.0           # half-hidden at zero overhead: no
+    assert plain_tok_s(0.25, 1.0) < 1000.0          # realistic overhead, perfect overlap: no
+    # boundary: at zero overhead the required overlap is ~76%
+    need = min_overlap_for_1000(0.0)
+    assert need is not None and 0.70 < need < 0.82
+    # at any realistic overhead residual, 1000 is unreachable even at full overlap
+    assert min_overlap_for_1000(0.25) is None
+    assert min_overlap_for_1000(0.50) is None
+
+
+def test_sensitivity_grid_monotone():
+    grid = sensitivity_grid()
+    # tok/s rises with more overlap (within a row) and falls with more overhead
+    for r in grid:
+        vals = [r["ov0.0"], r["ov0.5"], r["ov0.76"], r["ov1.0"]]
+        assert vals == sorted(vals)
+    col = [r["ov1.0"] for r in grid]
+    assert col == sorted(col, reverse=True)         # more overhead -> fewer tok/s
 
 
 def test_report_renders():

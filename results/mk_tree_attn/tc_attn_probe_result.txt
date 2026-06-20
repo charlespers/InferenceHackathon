@@ -62,3 +62,13 @@ ctx=8192:  M=1 128.24us M=8 140.24(1.09x)  M=16 157.31(1.23x)   correctness rel=
    far flatter than warp-shuffle. NEXT (engine): swap fp16->fp8 KV (dequant-on-load, M-independent), tree
    mask (ancestor set per node, from spec_accept_tree.h) for tree drafting, per-node RoPE. M=1 plain decode
    keeps the warp-shuffle k2 (TC underfills there). Hand to Charles as the verify-attn recipe/kernel.
+
+=== TREE-MASKED verify attention (tc_verify_tree.cu/tcvt) — VALIDATED + FLAT (the tree-spec lever) ===
+Each draft node attends [context] U [ancestor draft nodes] (parent[] walk; balanced binary tree). Validated
+vs CPU fp32 ancestor-masked attention. EVEN FLATTER than chain (tree depth log2(M)~4 < chain depth 16):
+ctx=4096:  M=1 75.04us  M=8 76.22 (1.02x)  M=16 81.55 (1.09x)   rel=0.42% PASS
+ctx=8192:  M=1 127.80us M=8 133.86(1.05x)  M=16 144.43(1.13x)   rel=0.46% PASS
+=> Wide trees are ~FREE on attention (1.09x@16 nodes) -> push tau via tree WIDTH on a flat verify. Connects
+   tree.rs (lossless tree accept) + build_from_source (head->tree) + this flat tree-masked TC verify attn =
+   the complete tree-spec path with a flat verify. NEXT (engine drop-in): fp8 KV (dequant-on-load) + per-node
+   RoPE pos_id (from tree_attn.h) + wire into Charles's decode loop; M=1 plain decode keeps warp-shuffle k2.

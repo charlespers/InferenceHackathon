@@ -1,48 +1,45 @@
-# charles-work — B=1 latency hypertuning for Qwen3-235B-A22B (8×H100)
+# charles-work — B=1 latency for Qwen3-235B-A22B (8×H100) · coordination branch
 
-A session's work on **maximizing single-user (batch-1) tok/s** for Qwen3-235B-A22B: first-principles
-research → an implementation spec → **measured kernel hypertuning on the real H100** → engine validation.
-Hardware confirmed on-box: **8×H100 80GB HBM3 (~3.35 TB/s)** (an earlier "H200" was not this box).
+Async channel between the **planning agent** (no GPU) and the **GPU agent** (15-min slot, Charles :30–:45).
+Goal: maximize single-user (batch-1) decode tok/s. **Start here, then open `gpu-agent-experiments.md`.**
 
-## The one idea
-B=1 decode is **memory-bandwidth bound** (GEMV, arithmetic intensity ≈1; tensor cores ~99% idle).
-`TPOT = bytes-moved-per-token / usable-HBM-BW + exposed latency`. Everything here is "move fewer bytes,
-expose less latency, accept more tokens per memory pass." Throughput tricks (continuous batching, paged
-KV, big-GEMM tiling) are neutral-to-harmful at B=1.
+## The one number that decides everything → run **E0 first**
+B=1 decode is bandwidth-bound, but is it **weight**-bound or **comms**-bound? The team's model assumes
+`collective_latency_s=5µs` → comms 0.94 ms dominates; my estimate (~1.5µs tuned) → weight dominates.
+**`nccl-tests` measures the real all-reduce latency in seconds, no model load** (E0). It decides whether
+the #1 lever is route-prefetch/spec (comms-bound) or int4/kernels (weight-bound). Everything keys off it.
 
-## Deliverables (in this branch)
+## Measured / validated (real, on-box where noted)
+- **K5 MoE-expert kernel: scalar → e=0.46 (1538 GB/s), ~100×, correctness-clean** (max_rel 3.2e-5), on H100.
+  A/B split: gate/up 0.49, down 0.405 (the weak link).
+- **EP→TP inversion, triple-confirmed:** my spec + my measured kernel + the team's own `latency.py` model.
+  Their model at my e=0.46: **TP8 261 vs EP8 94 tok/s** (2.8×).
+- **vLLM `192%128` TP8-FP8 crash reproduced live** — exactly as the spec predicted; fix = `--enable-expert-parallel`.
 
-| Artifact | What |
+## Doc map
+| Doc | What |
 |---|---|
-| `docs/b1-latency-architecture.md` | 15 B=1-latency avenues, each adversarially verified vs the roofline. Two playbook-inverting findings: **EP→TP8** (EP is busiest-rank bound at B=1) and **quantize the *big* thing hardest** (routed experts = most bandwidth, least sensitive). |
-| `docs/b1-tp8-moe-rearchitecture-h200.md` | Implementation spec for the TP8 column-sharded MoE. (Filename says h200; numbers scale ÷1.433 to this H100; break-evens/contexts unchanged.) **Predicted the exact vLLM launch crash we then hit.** |
-| `kernels/k5_experts_warp.cu` | The **measured-best K5 MoE-expert kernel** — warp-per-row + split-K (coalesced) + fp8x2→half2 dequant + full occupancy. |
-| `kernels/k5_experts_tuned.cu` | Intermediate fused single-kernel variant (128-bit loads + smem-y + hoisted scale), 8.5×. |
-| `kernels/k5_microbench.cu` | Reproducible correctness + HBM-bandwidth harness (reference vs winner, A/B split). |
-| `docs/k5-kernel-results-h100.md` | The measured optimization journey + remaining headroom. |
+| `gpu-agent-experiments.md` | **The work order** — E0–E8, exact commands, go/no-go signals, Results Log |
+| `team-coordination.md` | How this fits `origin/main` (Rust engine + bench); cross-validation; comms reconciliation |
+| `next-levers-research.md` | Prioritized, vetted levers (engine baseline → n-gram spec → int4 → down-proj) |
+| `spec-decode-moe-tax.md` | Why their `SpecConfig draft_len=8` loses on the MoE; use k≈2–3 (for `engine/spec/`) |
+| `b1-latency-architecture.md` | The 15-avenue first-principles research (H100 canonical) |
+| `b1-tp8-moe-rearchitecture-h200.md` | The TP8 MoE re-architecture spec (numbers ÷1.433 for this H100) |
+| `k5-kernel-results-h100.md` | The measured kernel optimization journey |
 
-## Headline measured result (real H100, K5 = the ~14.2B/token bottleneck)
+## Kernel files (`kernels/`)
+- `k5_experts.cu` (reference) · `k5_experts_warp.cu` (**measured winner**) · `k5_microbench.cu` (repro)
+- `k5_experts_warp2.cu` + `k5_downproj_bench.cu` (down-proj occupancy fix, for E4)
+- `k5_experts_int4.cu` + `k5_int4_bench.cu` (int4 byte lever — does the unpack eat the 2×? → E4)
+- `tools/verify_route_prediction.py` (validates the team's `predictor.rs` on a real MoE → E8)
 
-| K5 version | e (frac of 3.35 TB/s) | GB/s | vs scalar |
-|---|---|---|---|
-| scalar skeleton (`k5_experts.cu`) | 0.005 | 15 | 1× |
-| +128-bit loads, smem-y, hoisted scale | 0.039 | 131 | 8.5× |
-| +tile across CTAs (fill 132 SMs) | 0.257 | 862 | 56× |
-| +warp-per-row, split-K (coalesced) | 0.431 | 1444 | 94× |
-| +fp8x2→half2 dequant, full occupancy | **0.459** | **1538** | **~100×** |
+## Experiment queue (priority; see `gpu-agent-experiments.md` for commands)
+**E0** collective latency (cheapest, decides strategy) → **E1** FP8+EP engine baseline → **E4** kernel
+microbenches + Nsight (no model load) → **E6** n-gram spec (k=2–3) → **E2** EP-vs-TP → **E7** int4 engine →
+**E8** route-prediction → **E3** CUDA-graph. The 15-min slot affords ~1 vLLM load; do kernel/model work off-GPU.
 
-Correctness clean throughout (max relative error **3.2e-5** vs the scalar reference). Each step chosen by
-*measuring* where the previous was bound: load-width → SM occupancy → memory coalescing → dequant.
-Reproduce: `nvcc -arch=sm_90a -O3 --use_fast_math kernels/k5_microbench.cu -I kernels -o k5bench && ./k5bench 264 1024 3350`.
-
-## Engine validation (the spec paid off)
-The FP8 vLLM launch (`--tensor-parallel-size 8`) crashed with exactly the spec's §6.1 prediction:
-`ValueError: output_size of gate's and up's weight = 192 is not divisible by block_n = 128` — i.e.
-`MOE_INTER 1536 / TP8 = 192`, `192 % 128 ≠ 0`. **Fix = expert-parallel** (keep experts whole) or TP4×EP2
-(384, divisible) or BF16. End-to-end benchmark (`bench/measure.py` → `bench/roofline.py`) is validated
-against the mock and ready; running it against the real engine is pending GPU availability.
-
-## Open / next
-- **Run the engine vs the benchmark** for real TTFT/TPOT/tok-s (blocked only on GPU availability; harness ready).
-- **K5 headroom**: down-proj kernel (e=0.405, short contraction) → block-level reduce; int4 expert weights (next ~2× byte win); persistent kernel + K6 CUDA-graph capture.
-- **Route prediction**: `routing_stats.json` `markov_matrices` are ideal for speculative expert-prefetch.
+## State
+The strategic landscape is mapped and every lever has an exact experiment + a prediction to confirm/refute.
+**The next real signal is GPU-side: E0 (sub-minute) then E1.** Planning agent reacts to the Results Log:
+designs the targeted kernel fix from Nsight, sizes the spec tree from measured τ, and recomputes the
+cumulative tok/s from the real baseline.

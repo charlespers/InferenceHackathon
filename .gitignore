@@ -17,3 +17,4 @@ ui/vite.config.d.ts
 # benchmark results (noisy/large; keep the dir, drop the runs)
 results/*
 !results/.gitkeep
+target/

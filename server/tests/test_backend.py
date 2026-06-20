@@ -3,25 +3,34 @@ import json
 from server.schemas import ChatRequest, ChatMessage
 from server.topology import build_topology
 from server import backend as backend_mod
-from server.backend import get_backend, MockBackend, VLLMBackend
+from server.backend import get_backend, MockBackend, VLLMBackend, Backend
 
 
 def test_default_is_mock_when_vllm_unhealthy(monkeypatch):
+    # No BACKEND override + no healthy vLLM -> mock (the GPU-free demo path).
     monkeypatch.delenv("BACKEND", raising=False)
     monkeypatch.setattr(backend_mod, "_vllm_healthy", lambda: False)
     assert isinstance(get_backend(), MockBackend)
 
 
 def test_uses_vllm_when_healthy(monkeypatch):
+    # Auto-detect: a healthy vLLM (and no mock override) -> the real proxy backend.
     monkeypatch.delenv("BACKEND", raising=False)
     monkeypatch.setattr(backend_mod, "_vllm_healthy", lambda: True)
     assert isinstance(get_backend(), VLLMBackend)
 
 
 def test_forced_mock_via_env_even_if_vllm_healthy(monkeypatch):
+    # BACKEND=mock forces mock even if a vLLM server is up.
     monkeypatch.setenv("BACKEND", "mock")
     monkeypatch.setattr(backend_mod, "_vllm_healthy", lambda: True)
     assert isinstance(get_backend(), MockBackend)
+
+
+def test_vllm_backend_is_backend():
+    # VLLMBackend proxies to a real vLLM server (no longer NotImplementedError); it's a Backend.
+    assert issubclass(VLLMBackend, Backend)
+    assert callable(VLLMBackend().stream)
 
 
 def test_mock_backend_streams():

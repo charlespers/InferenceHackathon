@@ -23,6 +23,7 @@ from typing import List, Optional
 from ..model import MoEConfig
 from ..hardware import Cluster
 from ..latency import decode_latency
+from ..speculative import SpecConfig, wall_clock_speedup
 from .config import BenchConfig
 
 _EFFORT_RANK = {"S": 0, "M": 1, "L": 2}
@@ -45,21 +46,20 @@ def _tok_s(cfg, cluster, *, plan, dtype_bytes, kv_dtype_bytes, seq_len, tp, ep,
         ideal_routing=ideal_routing).tokens_per_s
 
 
-def _spec_speedup(accept_rate: float, draft_len: int, verify_overhead: float) -> float:
-    """Expected accepted tokens per target step / verify tax.
-
-    E[accepted draft tokens before first reject] = a(1-a^d)/(1-a); plus the 1
-    free token the target always emits. Divide by the verify overhead factor
-    (running the small draft model d times costs a little)."""
-    a = max(0.0, min(0.999, accept_rate))
-    geom = a * (1.0 - a ** draft_len) / (1.0 - a) if a else 0.0
-    t_eff = 1.0 + geom
-    return t_eff / max(1.0, verify_overhead)
+def _spec_speedup(accept_rate: float, draft_len: int, n_drafters: int = 1,
+                  drafter_cost_ratio: float = 0.05) -> float:
+    """Speculative-decode wall-clock speedup via the team's multi-drafter model
+    (`inferutil.speculative.wall_clock_speedup`) — keeps the lever consistent
+    with the spec-decode analysis rather than re-deriving it here."""
+    return wall_clock_speedup(SpecConfig(
+        alpha=max(0.0, min(0.999, accept_rate)), k=draft_len,
+        n_drafters=n_drafters, drafter_cost_ratio=drafter_cost_ratio))
 
 
 def recommend(cfg: MoEConfig, cluster: Cluster, config: BenchConfig, *,
               bottleneck=None, accept_rate: float = 0.7, draft_len: int = 4,
-              verify_overhead: float = 1.15, min_speedup: float = 1.02) -> List[Lever]:
+              n_drafters: int = 1, drafter_cost_ratio: float = 0.05,
+              min_speedup: float = 1.02) -> List[Lever]:
     """Ranked levers for this config. `bottleneck` (optional) annotates the lever
     that directly targets the diagnosed dominant term."""
     base = _tok_s(cfg, cluster, plan=config.plan, dtype_bytes=config.dtype_bytes,
@@ -119,10 +119,11 @@ def recommend(cfg: MoEConfig, cluster: Cluster, config: BenchConfig, *,
             f"tp={config.tp},ep={config.ep} -> tp={best_split[0]},ep={best_split[1]}",
             targets={"weight_bw", "comms"})
 
-    # speculative decode: amortize verify over a draft tree.
-    sp = _spec_speedup(accept_rate, draft_len, verify_overhead)
+    # speculative decode: amortize verify over a draft tree (speculative.py model).
+    sp = _spec_speedup(accept_rate, draft_len, n_drafters, drafter_cost_ratio)
     add("speculative decode", base * sp, "L",
-        f"est. accept~{accept_rate:.2f}, tree={draft_len}, verify x{verify_overhead:.2f}")
+        f"est. accept~{accept_rate:.2f}, k={draft_len}, drafters={n_drafters} "
+        f"(speculative.py)")
 
     levers.sort(key=lambda lv: (-lv.speedup, _EFFORT_RANK.get(lv.effort, 9)))
     return levers

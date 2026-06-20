@@ -52,9 +52,12 @@ def test_bottleneck_annotation_marks_targeting_lever():
 
 
 def test_spec_speedup_monotonic_in_accept_rate():
-    lo = _spec_speedup(0.3, 4, 1.15)
-    hi = _spec_speedup(0.8, 4, 1.15)
+    # delegates to inferutil.speculative.wall_clock_speedup
+    lo = _spec_speedup(0.3, 4)
+    hi = _spec_speedup(0.8, 4)
     assert hi > lo > 1.0
+    # more drafters -> higher speedup at fixed accept rate
+    assert _spec_speedup(0.5, 4, n_drafters=4) > _spec_speedup(0.5, 4, n_drafters=1)
 
 
 if __name__ == "__main__":

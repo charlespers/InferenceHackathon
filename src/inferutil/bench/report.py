@@ -66,6 +66,13 @@ def _delta(a: float, b: float) -> str:
 def format_compare(a: RunRecord, b: RunRecord) -> str:
     ra, rb = a.result, b.result
     ms = 1e3
+    if ra.n_repeats < 2 or rb.n_repeats < 2:
+        sig = "n/a (need repeats>=2)"
+    elif is_significant(ra.decode_tok_per_s, ra.decode_tok_per_s_std,
+                        rb.decode_tok_per_s, rb.decode_tok_per_s_std):
+        sig = "SIGNIFICANT"
+    else:
+        sig = "within-noise"
     return "\n".join([
         f"== COMPARE: {a.runid} (A) vs {b.runid} (B) ==",
         f"  {'metric':<16}{'A':>12}{'B':>12}{'delta':>12}",
@@ -81,6 +88,5 @@ def format_compare(a: RunRecord, b: RunRecord) -> str:
         f"  {'temp max C':<16}{ra.telemetry.temp_c_max:>12.1f}"
         f"{rb.telemetry.temp_c_max:>12.1f}"
         f"{_delta(ra.telemetry.temp_c_max, rb.telemetry.temp_c_max):>12}",
-        f"  {'decode sig?':<16}"
-        f"{'SIGNIFICANT' if is_significant(ra.decode_tok_per_s, ra.decode_tok_per_s_std, rb.decode_tok_per_s, rb.decode_tok_per_s_std) else 'within-noise':>36}",
+        f"  {'decode sig?':<16}{sig:>36}",
     ])

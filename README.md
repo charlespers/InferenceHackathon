@@ -86,3 +86,12 @@ Each run captures TTFT, decode/prefill tok/s, TPOT p50/p95, derived achieved
 bandwidth (% of peak and % of analytical floor), and NVML device telemetry
 (temps, util, power, energy/token, per-GPU imbalance). Results are JSON under
 `results/<name>/` and diffable run-to-run.
+
+### Agent-loop notes & limitations
+
+- All numbers today run on `MockEngine`; timing-derived metrics are analytical
+  until `ConiferEngine` lands on real hardware.
+- Use `repeats>=5` for the `compare` significance verdict to be meaningful;
+  with `repeats=1` the output reports `n/a (need repeats>=2)`.
+- The quality parity gate (`--min-quality`) is inert on the mock — token ids
+  are synthetic and independent of timing knobs (see `quality.py` docstring).

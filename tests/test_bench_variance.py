@@ -51,6 +51,21 @@ def test_significance_threshold():
     assert is_significant(100.0, 5.0, 105.0, 5.0) is False
 
 
+def test_format_compare_low_repeats_shows_na():
+    from inferutil.bench.metrics import BenchResult, TelemetrySummary
+    from inferutil.bench.config import BenchConfig
+    tele = TelemetrySummary(False, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, ())
+    cfg = BenchConfig(name="t", plan="hybrid", dtype_bytes=2, kv_dtype_bytes=2,
+                      tp=2, ep=8, prompt_tokens=128, decode_tokens=32)
+    res = BenchResult(0.04, 9000.0, 120.0, 0.008, 0.009, 1.0, 32,
+                      45_000_000_000, 5.3e12, 0.31, 540.0, 0.6, tele,
+                      n_repeats=1, decode_tok_per_s_std=0.0)
+    rec_a = RunRecord(runid="a1", config=cfg, env={}, result=res)
+    rec_b = RunRecord(runid="b1", config=cfg, env={}, result=res)
+    out = format_compare(rec_a, rec_b)
+    assert "n/a" in out
+
+
 if __name__ == "__main__":
     for k, v in sorted(globals().items()):
         if k.startswith("test_"):

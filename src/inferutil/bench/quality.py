@@ -4,6 +4,11 @@ Speed wins that silently change the model's output (aggressive quant, bad
 speculative-decode verification) are regressions. This measures token-level
 greedy parity; with the mock it is synthetic, but the moment a real engine
 emits real token ids it becomes a genuine quality gate.
+
+NOTE: On MockEngine the token ids are synthetic and independent of the timing
+knobs, so the parity check is a wiring SCAFFOLD that only becomes a real
+correctness safeguard once ConiferEngine emits real greedy token ids; do not
+trust min_quality as a real quality gate until then.
 """
 from __future__ import annotations
 

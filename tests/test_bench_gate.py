@@ -33,6 +33,16 @@ def test_no_thresholds_passes():
     assert evaluate(_result(), Thresholds()).passed is True
 
 
+def test_quality_none_fails_with_not_measured_message():
+    result_no_quality = BenchResult(0.04, 9000.0, 120.0, 0.008, 0.009, 1.0, 128,
+                                    45_000_000_000, 5.3e12, 0.31, 540.0, 0.6, TELE,
+                                    quality=None)
+    g = evaluate(result_no_quality, Thresholds(min_quality_match=0.99))
+    assert g.passed is False
+    joined = " ".join(g.failures)
+    assert "not measured" in joined
+
+
 if __name__ == "__main__":
     for k, v in sorted(globals().items()):
         if k.startswith("test_"):

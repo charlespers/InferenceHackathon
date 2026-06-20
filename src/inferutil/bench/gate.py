@@ -30,7 +30,8 @@ def evaluate(result, thresholds: Thresholds) -> GateResult:
     if t.min_pct_of_floor is not None and result.pct_of_floor < t.min_pct_of_floor:
         fails.append(f"pct_of_floor {result.pct_of_floor*100:.1f} < min {t.min_pct_of_floor*100:.1f} %")
     if t.min_quality_match is not None:
-        q = result.quality.match_rate if result.quality is not None else 0.0
-        if q < t.min_quality_match:
-            fails.append(f"quality {q:.3f} < min {t.min_quality_match:.3f}")
+        if result.quality is None:
+            fails.append(f"quality not measured (run had no reference) — required min {t.min_quality_match:.3f}")
+        elif result.quality.match_rate < t.min_quality_match:
+            fails.append(f"quality {result.quality.match_rate:.3f} < min {t.min_quality_match:.3f}")
     return GateResult(passed=(not fails), failures=tuple(fails))

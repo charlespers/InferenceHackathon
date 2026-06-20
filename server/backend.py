@@ -7,6 +7,7 @@ from typing import Iterator
 
 from server.schemas import ChatRequest
 from server.mock_engine import mock_stream
+from server.optimization_telemetry import summary_fields
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001")
 
@@ -79,13 +80,19 @@ class VLLMBackend(Backend):
         # decode tok/s excludes prefill: only count time after first token
         decode_elapsed = (elapsed - (t_first - t_start)) if t_first else elapsed
         prefill_tokens = sum(len(m.content.split()) for m in req.messages)
+        decode_rate = round(max(n_tokens - 1, 0) / max(decode_elapsed, 1e-3), 1)
+        # Optimization block (floor breakdown / regime / roofline%) derived from the LIVE measured TPOT, so the
+        # console's FloorBar + MBU + regime render on real chat — not just the mock (see optimization_telemetry).
+        fwd_tpot = round(1000.0 / decode_rate, 2) if decode_rate > 0 else 0.0
+        opt = summary_fields(fwd_tpot, decode_rate, weight_dtype="bf16", collective_us=17.0) if decode_rate > 0 else {}
         yield {
             "x_summary": {
                 "ttft_ms": ttft_ms,
-                "decode_tok_per_s": round(max(n_tokens - 1, 0) / max(decode_elapsed, 1e-3), 1),
+                "decode_tok_per_s": decode_rate,
                 "prefill_tokens": prefill_tokens,
                 "completion_tokens": n_tokens,
                 "spec_accept_rate": 0.0,
+                **opt,
             }
         }
 

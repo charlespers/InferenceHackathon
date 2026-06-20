@@ -12,6 +12,7 @@
 
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
+#include <cuda/pipeline>
 namespace cg = cooperative_groups;
 
 #define NRANKS 8
@@ -26,7 +27,11 @@ namespace cg = cooperative_groups;
 // below, and the top-level kernel now takes `layer_scales` (mirrors `layer_weights`'s per-layer shape)
 // to actually have a scales pointer to pass through.
 __device__ void multimem_allreduce_8kb(half* mc_ptr, int n);                 // the NVLS reduce (few blocks)
-__device__ void stream_weight_tile(const void* hbm_src, void* smem_dst, int bytes);  // cp.async (many blocks)
+// ALSO widened (same reason as expert_gemv above): cuda::memcpy_async needs a pipeline/barrier handle
+// to know what to wait on later -- stream_weight_tile's own doc says the CALLER owns acquire/commit/
+// wait/release around it, so the pipeline is threaded through here, not hidden inside the function.
+__device__ void stream_weight_tile(const void* hbm_src, void* smem_dst, int bytes,
+                                    cuda::pipeline<cuda::thread_scope_block>& pipe);  // cp.async (many blocks)
 __device__ void expert_gemv(const half* x, const void* w_smem, const half* scales,
                              half* y, int rows, int k);
 
@@ -39,6 +44,11 @@ extern "C" __global__ void k6_overlap_decode(half* act,                 // resid
     cg::grid_group grid = cg::this_grid();
     bool is_reduce = (blockIdx.x < N_REDUCE_BLOCKS);     // SM SPECIALIZATION: reduce blocks vs stream/compute blocks
     extern __shared__ unsigned char smem[];
+    // one BLOCK-SCOPED pipeline per block (make_pipeline() alone defaults to thread-scope, which
+    // doesn't typecheck against stream_weight_tile's thread_scope_block signature) -- needs an
+    // explicit shared_state per the documented cuda::pipeline block-scope construction pattern.
+    __shared__ cuda::pipeline_shared_state<cuda::thread_scope_block, 1> pipe_state;
+    auto pipe = cuda::make_pipeline(cg::this_thread_block(), &pipe_state);
 
     for (int L = 0; L < num_layers; ++L) {
         // ---- ATTENTION (omitted): produces attn_out into `act` (TP-sharded partial) ----
@@ -46,11 +56,17 @@ extern "C" __global__ void k6_overlap_decode(half* act,                 // resid
         if (is_reduce) {
             multimem_allreduce_8kb(mc_buf, /*n=*/4096);          // EXACT in-switch reduce on a few SMs
         } else {
-            stream_weight_tile(layer_weights[L]/*MoE gate/up*/, smem, /*bytes=*/0);  // overlap: HBM read in flight
+            pipe.producer_acquire();
+            stream_weight_tile(layer_weights[L]/*MoE gate/up*/, smem, /*bytes=*/0, pipe);  // HBM read in flight
+            pipe.producer_commit();
         }
         grid.sync();                                              // gate the dependent multiply on the reduced act
         // now act holds the reduced attention output AND the MoE gate/up weights are smem-resident:
-        if (!is_reduce) expert_gemv(act, smem, layer_scales[L], act, /*rows*/1536, 4096);  // MoE gate/up
+        if (!is_reduce) {
+            pipe.consumer_wait();                                  // wait for this block's own prefetch to land
+            expert_gemv(act, smem, layer_scales[L], act, /*rows*/1536, 4096);  // MoE gate/up
+            pipe.consumer_release();
+        }
         grid.sync();
 
         // ---- MoE down-proj (omitted): produces moe_out partial ----
@@ -58,7 +74,9 @@ extern "C" __global__ void k6_overlap_decode(half* act,                 // resid
         if (is_reduce) {
             multimem_allreduce_8kb(mc_buf, 4096);
         } else if (L + 1 < num_layers) {
-            stream_weight_tile(layer_weights[L + 1]/*next QKV*/, smem, 0);  // overlap: next-layer weights in flight
+            pipe.producer_acquire();
+            stream_weight_tile(layer_weights[L + 1]/*next QKV*/, smem, 0, pipe);  // next-layer weights in flight
+            pipe.producer_commit();
         }
         grid.sync();
         // act = residual + reduced moe_out ; next layer's QKV already resident -> loop continues with no stall.

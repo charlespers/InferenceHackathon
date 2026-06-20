@@ -1,0 +1,144 @@
+armed Sat Jun 20 10:22:21 UTC 2026 — stale-TP probe waiting for the FIRST genuinely-idle window
+IDLE window confirmed Sat Jun 20 10:22:42 UTC 2026 (free=81110MB, lock-free x2)
+min GPU free 81110MB
+=== launch bf16-TP8 + stale_tp (Sat Jun 20 10:22:43 UTC 2026) ===
+  probe exact (Sat Jun 20 10:23:23 UTC 2026) ctl={"enable": false, "mode": "layer", "policy": "proxy", "K": 1, "decode_only": true}
+  [1/10] ok (362 chars)
+  [2/10] ok (37 chars)
+  [3/10] ok (413 chars)
+  [4/10] ok (236 chars)
+  [5/10] ok (433 chars)
+  [6/10] ok (193 chars)
+  [7/10] ok (442 chars)
+  [8/10] ok (168 chars)
+  [9/10] ok (16 chars)
+  [10/10] ok (211 chars)
+-> /alloc/data/stale_tp/q_exact.json
+measuring http://localhost:8099 model=qwen3 decode=64 x3 ...
+  run 1: {'ok': True, 'ttft_ms': 26.58, 'tpot_ms': 41.882, 'decode_tok_s': 23.88, 'tokens': 64}
+  run 2: {'ok': True, 'ttft_ms': 75.06, 'tpot_ms': 14.392, 'decode_tok_s': 69.48, 'tokens': 64}
+  run 3: {'ok': True, 'ttft_ms': 18.66, 'tpot_ms': 14.011, 'decode_tok_s': 71.37, 'tokens': 64}
+
+=== BASELINE ===
+  TTFT      75.06 ms
+  TPOT      14.392 ms/token
+  decode    69.48 tok/s  (12.9% of ~540.0 roofline)
+  bottleneck hint: DOMINATED by floor (launch/host/comms — fix fast-path first)
+  -> /alloc/data/stale_tp/m_exact.json
+  probe lyr_proxy_k2 (Sat Jun 20 10:23:36 UTC 2026) ctl={"enable": true, "mode": "layer", "policy": "proxy", "K": 2, "decode_only": true}
+  [1/10] ok (367 chars)
+  [2/10] ok (411 chars)
+  [3/10] ok (409 chars)
+  [4/10] ok (429 chars)
+  [5/10] ok (406 chars)
+  [6/10] ok (355 chars)
+  [7/10] ok (413 chars)
+  [8/10] ok (473 chars)
+  [9/10] ok (395 chars)
+  [10/10] ok (435 chars)
+-> /alloc/data/stale_tp/q_lyr_proxy_k2.json
+  probe lyr_proxy_k4 (Sat Jun 20 10:24:02 UTC 2026) ctl={"enable": true, "mode": "layer", "policy": "proxy", "K": 4, "decode_only": true}
+  [1/10] ok (458 chars)
+  [2/10] ok (414 chars)
+  [3/10] ok (408 chars)
+  [4/10] ok (65 chars)
+  [5/10] ok (11 chars)
+  [6/10] ok (427 chars)
+  [7/10] ok (274 chars)
+  [8/10] ok (17 chars)
+  [9/10] ok (15 chars)
+  [10/10] ok (386 chars)
+-> /alloc/data/stale_tp/q_lyr_proxy_k4.json
+  probe lyr_local_k2 (Sat Jun 20 10:24:09 UTC 2026) ctl={"enable": true, "mode": "layer", "policy": "local", "K": 2, "decode_only": true}
+  [1/10] ok (338 chars)
+  [2/10] ok (249 chars)
+  [3/10] ok (283 chars)
+  [4/10] ok (313 chars)
+  [5/10] ok (289 chars)
+  [6/10] ok (307 chars)
+  [7/10] ok (394 chars)
+  [8/10] ok (338 chars)
+  [9/10] ok (359 chars)
+  [10/10] ok (198 chars)
+-> /alloc/data/stale_tp/q_lyr_local_k2.json
+  probe lyr_proxy_k8 (Sat Jun 20 10:24:20 UTC 2026) ctl={"enable": true, "mode": "layer", "policy": "proxy", "K": 8, "decode_only": true}
+  [1/10] ok (254 chars)
+  [2/10] ok (411 chars)
+  [3/10] ok (191 chars)
+  [4/10] ok (129 chars)
+  [5/10] ok (365 chars)
+  [6/10] ok (168 chars)
+  [7/10] ok (144 chars)
+  [8/10] ok (376 chars)
+  [9/10] ok (219 chars)
+  [10/10] ok (130 chars)
+-> /alloc/data/stale_tp/q_lyr_proxy_k8.json
+  probe tmp_proxy_k2 (Sat Jun 20 10:24:27 UTC 2026) ctl={"enable": true, "mode": "temporal", "policy": "proxy", "K": 2, "decode_only": true}
+  [1/10] ok (116 chars)
+  [2/10] ok (15 chars)
+  [3/10] ok (22 chars)
+  [4/10] ok (258 chars)
+  [5/10] ok (214 chars)
+  [6/10] ok (13 chars)
+  [7/10] ok (170 chars)
+  [8/10] ok (112 chars)
+  [9/10] ok (97 chars)
+  [10/10] ok (221 chars)
+-> /alloc/data/stale_tp/q_tmp_proxy_k2.json
+=== parity gate: exact vs lyr_proxy_k2 ===
+=== adaptive-top-k quality gate (10 prompts) ===
+  mean word-prefix agreement : 0.0%
+  exact-match rate           : 0.0%
+  verdict                    : FAIL (large drift)
+      0.0%  ~  Write a Python function to check if a string is a 
+      0.0%  ~  What is the capital of Australia? Answer in one se
+      0.0%  ~  Explain the difference between a stack and a queue
+      0.0%  ~  Compute 17 * 23 and show your steps.
+      0.0%  ~  Write the first paragraph of a story about a light
+-> /alloc/data/stale_tp/parity_lyr_proxy_k2.json
+=== parity gate: exact vs lyr_proxy_k4 ===
+=== adaptive-top-k quality gate (10 prompts) ===
+  mean word-prefix agreement : 3.2%
+  exact-match rate           : 0.0%
+  verdict                    : FAIL (large drift)
+      0.0%  ~  Write a Python function to check if a string is a 
+      0.0%  ~  What is the capital of Australia? Answer in one se
+      0.0%  ~  Explain the difference between a stack and a queue
+      0.0%  ~  List the planets of the solar system in order from
+      0.0%  ~  Implement binary search in Python with comments.
+-> /alloc/data/stale_tp/parity_lyr_proxy_k4.json
+=== parity gate: exact vs lyr_local_k2 ===
+=== adaptive-top-k quality gate (10 prompts) ===
+  mean word-prefix agreement : 2.3%
+  exact-match rate           : 0.0%
+  verdict                    : FAIL (large drift)
+      0.0%  ~  Write a Python function to check if a string is a 
+      0.0%  ~  Compute 17 * 23 and show your steps.
+      0.0%  ~  List the planets of the solar system in order from
+      0.0%  ~  Implement binary search in Python with comments.
+      0.0%  ~  Translate 'I would like a coffee' into French.
+-> /alloc/data/stale_tp/parity_lyr_local_k2.json
+=== parity gate: exact vs lyr_proxy_k8 ===
+=== adaptive-top-k quality gate (10 prompts) ===
+  mean word-prefix agreement : 0.3%
+  exact-match rate           : 0.0%
+  verdict                    : FAIL (large drift)
+      0.0%  ~  Write a Python function to check if a string is a 
+      0.0%  ~  What is the capital of Australia? Answer in one se
+      0.0%  ~  Explain the difference between a stack and a queue
+      0.0%  ~  Compute 17 * 23 and show your steps.
+      0.0%  ~  Write the first paragraph of a story about a light
+-> /alloc/data/stale_tp/parity_lyr_proxy_k8.json
+=== parity gate: exact vs tmp_proxy_k2 ===
+=== adaptive-top-k quality gate (10 prompts) ===
+  mean word-prefix agreement : 4.6%
+  exact-match rate           : 0.0%
+  verdict                    : FAIL (large drift)
+      0.0%  ~  Write a Python function to check if a string is a 
+      0.0%  ~  Translate 'I would like a coffee' into French.
+      0.0%  ~  What is recursion? Give a one-line example.
+      1.3%  ~  Write the first paragraph of a story about a light
+      1.4%  ~  Explain the difference between a stack and a queue
+-> /alloc/data/stale_tp/parity_tmp_proxy_k2.json
+fatal: could not read Username for 'https://github.com': No such device or address
+slot done Sat Jun 20 10:24:48 UTC 2026

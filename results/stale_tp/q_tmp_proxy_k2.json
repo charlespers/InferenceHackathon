@@ -1,0 +1,17 @@
+{
+  "base": "http://localhost:8099",
+  "model": "qwen3",
+  "tokens": 96,
+  "completions": {
+    "Write a Python function to check if a string is a palindrome.": "Here\u6709\u4ee5\u4e0b\u4e00\u4e2a\u786e\u4ee5,\u5b9e\u73b0\u4e00\u4e2a\u5b57\u7b26\u4e32\u662f\u5426******\u4e3a\u5b57\u7b26\u4e32\u662f\u5426,11,\u4e3a\u4e00\u4e2a\u56de,\u4e3a\u201c\u201c\u7684\u5b57\u7b26\u4e32\uff0c1,,\uff0c\u3002\u7684,,.\u7684\u5b57\u7b26\u4e32\u3002\u7684...bin\u7684\u5b57\u7b26\u4e32.-,.\u7684\u5b57\u7b26\u4e32\u3002..\u7684bin\u7684\u5b57\u7b26\u4e32\u30021\u7684\u7684\u7684\u5b57\u7b26\u4e32\u3002.\u7684\u7684\u7684\u5b57\u7b26\u4e32\u3002\u5b57\u7b26\u4e321\u7684",
+    "What is the capital of Australia? Answer in one sentence.": "The capital of.",
+    "Explain the difference between a stack and a queue.": "A of the United States",
+    "Compute 17 * 23 and show your steps.": "To United and the United and and the, States, and and and and and the United States and the United the United States and and and and, and the, and and the United States,, and and, and the,, and the United States,, United and, and the,, and the United States,",
+    "Write the first paragraph of a story about a lighthouse keeper.": "In and, a quiet,, the, and observant and and,, a man who and the, and a man, and a,, who had,,, that he was,,,,, and he,, and the first paragraph of,,,, and the,, and,, and,,, and,, and,,, and,,,,,,,,,,,,,,,,,,,ll,",
+    "List the planets of the solar system in order from the sun.": "The planets,,",
+    "Implement binary search in Python with comments.": "Certainly! Here's,! the's a Python's the a simple implementation of binary the and of the binary search the the andathing search in Python.,,ve. The.  and , the,. and and",
+    "Summarize what HTTP status code 404 means.": "HTTP 4,  bin 4111bin 401 4 / 411110000000000100 / 411  / 401 2 ../../0011200000000000100000110000000000001000000",
+    "Translate 'I would like a coffee' into French.": "Je00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "What is recursion? Give a one-line example.": "Recursion00iti\n\n**1---Note: TheNoteNote: The user is a the,, the user is the the,, asking for a, the the a one-line, the,, example of recursion,, of the example of recursion,, of a one-line,,,, example.**-, of us.**., and"
+  }
+}

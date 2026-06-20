@@ -194,6 +194,135 @@ extern "C" __global__ void k2_flash_decode_reduce(
   for (int c = 0; c < K2_VPL; c++) o[c] = acc[c] * inv;
 }
 
+// =================================================================================================
+// FUSED single-kernel flash-decode (partial + reduce in ONE launch, partials in shared memory).
+//
+// WHY: the bench showed K2 at ctx 4096 is OVERHEAD/LAUNCH bound, not bandwidth or chain-latency
+// bound (4.2 MB read takes ~42 us vs a ~1.3 us bandwidth floor).  The two-kernel split-KV path pays
+// for (a) TWO kernel launches and (b) an HBM round-trip of the (m,l,acc) partials between them, and
+// the n_splits sweep showed *more* splits make it slower (reduce cost + launch grow with splits) --
+// the opposite of a parallelism-starved kernel.  So the win is to do everything in ONE launch and
+// keep partials on-chip.
+//
+// DESIGN: one CTA owns one q_head.  Its W warps split the [0,ctx) KV range W ways; each warp streams
+// its slice with the online-softmax recurrence (2x time-unrolled so two coalesced fp8 loads stay in
+// flight) into a register (m,l,acc[4/lane]).  The W partials are combined in shared memory by warp 0
+// (W is tiny, e.g. 8), normalized, and attn_out[qh] written directly.  No second launch, no partials
+// in HBM.  grid = N_Q_HEADS CTAs (64) * W warps -> e.g. 512 warps in flight across 132 SMs, and each
+// CTA's W warps give intra-SM latency hiding.
+// =================================================================================================
+extern "C" __global__ void k2_flash_decode_fused(
+    const float* __restrict__ q,
+    const fp8*  __restrict__ kv_k, const fp8* __restrict__ kv_v,
+    const float* __restrict__ kv_k_scale, const float* __restrict__ kv_v_scale,
+    int ctx_len, float* __restrict__ attn_out) {
+  const int lane = threadIdx.x & 31;
+  const int wid  = threadIdx.x >> 5;
+  const int W    = blockDim.x >> 5;          // warps per CTA = number of time-splits
+  const int qh   = blockIdx.x;               // one CTA per q_head
+  const int kvh  = qh / GQA_GROUP;
+  const float scale = rsqrtf((float)HEAD_DIM);
+
+  const int kv_base = kvh * HEAD_DIM;
+  const int c0 = kv_base + lane * K2_VPL;
+
+  float qreg[K2_VPL], ksc[K2_VPL], vsc[K2_VPL];
+  #pragma unroll
+  for (int c = 0; c < K2_VPL; c++) {
+    qreg[c] = q[qh * HEAD_DIM + lane * K2_VPL + c];
+    ksc[c]  = kv_k_scale ? kv_k_scale[c0 + c] : 1.f;
+    vsc[c]  = kv_v_scale ? kv_v_scale[c0 + c] : 1.f;
+  }
+
+  // this warp's contiguous KV time slice [t0,t1).
+  const int chunk = (ctx_len + W - 1) / W;
+  const int t0 = wid * chunk;
+  const int t1 = min(t0 + chunk, ctx_len);
+
+  float m = -FLT_MAX, l = 0.f, acc[K2_VPL];
+  #pragma unroll
+  for (int c = 0; c < K2_VPL; c++) acc[c] = 0.f;
+
+  const unsigned* __restrict__ k32 = reinterpret_cast<const unsigned*>(kv_k);
+  const unsigned* __restrict__ v32 = reinterpret_cast<const unsigned*>(kv_v);
+  const int row_words  = KV_DIM / 4;
+  const int base_words = kv_base / 4;
+
+  // 2x time-step unroll: two independent coalesced K (and V) loads in flight per iteration.
+  int t = t0;
+  for (; t + 1 < t1; t += 2) {
+    float kv0[K2_VPL], kv1[K2_VPL];
+    k2_load4(k32 + (size_t)t       * row_words + base_words, lane, ksc, kv0);
+    k2_load4(k32 + (size_t)(t + 1) * row_words + base_words, lane, ksc, kv1);
+    float p0 = 0.f, p1 = 0.f;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) { p0 += qreg[c]*kv0[c]; p1 += qreg[c]*kv1[c]; }
+    float s0 = k2_warp_sum(p0) * scale;
+    float s1 = k2_warp_sum(p1) * scale;
+    float vv0[K2_VPL], vv1[K2_VPL];
+    k2_load4(v32 + (size_t)t       * row_words + base_words, lane, vsc, vv0);
+    k2_load4(v32 + (size_t)(t + 1) * row_words + base_words, lane, vsc, vv1);
+    float mn = fmaxf(m, s0), corr = __expf(m - mn), pe = __expf(s0 - mn);
+    l = l * corr + pe;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) acc[c] = acc[c]*corr + pe*vv0[c];
+    m = mn;
+    mn = fmaxf(m, s1); corr = __expf(m - mn); pe = __expf(s1 - mn);
+    l = l * corr + pe;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) acc[c] = acc[c]*corr + pe*vv1[c];
+    m = mn;
+  }
+  for (; t < t1; t++) {
+    float kv[K2_VPL];
+    k2_load4(k32 + (size_t)t * row_words + base_words, lane, ksc, kv);
+    float p = 0.f;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) p += qreg[c]*kv[c];
+    float s = k2_warp_sum(p) * scale;
+    float vv[K2_VPL];
+    k2_load4(v32 + (size_t)t * row_words + base_words, lane, vsc, vv);
+    float mn = fmaxf(m, s), corr = __expf(m - mn), pe = __expf(s - mn);
+    l = l * corr + pe;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) acc[c] = acc[c]*corr + pe*vv[c];
+    m = mn;
+  }
+
+  // ---- combine the W warp-partials in shared memory ----
+  // smem: m[W], l[W], acc[W][HEAD_DIM] (lane-contiguous). W is small (<=32).
+  extern __shared__ float sm[];
+  float* sm_m = sm;                 // [W]
+  float* sm_l = sm_m + W;           // [W]
+  float* sm_acc = sm_l + W;         // [W*HEAD_DIM]
+  if (lane == 0) { sm_m[wid] = m; sm_l[wid] = l; }
+  float* sao = sm_acc + (size_t)wid * HEAD_DIM + lane * K2_VPL;
+  #pragma unroll
+  for (int c = 0; c < K2_VPL; c++) sao[c] = acc[c];
+  __syncthreads();
+
+  // warp 0 merges all W partials (log-sum-exp) and writes the normalized output.
+  if (wid == 0) {
+    float rm = -FLT_MAX, rl = 0.f, racc[K2_VPL];
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) racc[c] = 0.f;
+    for (int w = 0; w < W; w++) {
+      float ms = sm_m[w], ls = sm_l[w];
+      if (ls <= 0.f) continue;
+      const float* ai = sm_acc + (size_t)w * HEAD_DIM + lane * K2_VPL;
+      float mn = fmaxf(rm, ms), co = __expf(rm - mn), cs = __expf(ms - mn);
+      rl = rl * co + ls * cs;
+      #pragma unroll
+      for (int c = 0; c < K2_VPL; c++) racc[c] = racc[c]*co + ai[c]*cs;
+      rm = mn;
+    }
+    float inv = (rl > 0.f) ? (1.f / rl) : 0.f;
+    float* o = attn_out + qh * HEAD_DIM + lane * K2_VPL;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) o[c] = racc[c] * inv;
+  }
+}
+
 // ---- launch helpers ----------------------------------------------------------------------------
 // Pick a split count so the partial pass keeps the 132 SMs busy several times over while leaving
 // each split a chunk long enough to amortize the per-warp setup/epilogue.
@@ -235,5 +364,31 @@ static inline int k2_launch(
   dim3 gR((N_Q_HEADS + warps_per_cta - 1) / warps_per_cta);
   k2_flash_decode_reduce<<<gR, block, 0, stream>>>(part_m, part_l, part_acc, n_splits, attn_out);
   return n_splits;
+}
+
+// Pick the number of warps/time-splits per CTA for the FUSED kernel (one CTA per q_head).  Want
+// W*64 warps comfortably over the SMs while keeping each warp's slice long enough to amortize setup.
+static inline int k2_pick_warps(int ctx_len) {
+  int w = 8;                                  // 64 heads * 8 = 512 warps in flight
+  if (ctx_len > 16384) w = 16;
+  if (ctx_len <= 512)  w = 4;
+  int max_by_chunk = (ctx_len + 31) / 32;     // keep slice >= ~32 timesteps
+  if (w > max_by_chunk) w = max_by_chunk;
+  if (w < 1) w = 1;
+  return w;
+}
+
+// Single-launch fused flash-decode: no partials in HBM, no second kernel.  Returns warps/CTA used.
+static inline int k2_launch_fused(
+    const float* q, const fp8* kv_k, const fp8* kv_v,
+    const float* kv_k_scale, const float* kv_v_scale, int ctx_len,
+    float* attn_out, int warps = -1, cudaStream_t stream = 0) {
+  if (warps <= 0) warps = k2_pick_warps(ctx_len);
+  const int block = warps * 32;
+  // smem: m[W] + l[W] + acc[W*HEAD_DIM], all floats.
+  const size_t smem = (size_t)(2 * warps + warps * HEAD_DIM) * sizeof(float);
+  k2_flash_decode_fused<<<N_Q_HEADS, block, smem, stream>>>(
+      q, kv_k, kv_v, kv_k_scale, kv_v_scale, ctx_len, attn_out);
+  return warps;
 }
 #endif

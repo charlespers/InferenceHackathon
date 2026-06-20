@@ -1,4 +1,12 @@
-# Reading the 08:45 EAGLE3 results — decision tree (so interpretation is immediate)
+# Reading the EAGLE3 results — decision tree (so interpretation is immediate)
+
+> **CONTEXT UPDATE (reactions 04–06): the realized spec multiplier S is now THE dominant make-or-break for 1000.**
+> The comms is barrier-bound (~16µs, hideable LOSSLESSLY via deferred-overlap, not stale-TP which is dead); int4
+> is dead; TP=8 plain decode is occupancy-starved — so **spec (the batched verify) is the lever that both reaches
+> the roofline AND amortizes the comms.** What S tells us for 1000 (plug into `ladder_to_1000.py --tau-mult S`):
+> **S ≥ ~3.5** → on a floor-removed + deferred-overlap engine → ~1000+ is real; **S ≈ 2.5** → ~700-class, needs
+> every other lever. Also confirm the verify is correctly BATCHED (`verify_cost_check.py` — flat-ish in tree
+> size, the squeeze bench's per-row scaling was a bug) and measure S at **temp 0.7** (product), not just greedy.
 
 The first real EAGLE3 data lands from LOOP-A's FP8+EP slot (+ my bf16-TP8 arm, `run_eagle3.sh`). Inputs per
 mode (eager/graphs): **S** = tok/s(EAGLE3)/tok/s(baseline), **τ** = accept-length (1+accepted/drafts, from

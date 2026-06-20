@@ -91,6 +91,38 @@ def quant_grid(base: BenchConfig,
     return out
 
 
+def _divisors(n: int) -> List[int]:
+    return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def layout_grid(base: BenchConfig, n_gpus: int) -> List[BenchConfig]:
+    """Parallelism variants of a base config: every (tp, ep) over divisors of
+    n_gpus. Layout doesn't change outputs, so this is a pure-speed search."""
+    out = []
+    for tp in _divisors(n_gpus):
+        for ep in _divisors(n_gpus):
+            out.append(BenchConfig(
+                name=f"tp{tp}-ep{ep}", plan=base.plan, dtype_bytes=base.dtype_bytes,
+                kv_dtype_bytes=base.kv_dtype_bytes, tp=tp, ep=ep,
+                prompt_tokens=base.prompt_tokens, decode_tokens=base.decode_tokens))
+    return out
+
+
+def full_grid(base: BenchConfig, n_gpus: int,
+              dtypes=(2, 1, 0.5), kv_dtypes=(2, 1)) -> List[BenchConfig]:
+    """The full quant x layout space (quant changes quality; layout doesn't)."""
+    out = []
+    for d in dtypes:
+        for kv in kv_dtypes:
+            for tp in _divisors(n_gpus):
+                for ep in _divisors(n_gpus):
+                    out.append(BenchConfig(
+                        name=f"w{d}b-kv{kv}b-tp{tp}-ep{ep}", plan=base.plan,
+                        dtype_bytes=d, kv_dtype_bytes=kv, tp=tp, ep=ep,
+                        prompt_tokens=base.prompt_tokens, decode_tokens=base.decode_tokens))
+    return out
+
+
 def config_sweep(cfg: MoEConfig, cluster: Cluster,
                  configs: List[BenchConfig]) -> List[SweepPoint]:
     """Rank candidate configs by predicted decode tok/s (descending)."""

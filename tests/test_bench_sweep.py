@@ -3,7 +3,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from inferutil import QWEN3_235B, Cluster, H100_SXM
 from inferutil.bench.config import BenchConfig
-from inferutil.bench.sweep import depth_sweep, config_sweep, quant_grid, SweepPoint
+from inferutil.bench.sweep import (
+    depth_sweep, config_sweep, quant_grid, layout_grid, full_grid, SweepPoint,
+)
 
 CLUSTER = Cluster(gpu=H100_SXM, n_gpus=8)
 CFG = BenchConfig(name="s", plan="hybrid", dtype_bytes=1, kv_dtype_bytes=2,
@@ -35,6 +37,21 @@ def test_quant_grid_and_config_ranking():
     assert toks == sorted(toks, reverse=True)            # ranked fastest-first
     top = pts[0]
     assert top.dtype_bytes == 0.5 and top.kv_dtype_bytes == 1  # lowest bytes wins
+
+
+def test_layout_grid_keeps_quant_fixed_and_sizes():
+    lg = layout_grid(CFG, 8)
+    assert len(lg) == 16                                 # 4 divisors x 4 divisors
+    assert all(c.dtype_bytes == CFG.dtype_bytes
+               and c.kv_dtype_bytes == CFG.kv_dtype_bytes for c in lg)
+    assert len(full_grid(CFG, 8)) == 3 * 2 * 16          # dtypes x kv x layouts
+
+
+def test_layout_sweep_is_pure_speed_search():
+    pts = config_sweep(QWEN3_235B, CLUSTER, layout_grid(CFG, 8))
+    # one quant point -> all differences are layout (no quality change)
+    assert len({(p.dtype_bytes, p.kv_dtype_bytes) for p in pts}) == 1
+    assert pts[0].decode_tok_s == max(p.decode_tok_s for p in pts)   # top is fastest
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from .report import format_result, format_compare, format_diagnosis, format_swee
 from .attribution import diagnose
 from .levers import recommend
 from .manifest import build_manifest
-from .sweep import depth_sweep, config_sweep, quant_grid
+from .sweep import depth_sweep, config_sweep, quant_grid, layout_grid, full_grid
 from .gate import Thresholds, evaluate
 
 DEFAULT_RESULTS_DIR = "results"
@@ -144,6 +144,13 @@ def _cmd_sweep(args) -> None:
         pts = depth_sweep(QWEN3_235B, cluster, config, depths)
         title = (f"DEPTH SWEEP  plan={config.plan} w{config.dtype_bytes}b "
                  f"kv{config.kv_dtype_bytes}b tp={config.tp} ep={config.ep}")
+    elif args.full:
+        pts = config_sweep(QWEN3_235B, cluster, full_grid(config, cluster.n_gpus))
+        title = f"FULL SWEEP (quant x layout)  plan={config.plan} ctx={config.seq_len}"
+    elif args.layout:
+        pts = config_sweep(QWEN3_235B, cluster, layout_grid(config, cluster.n_gpus))
+        title = (f"LAYOUT SWEEP (tp x ep)  plan={config.plan} "
+                 f"w{config.dtype_bytes}b kv{config.kv_dtype_bytes}b ctx={config.seq_len}")
     else:
         pts = config_sweep(QWEN3_235B, cluster, quant_grid(config))
         title = f"CONFIG SWEEP (quant grid)  plan={config.plan} ctx={config.seq_len}"
@@ -235,7 +242,11 @@ def main(argv=None) -> None:
     sw.add_argument("--prompt", type=int, default=512)
     sw.add_argument("--decode", type=int, default=128)
     sw.add_argument("--depths", default=None,
-                    help="comma list e.g. 512,4096,32768; omit for a quant-grid config sweep")
+                    help="comma list e.g. 512,4096,32768 -> depth (KV-decay) sweep")
+    sw.add_argument("--layout", action="store_true",
+                    help="sweep tp x ep layouts at fixed quant (pure-speed search)")
+    sw.add_argument("--full", action="store_true",
+                    help="sweep the full quant x layout grid")
     sw.add_argument("--gpu-hr", type=float, default=3.0, help="$/GPU-hr for $/Mtok")
     sw.add_argument("--peak-bw-gbs", type=float, default=None,
                     help="measured HBM GB/s per GPU; overrides the spec sheet")

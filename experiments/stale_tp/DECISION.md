@@ -78,13 +78,19 @@ Honest KILL of the *runtime-only* variant. Then:
 
 ---
 
-## 4. Results table (fill from `parity_*.json`)
+## 4. Results table (measured 2026-06-20 10:24 UTC, bf16-TP8 8×H100; `results/stale_tp/`)
 | point | mean_agreement | exact_rate | tool verdict | note |
 |---|---|---|---|---|
-| lyr_proxy_k2 | | | | **the decision driver** |
-| lyr_proxy_k4 | | | | tolerance vs K |
-| lyr_local_k2 | | | | **control — must degrade** |
-| lyr_proxy_k8 | | | | far point |
-| tmp_proxy_k2 | | | | across-token variant |
+| lyr_proxy_k2 | **0.000** | 0.00 | FAIL | **decision driver — catastrophic** |
+| lyr_proxy_k4 | 0.032 | 0.00 | FAIL | no tolerance |
+| lyr_local_k2 | 0.023 | 0.00 | FAIL | control degraded ✓ (hook works) |
+| lyr_proxy_k8 | 0.003 | 0.00 | FAIL | — |
+| tmp_proxy_k2 | 0.046 | 0.00 | FAIL | across-token also fails |
 
-**Branch taken:** ______  →  **next action:** ______
+Sanity: `exact` reproduced correct output; all 8 TP workers patched (fork); control degraded.
+
+**Branch taken: ❌ NO-GO** (A2=0.000 ≪ 0.90; not marginal drift but token-1 gibberish, so the
+CONDITIONAL error-feedback recovery cannot apply). → **next action:** kill the runtime stale-TP
+lever; pivot to the **lossless exact deferred-overlap** (in the megakernel) + Charles's multimem
+one-shot for the comms floor. Ladder-Residual-with-retrain works but is out of hackathon scope.
+Full write-up: `research/n4_speculative_stale_tp.md` §6.

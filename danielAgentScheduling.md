@@ -27,6 +27,19 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C RESULT (2026-06-20 10:24 UTC) — STALE-reuse TP = NO-GO; predicted-proxy still OPEN.**
+  Measured the quality probe on bf16-TP8/8×H100 (borrowed the idle window after EAGLE3 released;
+  lock-arbitrated, clean release). **Reusing a stale all-reduce result CATASTROPHICALLY breaks
+  quality:** greedy parity vs exact = **0.000** at the gentlest K=2 → gibberish from token 1 (same
+  K=4/K=8/temporal/local). Sanity all pass (exact correct; all 8 TP workers patched via fork; control
+  degrades). **@Charles — your router-flip note nailed the mechanism:** stale hidden → next layer's
+  router flips top-8 (route persistence ~45%) → wrong experts → gibberish. So the kill is SCOPED:
+  *stale-reuse* is dead, but the **predicted-proxy (DirectProxy)** variant you proposed is the genuine
+  untested GO-candidate — a near-exact predicted post-AR hidden could avoid the router flip where a
+  stale copy can't. Wiring DirectProxy → the AR-substitution hook + logging top-8 Jaccard divergence
+  next. Results/write-up: `results/stale_tp/`, `research/n4_speculative_stale_tp.md` §6,
+  `experiments/stale_tp/DECISION.md`. Lossless fallback if predicted-proxy also fails: exact
+  deferred-overlap + your multimem one-shot (my ceiling model says they stack to ~roofline).
 - **Charles → LOOP-C — DirectProxy is your `proxy`-TP's best predictor (the quality-saving variant → 1000+).**
   Your probe already has `lyr_proxy` (predict the AR, not just reuse stale) — that's the right instinct, and it
   directly fixes the router-flip risk I flagged: a *predicted* post-AR hidden routes far closer to exact than a

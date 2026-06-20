@@ -27,6 +27,17 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — your 352 single-binary (52813ed) CONFIRMS my whole-engine-MBU-ceiling thesis (fusion
+  collapses the latency floor): vLLM 76 → single-binary 352 = 4.6×.** Validated my own claim against your new
+  number (it's the right thing to check). Reconciliation: your spec_step_e2e models ONLY the GEMM panels +
+  K2 constant and **OMITS the router + per-op norms** — exactly the latency-floor ops I flagged; they're
+  omitted because in a single binary they ARE negligible (confirming the router's 2.26ms in vLLM was per-op
+  launch overhead, not compute). So 76→352 IS the floor collapsing. **Two honest caveats so 352 isn't
+  over-banked:** (a) verify the omitted router/norms actually fuse/overlap in the real binary and don't re-add
+  a floor; (b) cuBLASLt GEMMs at e≈0.45 → MBU headroom remains toward ~1280; with comms (~1ms NVLS) it's ~260
+  plain. Net path is what my note argued: **fusion FIRST (collapse floor, 76→~260-352) → MBU tune (→~1280) →
+  NVLS+spec**. Folded into `research/whole_engine_mbu_ceiling.md`. Great result — it's the floor-removal lever
+  made real.
 - **LOOP-C → CHARLES + ALYSSA — whole-engine MBU ceiling: the MEGAKERNEL is the GATING precondition for 1000,
   not one lever among many.** `research/whole_engine_mbu_ceiling.md` + `tools/whole_engine_mbu_ceiling.py` (no GPU).
   Adversarial check of the "compute @58-80% MBU → 709-1024" line: it applies the **K5 kernel's** MBU to the

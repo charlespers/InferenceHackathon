@@ -115,11 +115,20 @@ def main():
     print(f"  S_e2e (eagle3 graphs / baseline eager)     = {s_e2e}")
     print(f"  tau (accept length)                        = {tau}")
     if v is not None:
-        verdict = "floor-bound -> route-aware NO-GO" if v < 1.3 else "union-taxed -> route-aware GO"
-        print(f"  V = tau/S_spec                             = {v}   ({verdict})")
+        # CAVEAT: V = tau/S is the WHOLE spec round (draft + verify) per emitted token, NOT just the
+        # verify-union cost. At draft_tp=1 the draft (k sequential head forwards) inflates V, and vLLM's
+        # verify is itself NOT flat (~(k+1)x a decode step) -- measured 14:45: V~2.34 was draft + non-flat
+        # verify, NOT a wide expert union. So do NOT read route-aware go/no-go from V. Route-aware go/no-go
+        # is set by whether the VERIFY is flat in k (Charles measured flat -> union doesn't tax -> NO-GO),
+        # which V cannot isolate. Print V as a round-cost diagnostic only.
+        print(f"  V = tau/S_spec (round cost, decode-steps)  = {v}   "
+              f"[draft + verify; NOT a verify-union readout -- see note]")
+        if v > 1.3:
+            print(f"    high V -> the spec ROUND is heavy: likely draft_tp=1 draft cost and/or a non-flat "
+                  f"verify (vLLM). Fix: draft_tp=8 + the native FLAT M=k GEMM verify, not union-shrinking.")
     if union is not None:
-        print(f"  back-solved verify union (f={a.f_graphs})           = {round(union,1)} experts "
-              f"({'tight ~route-aware-friendly' if union < 16 else 'wide -> route-aware headroom'})")
+        print(f"  [back-solved 'union' {round(union,1)} is UNRELIABLE: assumes V is all verify-union cost; "
+              f"it isn't (draft + non-flat verify dominate). Route-aware union-shrink stays NO-GO at B=1.]")
     if eg:
         print(f"  EAGLE3-absolute vs bf16-best {BF16_BEST_TOK_S}: {round(eg/BF16_BEST_TOK_S,3)}x "
               f"(FP8 target carries the ~25% B=1 handicap)")

@@ -1,0 +1,38 @@
+# HELP vllm:spec_decode_num_drafts_total Number of spec decoding drafts.
+# TYPE vllm:spec_decode_num_drafts_total counter
+vllm:spec_decode_num_drafts_total{engine="0",model_name="qwen3"} 616.0
+# HELP vllm:spec_decode_num_drafts_created Number of spec decoding drafts.
+# TYPE vllm:spec_decode_num_drafts_created gauge
+vllm:spec_decode_num_drafts_created{engine="0",model_name="qwen3"} 1.7819541076979067e+09
+# HELP vllm:spec_decode_num_draft_tokens_total Number of draft tokens.
+# TYPE vllm:spec_decode_num_draft_tokens_total counter
+vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="qwen3"} 4761.0
+# HELP vllm:spec_decode_num_draft_tokens_created Number of draft tokens.
+# TYPE vllm:spec_decode_num_draft_tokens_created gauge
+vllm:spec_decode_num_draft_tokens_created{engine="0",model_name="qwen3"} 1.7819541076979349e+09
+# HELP vllm:spec_decode_num_accepted_tokens_total Number of accepted tokens.
+# TYPE vllm:spec_decode_num_accepted_tokens_total counter
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="qwen3"} 272.0
+# HELP vllm:spec_decode_num_accepted_tokens_created Number of accepted tokens.
+# TYPE vllm:spec_decode_num_accepted_tokens_created gauge
+vllm:spec_decode_num_accepted_tokens_created{engine="0",model_name="qwen3"} 1.7819541076979563e+09
+# HELP vllm:spec_decode_num_accepted_tokens_per_pos_total Accepted tokens per draft position.
+# TYPE vllm:spec_decode_num_accepted_tokens_per_pos_total counter
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen3",position="0"} 196.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen3",position="1"} 40.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen3",position="2"} 18.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen3",position="3"} 7.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen3",position="4"} 5.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen3",position="5"} 4.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen3",position="6"} 2.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="qwen3",position="7"} 0.0
+# HELP vllm:spec_decode_num_accepted_tokens_per_pos_created Accepted tokens per draft position.
+# TYPE vllm:spec_decode_num_accepted_tokens_per_pos_created gauge
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="qwen3",position="0"} 1.7819541076979806e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="qwen3",position="1"} 1.7819541076979885e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="qwen3",position="2"} 1.7819541076979954e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="qwen3",position="3"} 1.7819541076980019e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="qwen3",position="4"} 1.7819541076980083e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="qwen3",position="5"} 1.781954107698016e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="qwen3",position="6"} 1.7819541076980245e+09
+vllm:spec_decode_num_accepted_tokens_per_pos_created{engine="0",model_name="qwen3",position="7"} 1.7819541076980307e+09

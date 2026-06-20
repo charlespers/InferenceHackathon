@@ -57,8 +57,16 @@ cd kernels && /usr/local/cuda-12.6/bin/nvcc -arch=sm_90a -O3 --use_fast_math k5_
   | grep -iE "DRAM Throughput|Achieved Occupancy|Memory Throughput|Stall|Issue Slots"
 ```
 Record: Nsight DRAM-throughput %, occupancy, top stalls for `k5a_gateup_warp` and `k5b_down_warp`.
-Then build/run any `kernels/k5_experts_warp2.cu` the planning agent pushes (down-proj block-reduce) and
-record its `e`. Target: push blended `e` from 0.46 toward 0.55+.
+Then test the **front-loaded down-proj fix** (`kernels/k5_experts_warp2.cu` = per-slot 6 KB smem vs the
+winner's 48 KB all-`a`, to lift occupancy):
+```bash
+/usr/local/cuda-12.6/bin/nvcc -arch=sm_90a -O3 --use_fast_math kernels/k5_downproj_bench.cu -I kernels -o dbench
+CUDA_VISIBLE_DEVICES=0 ./dbench 3350   # compares winner k5b (e≈0.405) vs v2 across tile/block configs
+```
+Record the v2 best `e` + maxrel. **Interpretation:** if v2 wins → the down kernel was occupancy-bound (fold
+v2 into `k5_experts_warp.cu`); if no improvement → it's DRAM- or reduce-bound, and the next fix is sub-warp
+split-K (fewer lanes/row, more rows/warp) — report Nsight so the planning agent designs it. Target: push
+blended K5 `e` from 0.46 toward ~0.50.
 
 ### E5 — Speculative decode acceptance (if a draft is wired)
 If EAGLE/MTP/n-gram drafting is available, measure `spec_accept_rate` (τ) + tok/s uplift via `x_summary`.

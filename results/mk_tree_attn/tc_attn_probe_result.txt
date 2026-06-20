@@ -1,0 +1,10 @@
+TC ATTENTION FLATNESS PROBE (cuBLAS fp16 TC, QK^T + P.V as GEMMs over 64 heads) — 2026-06-20 ~20:05 UTC
+H100 80GB, idle box + lock free, model-free. Softmax omitted (cheap/flat); H independent K/V (ratio clean).
+
+ctx=4096:  M=1 55.32us  M=4 71.48 (1.29x)  M=8 56.70 (1.03x)  M=16 58.87 (1.06x)   us/q: 55->18->7->3.7
+ctx=8192:  M=1 99.12us  M=4 128.78(1.30x)  M=8 104.38(1.05x)  M=16 108.39(1.09x)   us/q: 99->32->13->6.8
+ctx=2048:  M=1 32.99us  M=4 41.14 (1.25x)  M=8 32.35 (0.98x)  M=16 32.84 (1.00x)   us/q: 33->10->4->2.0
+
+VERDICT: TC attention is FLAT in M (M=8/M=1 ~= 1.0) vs warp-shuffle K2's ~4.0x. The M-scaling is a
+warp-shuffle/CUDA-core artifact, NOT fundamental. (M=4 ~1.3x = a cuBLAS tile-pick blip at the odd size,
+not scaling — M=8/16 align to MMA tiles and are flat.)

@@ -83,6 +83,31 @@ and τ from Charles's expected anchor (k4→2.8, k8→3.76, k16→~3.9), draft s
   the EAGLE3 "expected" anchor, not measured on the real model at these k. Confirm f + τ(k) with Charles
   before banking. The DIRECTION (optimal k≈4-8, ~2.6x, not flat) is robust to f in [0.15,0.25].
 
+## *** UPDATE: the M-tax is REMOVABLE — tensor-core attention IS flat in M ***
+(2026-06-20 ~20:05 UTC, `tc_attn_probe.cu`/`tcp`, idle box, model-free. Full: `tc_attn_probe_result.txt`.)
+The ~4x K2 M-scaling above is the warp-shuffle/CUDA-core kernel's artifact, NOT fundamental to B=1.
+A cuBLAS fp16 TC proxy of the verify attention (QK^T + P.V as batched GEMMs over 64 heads) is **FLAT in M**:
+| ctx | M=1 | M=8 | M=8/M=1 | vs warp-shuffle |
+|--:|--:|--:|--:|--:|
+| 2048 | 33.0us | 32.4 | **0.98x** | (warp ~2.96x) |
+| 4096 | 55.3us | 56.7 | **1.03x** | (warp ~4.0x) |
+| 8192 | 99.1us | 104.4 | **1.05x** | (warp ~5.6x) |
+Mechanism: on tensor cores the M queries are FREE output columns — the K/V read dominates and is
+M-independent (exactly why Charles's weight GEMMs are flat). us/query collapses 55->7us@M=8.
+- **Regime split (actionable):** M=1 plain-decode -> warp-shuffle/k2b WINS (~41us; TC underfills the MMA
+  M-tile, 55us). M>=4 spec-verify -> **TC WINS huge AND is flat** (56us vs warp 165us @M=8). The engine
+  wants BOTH kernels: warp-shuffle for decode(M=1), TC flash-decode for verify(M=k).
+- **Consequence for the spec ceiling:** if the verify attention goes flat (TC), the full forward goes
+  ~flat in M (GEMM panels already flat) -> the K2 M-tax cap is REMOVED -> net spec rises from the
+  warp-shuffle ~2.6x toward **~3.2-3.5x** (k=8, tau~3.76, minus ~5-15% draft). The 840-1000 path needs the
+  forward-floor wins too, but the "spec verify can't be flat" blocker is a kernel artifact, not physics.
+- **CAVEATS (before banking):** proxy = GEMM-only (softmax omitted — cheap + flat in M), fp16 (not fp8),
+  64 independent heads (no GQA broadcast; real KV is 16x smaller -> more compute-bound but TC handles it),
+  no tree/causal mask, no RoPE. A REAL TC flash-decode verify needs online-softmax (FA-style) + fp8 KV +
+  mask + per-node RoPE; flatness is very likely preserved but MUST be validated. M=1 must keep warp-shuffle.
+- **NEXT:** build the TC flash-decode verify (my lane = the TC evolution of mk_tree_attn) — coordinate with
+  Charles first (does his FA/engine path already have a TC attention, or only warp-shuffle k2_flash_decode?).
+
 ## Repro
 Box `/tmp/mkta`: `k2b` (Charles, flatness table), `k2bs` (my splits-sweep harness, `k2b_splits.cu`).
 `nvcc -arch=sm_90a -O3 --use_fast_math -I. k2_batched_decode.cu -o k2b` ; `./k2b <ctx> <iters>`.

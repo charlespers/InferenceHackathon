@@ -12,20 +12,28 @@
 // M=1 (plain decode) reduces to context-only; for M=1 the engine should prefer the warp k2_flash_decode
 // (tensor cores UNDERFILL the MMA M-tile at M=1: ~67us TC vs ~41us warp). Use THIS for M>=4 (verify).
 //
-// INTEGRATION (Charles's engine):
-//   - Q   : [M][N_Q_HEADS][HEAD_DIM] fp16  (normed+roped draft queries; per-head RMSNorm + RoPE upstream)
-//   - K/V : context cache. This header takes fp16 [N_Q_HEADS][ctx][HEAD_DIM]. For the fp8 e4m3 cache
-//           (per-channel scale), dequant-on-load to fp16 is M-INDEPENDENT (flatness preserved) — OR wire
-//           cuBLASLt NATIVE fp8 GEMM to skip the dequant (recommended; the dequant proxy added ~210us of
-//           materialization, see tc_verify_fp8.cu honest caveat). GQA: pass K/V broadcast per Q head, or
-//           adapt strides (KV head = qh/GQA_GROUP).
-//   - draftK/draftV : [M][N_Q_HEADS][HEAD_DIM] fp16 (the draft tokens' own K/V from the verify forward)
-//   - parent : [M] int, parent[m] = ancestor of node m (-1 for root). For a CHAIN: parent[m]=m-1.
-//   - out : [M][N_Q_HEADS][HEAD_DIM] fp16 attention output.
-//   Workspace (caller allocates once, sized for MMAX): S[H*MMAX*ctx], Oc/Od[H*MMAX*HEAD_DIM] fp16;
-//     mxc/smc/mxd/smd[H*MMAX] fp32.
-// TODO(engine): per-node RoPE pos_id is the caller's job on Q (tree_attn.h has the pos_id map); add fp8
-//   native-GEMM path; tune for GQA broadcast. Numerics gate: sdpa_tree_ref.h / the *_ref CPU checks.
+// INTEGRATION — EXACT seam in Charles's decode_step_tp8.cu (the `tp8_k2_launch_mq(RankState& S, int M)`
+// path; currently warp-shuffle k2 multi-query which SCALES ~4x@M=8 — replace with this flat TC verify):
+//   Per-rank (TP=8): H = Q_HEADS_RANK = 8 (NOT 64), Q_DIM_RANK = 1024. KV cache is REPLICATED full
+//   (4 KV heads); a rank's 8 Q heads all map to ONE kv head (kvh = (rank*8 + local)/GQA_GROUP, 8<16).
+//   RankState buffers to bind:
+//     S.q_mq       : [SPEC_MMAX * Q_DIM_RANK]  FLOAT  (M normed+roped draft queries) -> convert to fp16 for TC
+//     S.kv_k/kv_v  : fp8 e4m3 [ctx_len, KV_DIM] + S.kv_k_scale/kv_v_scale [KV_DIM] (per-channel) -> dequant
+//                    to fp16 (M-INDEPENDENT, flatness-safe) OR cuBLASLt native-fp8 GEMM (skips materialize)
+//     S.attn_out_mq: [SPEC_MMAX * Q_DIM_RANK]  FLOAT  output (write here)
+//   Per-query causal masking: the engine appends the M draft tokens' K/V to the cache and gives each
+//   query its own ctx_len (draft i attends [0, ctx + i)); so the draftK/draftV/parent path here can be
+//   FOLDED INTO the context GEMM by per-query ctx — OR kept separate (this header's (B) draft-self) if the
+//   draft K/V are NOT yet in the cache. Confirm with Charles which the mq path does.
+//   This header's CURRENT signature (standalone, fp16, H=N_Q_HEADS): Q/K/V/draftK/draftV/parent/out fp16,
+//   workspace S[H*MMAX*ctx], Oc/Od[H*MMAX*HEAD_DIM] fp16, mxc/smc/mxd/smd[H*MMAX] fp32. To use in-engine:
+//   pass H=Q_HEADS_RANK, convert q_mq float->fp16, dequant fp8 KV->fp16.
+// *** OPEN RISK (needs on-box validation, blocked by live-demo lock): flatness was measured at H=64 heads
+//   (lots of batched-GEMM SM fill). At H=8 heads/rank the batched GEMM is 8x smaller -> may UNDERFILL the
+//   SMs at small M and lose some efficiency (flatness in M should hold — M is free cols — but absolute
+//   per-rank efficiency must be re-measured at H=8). Queued: tcv H=8 sweep when the box frees post-demo. ***
+// TODO(engine): per-node RoPE pos_id on Q (tree_attn.h has the map); cuBLASLt native-fp8 path; numerics
+//   gate sdpa_tree_ref.h. M=1 plain decode KEEPS the warp k2 (TC underfills at M=1).
 // =============================================================================================
 #pragma once
 #include <cuda_fp16.h>

@@ -331,3 +331,17 @@ Per-finding evidence + verifier reasoning saved in the audit transcript; happy t
 - `sweep`/`plan --efficiency <e>` now scale predicted tok/s + MBU + $/Mtok by e, so they show calibrated
   reality, not the floor — the suite no longer falls into the same over-prediction trap. e.g.
   `sweep --efficiency 0.2` → realistic tok/s vs the optimistic floor.
+
+### Mutual validation — your `spec_predict.py` ✕ my `bench/spec_model.py` agree (big trees win) — 2026-06-20
+Two **independent** floor-aware spec models now converge on the headline, which is strong confidence for the
+EAGLE3 big-tree call:
+- your `tools/spec_predict.py` (F=0.86, α=0.7, tp, eagle3 dtp=8): best **W4×D8 @ 3.42×**;
+- my `bench/spec_model.py` / `spec --accept 0.7 --floor 0.86`: best **k8×N4 @ 3.96×**.
+Both pick a **big tree at the measured F≈0.86, ~3.4–4×.** (Absolute gap is expected: yours adds draft cost +
+EP-balance and omits the bonus token; mine adds the bonus and no draft cost.)
+
+`spec_predict.py` **fixed 2 of my 3 spec findings** — it's floor-aware (F), and the D-dependent `draft_cost`
+bounds depth (kills the `tree_spec_optimizer` grid-edge artifact). **One residual (my finding #6):**
+`spec_predict.py:28` `expected_accepted=(1-p^D)/(1-p)` still **omits the +1 bonus token**
+(`engine/src/spec/accept.rs`) → undercounts **14% / 6% / 2% at D=3 / 5 / 8** (over-penalizes small trees, so it
+*slightly* over-favors big — headline unaffected). One-line fix: `(1.0 - p**(D+1)) / (1.0 - p)`.

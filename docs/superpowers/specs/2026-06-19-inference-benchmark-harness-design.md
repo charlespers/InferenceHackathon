@@ -202,3 +202,99 @@ now on `main` — so the console can consume harness output later. A thin add, n
 6. `report.py` + `cli.py` (`run`/`report`/`compare`, `--json`).
 7. Tests across the pipeline (no GPU required).
 8. `BenchResult -> x_summary` adapter + `results/.gitkeep`, `.gitignore` entry.
+
+## Appendix A: concrete data shapes
+
+These pin down the boundaries in §3–§6 so the plan is unambiguous. All dataclasses are
+`frozen=True`, stdlib only, times in **seconds** internally (the report converts to ms),
+bandwidth in **bytes/sec**, matching `hardware.py` SI conventions.
+
+```python
+# engine.py — the seam
+@dataclass(frozen=True)
+class ExpertRoute:
+    layer: int
+    expert_id: int
+    gpu: int
+
+@dataclass(frozen=True)
+class PrefillResult:
+    n_prompt_tokens: int
+    seconds: float                 # prefill wall-time (=> TTFT with first-token gen)
+    first_token_seconds: float     # time to emit the first decoded token
+
+@dataclass(frozen=True)
+class DecodeStep:
+    index: int                     # decode-step index (0-based, post-warmup)
+    seconds: float                 # this step's wall-time (=> TPOT sample)
+    routes: tuple[ExpertRoute, ...] = ()   # optional; empty when engine doesn't expose it
+
+class Engine(Protocol):
+    def reset(self, *, plan: str, dtype_bytes: int, kv_dtype_bytes: int,
+              tp: int, ep: int, seq_len: int) -> None: ...
+    def prefill(self, token_ids: list[int]) -> PrefillResult: ...
+    def decode_step(self) -> DecodeStep: ...
+
+# telemetry.py — one NVML sample for one GPU at one instant
+@dataclass(frozen=True)
+class GpuSample:
+    gpu_index: int
+    t_seconds: float               # monotonic offset from window start
+    temp_c: float
+    sm_util_pct: float
+    mem_util_pct: float
+    power_w: float
+    sm_clock_mhz: float
+    mem_clock_mhz: float
+    mem_used_bytes: int
+
+class TelemetrySource(Protocol):    # NvmlTelemetry | NullTelemetry | DcgmTelemetry | Fake
+    def start(self) -> None: ...    # spawn sampler thread bracketing the decode window
+    def stop(self) -> list[GpuSample]: ...
+    @property
+    def available(self) -> bool: ...
+
+# metrics.py — the result of one run (the report + store unit)
+@dataclass(frozen=True)
+class TelemetrySummary:
+    available: bool
+    n_gpus: int
+    temp_c_max: float
+    sm_util_pct_mean: float
+    mem_util_pct_mean: float
+    power_w_mean: float
+    energy_j_per_token: float
+    util_imbalance: float          # max-GPU mean-util / mean-across-GPUs (expert skew proxy)
+    per_gpu_mean_util: tuple[float, ...]
+
+@dataclass(frozen=True)
+class BenchResult:
+    # latency
+    ttft_s: float
+    prefill_tok_per_s: float
+    decode_tok_per_s: float
+    tpot_p50_s: float
+    tpot_p95_s: float
+    total_s: float
+    n_decode_tokens: int
+    # bandwidth / efficiency (derived; roofline metrics)
+    bytes_per_token: int
+    achieved_hbm_bw: float         # bytes/sec
+    pct_of_peak_bw: float          # achieved / cluster.aggregate_hbm_bw
+    analytical_floor_tok_per_s: float   # from inferutil.latency.decode_latency
+    pct_of_floor: float            # decode_tok_per_s / analytical_floor_tok_per_s
+    # device
+    telemetry: TelemetrySummary
+
+# store.py — what one JSON file holds
+@dataclass(frozen=True)
+class RunRecord:
+    runid: str                     # caller-stamped (CLI provides timestamp); no internal clock
+    config: BenchConfig
+    env: dict                      # {gpu, n_gpus, driver_version, host}
+    result: BenchResult
+```
+
+`config_id(config)` = stable hash of `BenchConfig` fields → the `results/<name>/` lineage key.
+`bytes_per_token` comes from `model.active_params * dtype_bytes + seq_len *
+model.kv_bytes_per_token(kv_dtype_bytes)`, consistent with `latency.py`'s weight+KV terms.

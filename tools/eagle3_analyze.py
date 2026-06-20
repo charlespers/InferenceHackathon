@@ -23,6 +23,13 @@ Usage:
 from __future__ import annotations
 import argparse, json, os, re
 
+# Reference: the team's BEST measured non-spec baseline is bf16-TP8 = 85.7 tok/s (Alyssa,
+# docs/config-sweep.md), NOT FP8. FP8 is ~25% SLOWER at B=1 (FP8+EP 64.5, FP8-otf 69.0) —
+# overhead-dominated regime + dequant cost. EAGLE3's head verifier is pinned to the FP8 target,
+# so EAGLE3 MUST run on FP8: its matched baseline is FP8 (clean spec speedup S), but the real-world
+# win is EAGLE3-absolute vs this bf16 best. Report BOTH so FP8's handicap isn't hidden.
+BF16_BEST_TOK_S = 85.7
+
 
 def load_json(path):
     try:
@@ -111,8 +118,9 @@ def main():
     metrics_text = open(metrics_path).read() if os.path.exists(metrics_path) else ""
 
     ts_e, ts_b = tok_s(m_e), tok_s(m_b)
-    S = (ts_e / ts_b) if (ts_e and ts_b) else None
-    tau, tau_detail = parse_accept_length(metrics_text)
+    S = (ts_e / ts_b) if (ts_e and ts_b) else None          # clean spec speedup (matched FP8)
+    win_vs_bf16 = (ts_e / BF16_BEST_TOK_S) if ts_e else None  # real-world win vs the team's best
+    tau, tau_detail = parse_accept_length(metrics_text)     # MEASURED emitted/step (bonus included)
     V = (tau / S) if (tau and S) else None
 
     # route-aware go/no-go (decision rule from ROUTE_AWARE_DECISION.md)
@@ -132,7 +140,9 @@ def main():
     summary = {
         "mode": mode,
         "tok_s_eagle3": ts_e, "tok_s_baseline": ts_b,
-        "speedup_S": round(S, 3) if S else None,
+        "speedup_S_vs_fp8_matched": round(S, 3) if S else None,
+        "eagle3_abs_vs_bf16_best": round(win_vs_bf16, 3) if win_vs_bf16 else None,
+        "bf16_best_tok_s": BF16_BEST_TOK_S,
         "accept_length_tau": round(tau, 3) if tau else None,
         "verify_cost_V": round(V, 3) if V else None,
         "lossless_parity": parity.get("verdict") if isinstance(parity, dict) else None,
@@ -144,12 +154,13 @@ def main():
     print("=== EAGLE3 slot analysis (mode={}) ===".format(mode))
     print(f"  baseline tok/s : {ts_b}")
     print(f"  EAGLE3   tok/s : {ts_e}")
-    print(f"  speedup  S     : {summary['speedup_S']}  (matched {mode})")
+    print(f"  speedup  S     : {summary['speedup_S_vs_fp8_matched']}  (vs matched FP8 baseline, {mode})")
+    print(f"  EAGLE3 vs bf16 : {summary['eagle3_abs_vs_bf16_best']}x  (abs tok/s vs team best 85.7; FP8 is a ~25% handicap)")
     print(f"  accept-len tau : {summary['accept_length_tau']}   [{tau_detail.get('source','?')}]")
     print(f"  verify cost V  : {summary['verify_cost_V']}   (= tau/S; ~1 floor-bound, >1 tax real)")
     print(f"  lossless       : {summary['lossless_parity']}  (exact_ok={parity_ok})")
     print(f"  ROUTE-AWARE    : {verdict}")
-    if summary["speedup_S"] is None:
+    if summary["speedup_S_vs_fp8_matched"] is None:
         print("  !! speedup missing — check m_*.json for failed runs (server didn't serve?)")
 
     if a.out:

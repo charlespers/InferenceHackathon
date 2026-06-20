@@ -17,14 +17,14 @@ echo "=== slot open $(date -u +%H:%M:%S)UTC, min GPU free ${mf}MiB ===" >> "$RES
 cd "$SRC" || { echo "no $SRC"; touch /root/kbench_done; exit 1; }
 
 # label:file pairs — the standalone microbench TUs (each prints its own GB/s / %-peak / us)
-BENCHES="K5-fp8-MoE-decode:k5_experts.cu K5-int4-MoE-decode:k5_int4_bench.cu K1+K2-attn-decode:k12_bench.cu prefill-attn:prefill_attn.cu prefill-MoE:prefill_moe.cu"
+BENCHES="FUSED-decode-step-graph:decode_step.cu AUTOTUNE-sweep:autotune.cu K5-fp8-MoE-decode:k5_experts.cu K5-int4-MoE-decode:k5_int4_bench.cu K1+K2-attn-decode:k12_bench.cu prefill-attn:prefill_attn.cu prefill-MoE:prefill_moe.cu"
 for pair in $BENCHES; do
   label=${pair%%:*}; f=${pair##*:}
   echo "" >> "$RES"; echo "########## $label ($f) ##########" >> "$RES"
   [ -f "$f" ] || { echo "(missing)" >> "$RES"; continue; }
   bin="/tmp/kb_${f}.bin"
   if "$NVCC" -arch=sm_90a -O3 --use_fast_math -I . "$f" -o "$bin" >"/tmp/kc_$f" 2>&1; then
-    timeout 150 "$bin" >> "$RES" 2>&1 || echo "(run failed/timeout)" >> "$RES"
+    timeout 240 "$bin" >> "$RES" 2>&1 || echo "(run failed/timeout)" >> "$RES"
   else
     echo "COMPILE FAILED:" >> "$RES"; head -12 "/tmp/kc_$f" >> "$RES"
   fi

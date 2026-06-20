@@ -63,6 +63,30 @@ record its `e`. Target: push blended `e` from 0.46 toward 0.55+.
 ### E5 — Speculative decode acceptance (if a draft is wired)
 If EAGLE/MTP/n-gram drafting is available, measure `spec_accept_rate` (τ) + tok/s uplift via `x_summary`.
 
+### E6 — n-gram / prompt-lookup spec-decode (cheapest real multiplier)  ⟵ do right after E1
+Relaunch the E1 engine adding a speculative config (validate exact flag form vs vLLM 0.10.1):
+```bash
+vllm serve Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --tensor-parallel-size 8 --enable-expert-parallel \
+  --max-model-len 8192 --port 8001 --served-model-name qwen3-235b-a22b --gpu-memory-utilization 0.88 \
+  --speculative-config '{"method":"ngram","num_speculative_tokens":4,"prompt_lookup_max":3,"prompt_lookup_min":1}'
+# then re-run E1's measure.py at ctx 128/2048 and read acceptance + tok/s
+```
+Record: decode tok/s vs E1 (no-spec), `spec_accept_rate`/τ. **Go/no-go:** tok/s up AND acceptance >~25%.
+Keep the draft tree NARROW (num_speculative_tokens 3–4) — bushy trees go net-negative on this MoE. See
+`docs/next-levers-research.md` L1. Expect ~1.1–1.4× on structured prompts, less on prose.
+
+### E7 — INT4/AWQ expert weights (biggest byte win; gated on a checkpoint)
+First resolve the blocker: does an AWQ/GPTQ-INT4 `Qwen3-235B-A22B` checkpoint exist on HF for vLLM?
+```bash
+# search HF cache / hub for an int4/awq variant; if present, serve it (W4A16):
+vllm serve <int4-or-awq-qwen3-235b> --tensor-parallel-size 8 --enable-expert-parallel \
+  --max-model-len 8192 --port 8001 --served-model-name qwen3-235b-a22b --gpu-memory-utilization 0.88
+# bench vs the FP8 baseline (E1); then quality-gate vs FP8 (bitwise/PPL/task).
+```
+Record: decode tok/s vs FP8 (expect **~1.13–1.20×** e2e, not 2× — only the expert term halves) + the
+accuracy delta. If no checkpoint exists, note it and defer (quantizing 235B is a separate task).
+See `docs/next-levers-research.md` L2.
+
 ## Results Log  (GPU agent: append, newest first; format below)
 <!-- ### YYYY-MM-DD  E<n> — <one-line result>
      launch/config: ...

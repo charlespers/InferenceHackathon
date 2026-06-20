@@ -70,7 +70,7 @@ def main():
 
     K = args.top_k
     # per-(position,layer) fraction of the selected top-8 renorm mass held by top-k'
-    mass4, mass6 = [], []
+    mass2, mass4, mass6 = [], [], []
     per_layer_m4: dict[int, list] = {}
 
     with torch.inference_mode():
@@ -83,13 +83,16 @@ def main():
                 probs = torch.softmax(logits.float(), dim=-1)
                 top8 = torch.topk(probs, K, dim=-1).values  # [pos, 8], desc
                 denom = top8.sum(dim=-1).clamp_min(1e-9)
+                m2 = (top8[:, :2].sum(dim=-1) / denom)
                 m4 = (top8[:, :4].sum(dim=-1) / denom)
                 m6 = (top8[:, :6].sum(dim=-1) / denom)
+                mass2.append(m2.cpu().numpy())
                 mass4.append(m4.cpu().numpy())
                 mass6.append(m6.cpu().numpy())
                 per_layer_m4.setdefault(layer, []).append(float(m4.mean()))
             print(f"  [{pi+1}/{args.n_prompts}] {ids.shape[1]} pos, {len(rl)} MoE layers")
 
+    m2 = np.concatenate(mass2)
     m4 = np.concatenate(mass4)
     m6 = np.concatenate(mass6)
     n = len(m4)
@@ -98,25 +101,36 @@ def main():
         return float((arr > thr).mean())
 
     print(f"\n=== router concentration over {n} (position,layer) samples ===")
-    print(f"  mean top-4 mass (of selected 8): {m4.mean():.3f}   top-6 mass: {m6.mean():.3f}")
+    print(f"  mean mass of selected-8 held by: top2 {m2.mean():.3f} | "
+          f"top4 {m4.mean():.3f} | top6 {m6.mean():.3f}")
     table = {}
     for thr in (0.85, 0.90, 0.95):
-        f4, f6 = frac_above(m4, thr), frac_above(m6, thr)
-        table[str(thr)] = {"top4": f4, "top6": f6}
-        print(f"  thr {thr}:  P(top4 mass>{thr})={f4*100:5.1f}%   "
-              f"P(top6 mass>{thr})={f6*100:5.1f}%")
+        f2, f4, f6 = frac_above(m2, thr), frac_above(m4, thr), frac_above(m6, thr)
+        table[str(thr)] = {"top2": f2, "top4": f4, "top6": f6}
+        print(f"  thr {thr}:  P(top2>{thr})={f2*100:5.1f}%  "
+              f"P(top4>{thr})={f4*100:5.1f}%  P(top6>{thr})={f6*100:5.1f}%")
 
-    # Adaptive policy: k=4 if top4>0.9 ; elif k=6 if top6>0.95 ; else 8.
-    use4 = m4 > 0.90
-    use6 = (~use4) & (m6 > 0.95)
-    avg_k = (use4 * 4 + use6 * 6 + (~use4 & ~use6) * 8).mean()
-    expert_byte_frac = avg_k / K  # experts ~66% of decode bytes
-    e2e = 0.66 * expert_byte_frac + 0.34  # crude: only expert term shrinks
-    print(f"\n  adaptive policy (k4 if m4>.9; k6 if m6>.95; else 8):")
-    print(f"    tokens at k=4: {use4.mean()*100:.1f}%  k=6: {use6.mean()*100:.1f}%  "
-          f"k=8: {(~use4&~use6).mean()*100:.1f}%")
-    print(f"    avg experts/token: {avg_k:.2f}/8  -> expert bytes x{expert_byte_frac:.3f}")
-    print(f"    crude e2e decode time x{e2e:.3f}  (~{(1/e2e-1)*100:.0f}% faster, expert-term only)")
+    # SOTA policy (Dynamic Routing ACL'24 + fine-grained k_min floor): smallest k
+    # in {2,4,6,8} whose cumulative router mass > p. Floor k>=2 (head experts are
+    # low-redundancy in fine-grained MoE). Sweep p; report avg-k and byte savings.
+    print(f"\n  adaptive policy: k = min{{2,4,6,8}} s.t. mass>p, floor k>=2")
+    policy = {}
+    for p in (0.85, 0.90, 0.95):
+        use2 = m2 > p
+        use4 = (~use2) & (m4 > p)
+        use6 = (~use2) & (~use4) & (m6 > p)
+        use8 = ~use2 & ~use4 & ~use6
+        avg_k = (use2*2 + use4*4 + use6*6 + use8*8).mean()
+        byte_frac = avg_k / K            # experts ~66% of B=1 decode bytes
+        e2e = 0.66 * byte_frac + 0.34    # crude: only the expert term shrinks
+        policy[str(p)] = {"pct_k2": float(use2.mean()), "pct_k4": float(use4.mean()),
+                          "pct_k6": float(use6.mean()), "pct_k8": float(use8.mean()),
+                          "avg_k": float(avg_k), "expert_byte_frac": float(byte_frac),
+                          "crude_e2e_time_frac": float(e2e)}
+        print(f"    p={p}: k2 {use2.mean()*100:4.1f}% k4 {use4.mean()*100:4.1f}% "
+              f"k6 {use6.mean()*100:4.1f}% k8 {use8.mean()*100:4.1f}% | "
+              f"avg_k {avg_k:.2f} -> expert bytes x{byte_frac:.3f}, "
+              f"~{(1/e2e-1)*100:.0f}% faster (expert-term)")
 
     layers = sorted(per_layer_m4)
     band = lambda lo, hi: float(np.mean([np.mean(per_layer_m4[l]) for l in layers if lo <= l < hi]))
@@ -127,13 +141,10 @@ def main():
 
     out = {
         "n_samples": n,
+        "mean_top2_mass": float(m2.mean()),
         "mean_top4_mass": float(m4.mean()), "mean_top6_mass": float(m6.mean()),
         "frac_above": table,
-        "adaptive_policy": {
-            "pct_k4": float(use4.mean()), "pct_k6": float(use6.mean()),
-            "avg_k": float(avg_k), "expert_byte_frac": float(expert_byte_frac),
-            "crude_e2e_time_frac": float(e2e),
-        },
+        "adaptive_policy_by_p": policy,
         "per_layer_top4_bands": bands,
     }
     json.dump(out, open(args.out, "w"), indent=2)

@@ -35,6 +35,17 @@ __device__ void stream_weight_tile(const void* hbm_src, void* smem_dst, int byte
 __device__ void expert_gemv(const half* x, const void* w_smem, const half* scales,
                              half* y, int rows, int k);
 
+// TILE_ROWS: a PLACEHOLDER reduced width, not the real MOE_INTER_RANK=1536. The smoke test crashed
+// with an illegal memory access because both stream_weight_tile call sites below hardcoded bytes=0
+// (a literal unwired placeholder -- 0 bytes ever copied) while expert_gemv read as if the FULL
+// [1536 x 4096] weight matrix (6.29 MB) were smem-resident, which can't fit (SMs have ~228KB). The
+// real fix is the full STAGES/TILE_K multi-tile loop k5_experts_pipelined.cu already has for its
+// __global__ kernel -- porting that loop structure to this call site is the next real task, not
+// done here. This is a SMALLER, honest placeholder (8 rows, 8*4096=32KB smem) that actually fits and
+// lets the scheduling/sync mechanism (grid.sync, pipeline acquire/wait) be smoke-tested without
+// crashing -- it does NOT process the real MoE width.
+#define TILE_ROWS 8
+
 // The persistent megakernel. grid = N_REDUCE_BLOCKS + (many stream/compute blocks). One launch, loops 94 layers.
 extern "C" __global__ void k6_overlap_decode(half* act,                 // residual stream (on-chip across layers)
                                              const void* const* layer_weights, // [94] per-layer weight bases (HBM)
@@ -57,14 +68,14 @@ extern "C" __global__ void k6_overlap_decode(half* act,                 // resid
             multimem_allreduce_8kb(mc_buf, /*n=*/4096);          // EXACT in-switch reduce on a few SMs
         } else {
             pipe.producer_acquire();
-            stream_weight_tile(layer_weights[L]/*MoE gate/up*/, smem, /*bytes=*/0, pipe);  // HBM read in flight
+            stream_weight_tile(layer_weights[L]/*MoE gate/up*/, smem, TILE_ROWS * 4096, pipe);  // HBM read in flight
             pipe.producer_commit();
         }
         grid.sync();                                              // gate the dependent multiply on the reduced act
         // now act holds the reduced attention output AND the MoE gate/up weights are smem-resident:
         if (!is_reduce) {
             pipe.consumer_wait();                                  // wait for this block's own prefetch to land
-            expert_gemv(act, smem, layer_scales[L], act, /*rows*/1536, 4096);  // MoE gate/up
+            expert_gemv(act, smem, layer_scales[L], act, /*rows*/TILE_ROWS, 4096);  // MoE gate/up (PLACEHOLDER width)
             pipe.consumer_release();
         }
         grid.sync();
@@ -75,7 +86,7 @@ extern "C" __global__ void k6_overlap_decode(half* act,                 // resid
             multimem_allreduce_8kb(mc_buf, 4096);
         } else if (L + 1 < num_layers) {
             pipe.producer_acquire();
-            stream_weight_tile(layer_weights[L + 1]/*next QKV*/, smem, 0, pipe);  // next-layer weights in flight
+            stream_weight_tile(layer_weights[L + 1]/*next QKV*/, smem, TILE_ROWS * 4096, pipe);  // next-layer QKV (PLACEHOLDER width)
             pipe.producer_commit();
         }
         grid.sync();

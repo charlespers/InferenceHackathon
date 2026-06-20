@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
   CKR(cudaMemcpy(d_scales, h_scales.data(), num_layers * sizeof(half*), cudaMemcpyHostToDevice));
 
   // ---- occupancy check against the REAL kernel (not the earlier proxy shape) before committing to launch ----
-  int smem_bytes = K6_INTER;   // matches expert_gemv's w_smem tile size assumption (rough, fp8 bytes)
+  int smem_bytes = 8 /*TILE_ROWS, matching k6_overlap_decode.cu's placeholder*/ * HIDDEN;  // 32KB
   int threads_per_block = 256;
   int max_blocks_per_sm = 0;
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, k6_overlap_decode, threads_per_block, smem_bytes);

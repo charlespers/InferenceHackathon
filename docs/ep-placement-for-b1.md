@@ -58,6 +58,18 @@ sets) which `tools/routing_analysis.py` can emit. `routing_stats.json` already h
 (token-to-token transitions) — useful for the *predictor*, but per-step placement needs the *within-token*
 co-activation, a different statistic.
 
+## Demonstrated (`tools/placement_b1.py`, synthetic Zipf+co-activation traces)
+| placement | e_step_busiest (B=1 latency) | cross_gpu_frac (team's proxy) |
+|---|---|---|
+| round-robin | 2.937 | 0.839 |
+| greedy-by-count (team `optimizer.rs`) | 2.464 | 0.888 |
+| co-activation-aware (minimize e_step_busiest) | **2.250** | 0.908 |
+| + predictive replica selection (16 hot) | **2.212** | — |
+**The objectives ANTI-correlate:** the placements that lower the B=1 metric (e_step_busiest) *raise*
+`cross_gpu_frac`. So optimizing the team's proxy would **pick a worse B=1 placement** — concrete proof that
+B=1 needs the per-step-busiest objective, not average-load/locality. (`placement_b1.py` accepts real per-token
+expert traces too: `--traces token_experts.json`.)
+
 ## Honest bound
 Even an optimal EP placement (predictive replica selection → busiest ≈ 1.5, heavy replication → →1) does not
 beat pure TP8 (busiest = 1, no all-to-all, fewer collectives). **Placement is the EP-path mitigation; the

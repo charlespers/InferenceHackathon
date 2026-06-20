@@ -32,7 +32,23 @@ Record: the **8–16 KB all-reduce latency (µs)** and all-to-all latency. Then 
 **Go signal:** if all-reduce ≤ ~2µs → weight-bound → prioritize E7 (int4) + E4 (kernel); if ≥ ~4µs →
 comms-bound → prioritize route-prefetch (`engine/routing/scheduler.rs`) + one-shot all-reduce, then E6 spec.
 
-### E0b — Comms tuning sweep  ⟵ NEW #1 (E0 showed comms-bound: 16µs all-reduce → 3.0ms TPOT)
+### E-attr — Split the floor (Nsight Systems)  ⟵ DO BEFORE optimizing it
+Two data rounds show the engine is **floor-bound** (vLLM 16% of roofline; the adaptive engine 2.5%), and the
+real TPOT decomposes to ~60% **unmodeled overhead**, 26% comms, 14% weight (`overhead-attribution.md`,
+`results-reaction-02.md`). Before tuning comms OR kernels, **split the floor** so the #1 lever is known:
+```bash
+# trace ~20 decode steps on the bf16-TP8 (or fp8-TP8) server:
+nsys profile -t cuda,nvtx,nccl -d 20 -o /root/decode_trace \
+  python3 bench/measure.py --base http://localhost:8001 --model q --ctx 512 --decode 64
+nsys stats --report cuda_gpu_kern_sum,nccl_sum /root/decode_trace.nsys-rep | head -40
+# also: relaunch with --enforce-eager, re-measure TPOT (delta = launch/host the graph hides)
+```
+Record: % of a step in MoE/attn kernels (+ their achieved DRAM BW) vs NCCL all-reduce vs idle gaps.
+**Branch:** NCCL dominates → E0b is #1; MoE kernels at low BW → the K5 kernels are #1 (vLLM fused_moe ~0.16
+vs K5 0.46); idle gaps → fast-path/sampling. **Weight levers (fp8/int4/adaptive-topk) stay LAST until the
+floor is down** — `ab_adaptive` proved they're invisible while floor-bound.
+
+### E0b — Comms tuning sweep  ⟵ #1 IF E-attr says comms (E0 showed 16µs all-reduce → 3.0ms)
 Use the **bf16 TP8** baseline (current best 85.7 tok/s / 11.67ms; bf16 has no 192 constraint so pure TP8
 launches). Each variant is env + relaunch; record TPOT. Goal: cut the 16µs all-reduce → shrink the ~3ms
 comms term, and **diagnose comms-vs-overhead** (if TPOT barely moves, the 11.67ms is mostly kernel/overhead

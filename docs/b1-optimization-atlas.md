@@ -3,12 +3,17 @@
 The complete map of the converged team effort (my docs + `research/` + `tools/`). Status: ✅measured ·
 📊projected · 🧪experiment-ready · 🔬research. Current: **bf16-TP8 85.7 tok/s / 777ms TTFT / 2271ms@128tok**.
 
-## 🎯 NORTH STAR: 1000 tok/s — UPDATED by measured data (`results-reaction-04.md`, `1000-experiments.md`)
-Squeeze round changed the picture: **comms is BARRIER-bound (~16µs/collective, can't make it faster — in-kernel
-recursive-doubling is worse), int4 RULED OUT at B=1 (0.58×), spec is the lever.** So:
-- **Engine: graphs + scheduler-free loop + fp8-K5 (e→1) + big-tree spec amortizes the barrier-bound comms → ~745–870 LOSSLESS** (`ladder_to_1000.py --C 16 --ncoll 188`; route-aware big-tree verify adds ~15%, now first-order).
-- **The 300→1000 leap = ONE of:** (a) **proxy/stale-TP** hides the comms (LOOP-C; quality-gated — use **DirectProxy** as the predictor to preserve routing) → ~1218; (b) **EAGLE3 realized ×3.8** (trained draft) → ~1003; (c) a *lossless* EP collective-count cut (flagged uncertain — 2 TP ARs are intrinsic, DP-attn is a net loss).
-- **int4 / count-via-DP-attn / making-the-AR-faster are dead ends.** **Make-or-break experiments (`1000-experiments.md`):** #1 comms C (`measure_collective.sh`, no model load), #2 EAGLE3 realized S (09:45), #3 proxy/stale-TP quality (LOOP-C).
+## 🎯 NORTH STAR: 1000 tok/s — LOSSLESS path (measured-data-grounded: `results-reaction-04/05.md`, `1000-experiments.md`)
+Measured: **comms is BARRIER-bound (~16µs, can't fake it — stale/predicted-TP MEASURED DEAD 0.000–0.025, info
+barrier), int4 RULED OUT (0.58×), spec is the lever.** But the comms is hideable **losslessly**:
+- **Engine:** graphs + scheduler-free loop + fp8-K5(e→1) + **exact deferred-overlap** (LOOP-C — overlap the EXACT
+  NVLS all-reduce with the next op's weight stream, different HW paths; LOSSLESS) + **big-tree spec** (route-aware
+  verify, first-order here). `ladder_to_1000.py --C 16 --overlap --tau-mult 2.86` → **~938** (gap closed by EAGLE3
+  ≥×3.05); **`--C 4 --overlap`** (multimem in-switch) → full hide → **≫1000**.
+- **The make-or-break (`1000-experiments.md`):** #1 **comms C** (`measure_collective.sh`) — multimem in-switch
+  ≤~4µs ⇒ deferred-overlap FULLY hides comms; #2 **EAGLE3 realized spec S** (the dominant multiplier); #3 the
+  **deferred-overlap kernel** (LOOP-C's schedule + my NVLS/megakernel K6). All lossless, no quality risk.
+- **Dead ends:** int4, stale/proxy-TP, DP-attn count-cut, making-the-AR-faster-without-overlap.
 - **Cheap first ship (~300, lossless today):** spec + prefix-cache on bf16-TP8.
 
 ## The decode-step decomposition (the spine — `overhead-attribution.md`)

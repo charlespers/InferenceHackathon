@@ -20,20 +20,27 @@ Orthogonal to — and stacks with — the expert/weight/comms levers others own
 - Serve: FP8 weights + `--enable-expert-parallel` + CUDA graphs (no `--enforce-eager`),
   `--max-num-seqs 1`, `--max-model-len 36864`, TP=8, port **8088**.
 
-## Hypothesis / crossover
+## Hypothesis / crossover (refined by roofline — see tools/kv_roofline.py)
 
-Blog reports decode break-even ≈ **7k tokens** for dense Llama-3.1-8B (ITL slope
-→ 54% of bf16). Qwen3-235B is **MoE with only ~22B active params**, so compute per
-decode step is low relative to the KV read ⇒ the KV-read fraction of each step is
-*larger* ⇒ we expect the crossover **at or below 7k**, and a *bigger* TPOT win at
-32k than the dense-8B number. To test:
+Initial guess was "crossover ≤7k because MoE has low active compute." The roofline
+(real config: 94 layers, **GQA with only 4 KV heads**, head_dim 128, 22B active fp8
+weights) **corrects this**: Qwen3-235B's KV cache is *small per token* (188 KB bf16
+/ 94 KB fp8) relative to the 22 GB/token weight read, so the KV-read fraction is low
+until long context. Bandwidth-bound prediction:
 
-| ctx    | expectation |
-|--------|-------------|
-| 128    | neutral / slight fp8 loss (quant overhead, tiny KV) |
-| 2 048  | ~neutral, near break-even floor |
-| 8 192  | fp8 ahead on TPOT (past crossover) |
-| 32 768 | fp8 clearly ahead; largest decode tok/s gain |
+| ctx    | KV/(wt+KV) | roofline TPOT win | note |
+|--------|-----------|-------------------|------|
+| 128    | 0.1%  | 0.1%  | negligible |
+| 2 048  | 1.8%  | 0.9%  | negligible |
+| 8 192  | 6.7%  | 3.3%  | modest |
+| 16 384 | 12.5% | 6.3%  | **crossover region** |
+| 32 768 | 22.3% | 11.1% | clear (ceiling) |
+
+So crossover is **~16k, later than the dense-8B 7k** — GQA-4 shrinks the KV term.
+And these are bandwidth-bound *ceilings*; real wall TPOT carries TP+MoE comms, so the
+measured latency win is SMALLER. The surer payoff for this model is **memory** (half
+KV footprint ⇒ longer context fits / headroom for other levers). The A/B measures
+which effect dominates in practice. Sweep ctx 128/2k/8k/16k/32k.
 
 ## Harness
 

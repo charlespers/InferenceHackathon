@@ -89,7 +89,7 @@ fi
 grep -iE "flashattention|FlashAttn|FA3|attention backend|backend" "$LOG" | tail -3 || true
 
 # --- ctx sweep: the FP8-KV win grows with context length. Deadline-aware. ---
-for ctx in 128 2048 8192 32768; do
+for ctx in 128 2048 8192 16384 32768; do   # 16k brackets the roofline crossover
   left=$(( $(secs_to_slot_end) - GUARD_MARGIN ))
   need=$(( ctx >= 32768 ? 100 : 45 ))   # rough per-point budget
   if [ "$left" -lt "$need" ]; then

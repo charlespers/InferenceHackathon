@@ -84,8 +84,10 @@ impl PrefetchSink for RecordingSink {
 // ---------------------------------------------------------------------------
 
 pub struct PlacementMap {
-    /// placement[layer][expert_id] = gpu_id.
+    /// primary[layer][expert_id] = gpu_id.
     data: Vec<Vec<usize>>,
+    /// replica[layer][expert_id] = Some(gpu_id) for hot experts with a second copy.
+    replicas: Vec<Vec<Option<usize>>>,
     pub n_gpus: usize,
     pub n_experts: usize,
 }
@@ -95,15 +97,48 @@ impl PlacementMap {
         let data = (0..n_layers)
             .map(|_| (0..n_experts).map(|e| e % n_gpus).collect())
             .collect();
-        Self { data, n_gpus, n_experts }
+        let replicas = vec![vec![None; n_experts]; n_layers];
+        Self { data, replicas, n_gpus, n_experts }
     }
 
+    /// Build from pre-computed placement + replica tables.
+    /// `placement[layer][expert] = primary_gpu`
+    /// `replicas[layer][expert]  = Some(replica_gpu)` or `None`
+    pub fn from_tables(
+        placement: Vec<Vec<usize>>,
+        replicas: Vec<Vec<Option<usize>>>,
+        n_gpus: usize,
+        n_experts: usize,
+    ) -> Self {
+        Self { data: placement, replicas, n_gpus, n_experts }
+    }
+
+    /// Primary GPU for this expert.
     pub fn gpu_for(&self, layer: usize, expert_id: ExpertId) -> usize {
         self.data[layer][expert_id as usize % self.n_experts]
     }
 
+    /// All GPUs hosting this expert (primary + optional replica).
+    pub fn gpus_for(&self, layer: usize, expert_id: ExpertId) -> (usize, Option<usize>) {
+        let idx = expert_id as usize % self.n_experts;
+        (self.data[layer][idx], self.replicas[layer][idx])
+    }
+
+    /// Whether this expert is replicated at this layer.
+    pub fn is_replicated(&self, layer: usize, expert_id: ExpertId) -> bool {
+        self.replicas[layer][expert_id as usize % self.n_experts].is_some()
+    }
+
     pub fn set(&mut self, layer: usize, expert_id: ExpertId, gpu_id: usize) {
         self.data[layer][expert_id as usize] = gpu_id;
+    }
+
+    pub fn set_replica(&mut self, layer: usize, expert_id: ExpertId, gpu_id: usize) {
+        self.replicas[layer][expert_id as usize] = Some(gpu_id);
+    }
+
+    pub fn n_replicated_experts(&self) -> usize {
+        self.replicas.iter().flat_map(|l| l.iter()).filter(|r| r.is_some()).count()
     }
 }
 
@@ -147,14 +182,15 @@ impl<S: PrefetchSink> PrefetchScheduler<S> {
     pub fn on_prediction(&mut self, prediction: &ExpertPrediction) {
         let target_layer = prediction.layer;
         for &expert_id in &prediction.experts {
-            let gpu_id = self.placement.gpu_for(target_layer, expert_id);
-            // Warm cache lines first, then issue early dispatch.
-            self.sink.submit(PrefetchAction::WarmExpert {
-                layer: target_layer, expert_id, gpu_id,
-            });
-            self.sink.submit(PrefetchAction::EarlyDispatch {
-                layer: target_layer, expert_id, gpu_id,
-            });
+            let (primary, replica) = self.placement.gpus_for(target_layer, expert_id);
+            for &gpu_id in &[Some(primary), replica].into_iter().flatten().collect::<Vec<_>>() {
+                self.sink.submit(PrefetchAction::WarmExpert {
+                    layer: target_layer, expert_id, gpu_id,
+                });
+                self.sink.submit(PrefetchAction::EarlyDispatch {
+                    layer: target_layer, expert_id, gpu_id,
+                });
+            }
         }
         self.total_prefetched += prediction.experts.len() as u64;
         self.pending.push_back(PendingPrefetch {
@@ -218,8 +254,24 @@ mod tests {
         sched.on_prediction(&pred);
 
         let actions = sched.sink.drain();
-        // 8 experts × 2 actions (WarmExpert + EarlyDispatch) = 16
+        // 8 experts × 2 actions (WarmExpert + EarlyDispatch), no replicas = 16
         assert_eq!(actions.len(), 16);
+    }
+
+    #[test]
+    fn scheduler_issues_extra_actions_for_replicated_experts() {
+        let sink = RecordingSink::new();
+        let mut placement = PlacementMap::round_robin(10, 8, 128);
+        // Replicate expert 0 (layer 1) onto GPU 4
+        placement.set_replica(1, 0, 4);
+        let mut sched = PrefetchScheduler::new(sink, placement);
+
+        let pred = make_prediction(1, vec![0, 16, 32, 48, 64, 80, 96, 112]);
+        sched.on_prediction(&pred);
+
+        let actions = sched.sink.drain();
+        // expert 0 has replica → 4 actions; 7 others → 2 each = 4 + 14 = 18
+        assert_eq!(actions.len(), 18);
     }
 
     #[test]

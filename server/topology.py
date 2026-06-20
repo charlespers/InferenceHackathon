@@ -1,4 +1,8 @@
+import json
 import subprocess
+from pathlib import Path
+
+OPTIMIZED_PLACEMENT_PATH = Path("/alloc/data/optimized_placement.json")
 
 
 def _query_gpus() -> list[dict]:
@@ -38,17 +42,38 @@ def _query_gpus() -> list[dict]:
         ]
 
 
-def build_topology(num_layers: int = 94, experts_per_layer: int = 128) -> dict:
-    """Live cluster map: real GPU stats from nvidia-smi + expert placement."""
-    gpus = _query_gpus()
-    num_gpus = len(gpus)
-    placement = {
+def _load_placement(num_layers: int, experts_per_layer: int, num_gpus: int) -> dict:
+    """Use optimized placement if available, else fall back to round-robin."""
+    if OPTIMIZED_PLACEMENT_PATH.exists():
+        try:
+            with open(OPTIMIZED_PLACEMENT_PATH) as f:
+                data = json.load(f)
+            raw = data["placement"]
+            return {
+                str(layer): {
+                    str(e): int(raw.get(str(layer), {}).get(str(e), e % num_gpus))
+                    for e in range(experts_per_layer)
+                }
+                for layer in range(num_layers)
+            }
+        except Exception:
+            pass
+    return {
         str(layer): {str(e): e % num_gpus for e in range(experts_per_layer)}
         for layer in range(num_layers)
     }
+
+
+def build_topology(num_layers: int = 94, experts_per_layer: int = 128) -> dict:
+    """Live cluster map: real GPU stats + optimized expert placement."""
+    gpus = _query_gpus()
+    num_gpus = len(gpus)
+    placement = _load_placement(num_layers, experts_per_layer, num_gpus)
+    source = "optimized" if OPTIMIZED_PLACEMENT_PATH.exists() else "round-robin"
     return {
         "gpus": gpus,
         "num_layers": num_layers,
         "experts_per_layer": experts_per_layer,
         "placement": placement,
+        "placement_source": source,
     }

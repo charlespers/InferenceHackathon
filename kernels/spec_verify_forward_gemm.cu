@@ -268,9 +268,9 @@ int main(int argc, char** argv) {
     { "lm_head         [18992,4096]",   VOC_R,        HIDDEN,    1        },
   };
 
-  const int Ms[]={1,2,4,8}; const int NM=4;
+  const int Ms[]={1,2,4,8,16,32}; const int NM=6;   // M-sweep: tree widths 1..32 (verify columns)
   const int PADM=16;                // deployed verify pads the draft batch to the kernel's efficient tile
-  const int MMAX=16;                // device buffers sized for the padded width
+  const int MMAX=32;                // device buffers sized for the widest swept M (32)
   const int WARM=20, IT=100;
 
   // accumulate modeled per-rank forward time at each (prec, M):

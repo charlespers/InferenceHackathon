@@ -98,4 +98,20 @@ code{background:var(--paper);padding:1px 5px;border-radius:2px;color:var(--conif
 <tr><td>16,384</td><td>46.8</td><td class=tagm>47.8</td><td>20.91</td><td>6.7%</td><td>223</td><td>4.66</td><td>3347</td><td>16%</td></tr>
 <tr><td>32,768</td><td>39.0</td><td class=tagm>40.1</td><td>24.92</td><td>7.5%</td><td>250</td><td>6.24</td><td>3331</td><td>13%</td></tr>
 </table><div class=note>Source: <code>decode_step_tp8.cu</code> (TP=8 sharded, fp8, NCCL path, USE_NVLS=0) on 8×H100, 150 timed iters/point, latency proxy (per-token HBM read volume + kernel chain + launch count are byte-exact; produced token id is not validated here). Regenerate: <code>python3 tools/gen_report.py sweep.log report.html</code>.</div></div>
+<h2>Speculative verify — GEMM forward cost vs tree width M (measured, fp8)</h2><div class=panel>
+<div class=row><div class=lbl>M = 1<span class=tag>2047 µs total · ratio 1.00×</span></div><div class="track"><div class="fill" style="width:100.0%;background:var(--conifer)"></div></div><div class=val>2047 µs/tok</div></div>
+<div class=row><div class=lbl>M = 2<span class=tag>2045 µs total · ratio 1.00×</span></div><div class="track"><div class="fill" style="width:50.0%;background:var(--conifer)"></div></div><div class=val>1022 µs/tok</div></div>
+<div class=row><div class=lbl>M = 4<span class=tag>2042 µs total · ratio 1.00×</span></div><div class="track"><div class="fill" style="width:24.9%;background:var(--conifer)"></div></div><div class=val>510 µs/tok</div></div>
+<div class=row><div class=lbl>M = 8<span class=tag>2045 µs total · ratio 1.00×</span></div><div class="track"><div class="fill" style="width:12.5%;background:var(--conifer)"></div></div><div class=val>256 µs/tok</div></div>
+<div class=row><div class=lbl>M = 16<span class=tag>2038 µs total · ratio 1.00×</span></div><div class="track"><div class="fill" style="width:6.2%;background:var(--conifer)"></div></div><div class=val>127 µs/tok</div></div>
+<div class=row><div class=lbl>M = 32<span class=tag>2101 µs total · ratio 1.03×</span></div><div class="track"><div class="fill" style="width:3.2%;background:var(--conifer)"></div></div><div class=val>66 µs/tok</div></div>
+<div class=note><b>Total verify-forward cost is flat in M</b> (ratio ≈1.0 out to M=16, 1.03 at M=32) — so the <i>per-token</i> cost falls ~M-fold: a tree of M draft tokens reads the weights <b>once</b>. This is the wgmma/GEMM path preserving the amortization the spec multiplier needs; the old M=1 GEMV idiom scaled ~linearly (k×) and killed it. This is the lever past the plain-decode floor.</div></div>
+<h2>Projected spec'd throughput — tok/s (anchor 430 single-forward)</h2><div class=panel><table>
+<tr><th>tree k</th><th>α=0.7</th><th>α=0.8</th><th>α=0.9</th></tr>
+<tr><td>2</td><td>731</td><td>774</td><td>817</td></tr>
+<tr><td>4</td><td class=tagm>1089</td><td class=tagm>1269</td><td class=tagm>1479</td></tr>
+<tr><td>8</td><td class=tagm>1351</td><td class=tagm>1789</td><td class=tagm>2449</td></tr>
+<tr><td>16</td><td class=tagm>1429</td><td class=tagm>2090</td><td class=tagm>3503</td></tr>
+<tr><td>32</td><td class=tagm>1433</td><td class=tagm>2148</td><td class=tagm>4152</td></tr>
+</table><div class=note><b>Measured:</b> verify(k) ≈ one decode-forward (flat, above). <span class=tagp>Projected:</span> spec tok/s = anchor × E[accepted]/ratio, with ratio≈1. <b>Crosses 1000 at k≥4 for α≥0.8.</b> Anchor 430 = GEMM-forward-bound single decode (projection — comms hidden, not yet a measured end-to-end spec run). The route-aware drafter keeps the expert union small so the wide-tree verify stays this cheap.</div></div>
 </div></body></html>

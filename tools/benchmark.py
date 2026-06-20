@@ -41,7 +41,7 @@ PROMPTS = [
 ]
 
 
-def stream_request(base: str, prompt: str, max_tokens: int) -> dict:
+def stream_request(base: str, prompt: str, max_tokens: int, user: str | None = None) -> dict:
     payload = json.dumps({
         "model": "qwen3-235b-a22b",
         "messages": [{"role": "user", "content": prompt}],
@@ -50,10 +50,13 @@ def stream_request(base: str, prompt: str, max_tokens: int) -> dict:
         "chat_template_kwargs": {"enable_thinking": False},
     }).encode()
 
+    hdrs = {"Content-Type": "application/json"}
+    if user:
+        hdrs["X-User"] = user
     req = urllib.request.Request(
         f"{base}/v1/chat/completions",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=hdrs,
         method="POST",
     )
 
@@ -110,18 +113,20 @@ def main():
     ap.add_argument("--n", type=int, default=10, help="number of prompts to run")
     ap.add_argument("--tokens", type=int, default=100, help="max tokens per response")
     ap.add_argument("--out", default=None, help="optional JSON output file")
+    ap.add_argument("--user", default=None, help="your name — shown in /api/tasks during the run")
     args = ap.parse_args()
 
     prompts = (PROMPTS * ((args.n // len(PROMPTS)) + 1))[:args.n]
+    user = args.user or "benchmark"
 
-    print(f"Benchmarking {args.base}  ({args.n} prompts, {args.tokens} tokens each)")
+    print(f"Benchmarking {args.base}  ({args.n} prompts, {args.tokens} tokens each, user={user})")
     print(f"{'#':>3}  {'TTFT ms':>10}  {'tok/s':>8}  {'tokens':>7}  {'hit%':>6}  {'total s':>8}")
     print("─" * 54)
 
     results = []
     for i, prompt in enumerate(prompts):
         try:
-            r = stream_request(args.base, prompt, args.tokens)
+            r = stream_request(args.base, prompt, args.tokens, user)
             results.append(r)
             hit_str = f"{r['predictor_hit_rate']*100:.1f}%" if r.get("predictor_hit_rate") is not None else "  N/A"
             print(f"{i+1:>3}  {r['ttft_ms']:>10.1f}  {r['decode_tok_per_s']:>8.1f}"

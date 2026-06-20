@@ -11,7 +11,7 @@ interface Props {
 export function ChatPane({ base, onTurn }: Props) {
   const chat = useChatStream(base);
   const [text, setText] = useState("");
-  const [model, setModel] = useState("qwen3-235b-a22b");
+  const [model, setModel] = useState("qwen3-235b-fp8");
   const [temperature, setTemperature] = useState(0.7);
   const [maxTokens, setMaxTokens] = useState(256);
 

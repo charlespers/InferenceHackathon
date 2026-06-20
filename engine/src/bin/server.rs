@@ -382,7 +382,7 @@ async fn health() -> Json<Value> {
 async fn models() -> Json<Value> {
     Json(json!({
         "object": "list",
-        "data": [{"id": "qwen3-235b-a22b", "object": "model"}]
+        "data": [{"id": "qwen3-235b-fp8", "object": "model"}]
     }))
 }
 
@@ -433,8 +433,6 @@ async fn chat_completions(
 
     // Always stream internally; non-streaming collects and wraps.
     body["stream"] = json!(true);
-    // Ensure thinking mode disabled for Qwen3
-    body["model"] = json!("/alloc/data/Qwen3-235B-A22B");
     {
         let ktw = body["chat_template_kwargs"].as_object_mut();
         if let Some(m) = ktw {

@@ -1,5 +1,6 @@
 from typing import Iterator
 from server.schemas import ChatRequest
+from server.optimization_telemetry import summary_fields
 
 _WORDS = ("Routing across eight H100s with expert parallelism keeps "
           "per-token latency low at batch size one. ").split()
@@ -71,6 +72,11 @@ def mock_stream(req: ChatRequest, topo: dict) -> Iterator[dict]:
                 "spec": {"proposed": proposed, "accepted": accepted},
             },
         }
+    # Make the optimization legible (docs/console-telemetry-spec.md): derive the floor breakdown / regime /
+    # ceiling-% from this engine's per-token latency so the UI can show WHERE the time goes (overhead-dominated
+    # for vLLM; the floor cut for conifer). weight_dtype optional per profile (default bf16).
+    opt = summary_fields(per_tok_ms, round(1000.0 / per_tok_ms, 1),
+                         weight_dtype=prof.get("weight_dtype", "bf16"))
     yield {
         "x_summary": {
             "engine": prof["label"],
@@ -80,5 +86,6 @@ def mock_stream(req: ChatRequest, topo: dict) -> Iterator[dict]:
             "completion_tokens": n,
             "spec_enabled": spec_on,
             "spec_accept_rate": round(accepted_total / proposed_total, 3),
+            **opt,
         }
     }

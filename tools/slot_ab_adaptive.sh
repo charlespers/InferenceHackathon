@@ -41,6 +41,9 @@ run_mode () {  # $1=label  $2=ENABLE
     PYTHONPATH=src python3 tools/measure_baseline.py --base http://localhost:$PORT \
       --model qwen3 --decode 64 --repeats 2 --out /alloc/data/ab_$mode.json >> "$LOG" 2>&1
     RESULTS+=(/alloc/data/ab_$mode.json)
+    python3 tools/quality_probe.py --base http://localhost:$PORT --model qwen3 \
+      --tokens 96 --out /alloc/data/q_$mode.json >> "$LOG" 2>&1   # for the quality gate
+    RESULTS+=(/alloc/data/q_$mode.json)
     echo "--- $mode adaptive_topk debug ---" >> "$LOG"
     grep -i 'adaptive_topk' /alloc/data/vllm_$mode.log | tail -4 >> "$LOG"
   fi
@@ -55,6 +58,14 @@ if [ "$freemb" -gt 65000 ]; then
     || echo "skip adaptive (out of slot time)" >> "$LOG"
 else
   echo "GPUs busy (${freemb}MB free) -> cannot launch our vLLM; skipping A/B" >> "$LOG"
+fi
+
+# Quality gate: does adaptive (k=4) match baseline (k=8) greedy output?
+if [ -f /alloc/data/q_baseline.json ] && [ -f /alloc/data/q_adaptive.json ]; then
+  echo "=== quality gate (baseline vs adaptive output) ===" >> "$LOG"
+  python3 tools/quality_compare.py /alloc/data/q_baseline.json \
+    /alloc/data/q_adaptive.json --out /alloc/data/quality_gate.json >> "$LOG" 2>&1
+  RESULTS+=(/alloc/data/quality_gate.json)
 fi
 
 # Auto-share results to origin/djamoils-results (isolated worktree).

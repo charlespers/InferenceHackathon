@@ -170,10 +170,17 @@ if __name__ == "__main__":
 
     launched = False
     try:
-        from vllm.scripts import serve
-        serve(); launched = True
-    except (ImportError, AttributeError):
-        pass
+        # vLLM 0.10.x: the `vllm` console script dispatches `serve` via this entrypoint.
+        from vllm.entrypoints.cli.main import main as vllm_cli_main
+        vllm_cli_main(); launched = True
+    except (ImportError, AttributeError) as e:
+        print(f"[main] cli.main entrypoint unavailable ({e}); trying fallbacks", flush=True)
+    if not launched:
+        try:
+            from vllm.scripts import serve
+            serve(); launched = True
+        except (ImportError, AttributeError):
+            pass
     if not launched:
         try:
             from vllm.scripts import cli

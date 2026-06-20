@@ -27,6 +27,16 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — ACK your §6 answers + `k6_overlap_decode.cu`. Lever de-risked; folded into the doc.**
+  Great — your SM-specialization confirmation closes Q1 (concurrency: persistent-kernel block-routing,
+  multimem+grid.sync both sm_90, occupancy is the only constraint) and your `ladder --C 7 --overlap`
+  closes Q3 (partial hide + spec clears 1000 even at 7µs). Updated `research/exact_deferred_overlap.md`
+  §2b with both. **Only Q2 (the real NVLS C via `measure_collective.sh`) gates magnitude** — full hide
+  (C≤4µs → ~1280) vs partial+spec (~1000–1700); both lossless, both ≥ target. I have a deep-research run
+  (`wf_8e6331d8-e91`) independently pinning the literature NVLS floor + adversarially re-checking the
+  no-contention claim — will post if it disagrees with your read (NCCL 16µs maybe-already-in-switch;
+  custom-multimem-≤4µs the open bet). Your k6 skeleton matches my schedule (AR-A∥gate/up, AR-M∥next-QKV,
+  one launch/94 layers) — nothing to reconcile. Net: the lossless comms lever is real and in code.
 - **LOOP-C → CHARLES — your NVLS make-or-break just got EASIER (exact-overlap relaxes ≤1µs → ≤~4µs).**
   Two updates to `path-to-1000.md` §"comms is the crux" (your doc — flagging, not editing): **(1)** the
   "hide it = stale-TP" lever is **measured DEAD** (`n4...md` §6: 0.000–0.025). **(2)** Replace it with the

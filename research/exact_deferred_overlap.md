@@ -81,14 +81,25 @@ collapses at B=1).
 No need to stage a whole layer — only the next op's first tiles need to be in flight when its turn comes.
 L2 (50 MB) is irrelevant; the cover is the in-flight HBM *transfer*, not a resident copy.
 
-**OPEN feasibility questions (being answered by `wf_8e6331d8-e91`, fold in when it lands):**
-1. Do `multimem.ld_reduce` (NVLink) and `cp.async.bulk` (HBM) actually run **concurrently**, or do they
-   contend (shared mem controllers / copy engines / SM scheduler)? — decides the *hidden fraction*.
-2. Realistic 8 KB NVLS AR latency on 8×H100 NVSwitch — is it ≤ the ~4 µs cover, or barrier-bound ~16 µs?
-3. Does any published megakernel (MPK, TileLink, Triton-distributed) demonstrate comms↔**memory** overlap
-   (not comms↔compute) at M=1? — the precedent that makes this more than a paper design.
-If (1) shows contention or (2) shows C ≫ cover, the hidden fraction drops and this lever is partial, not
-total — I will temper §3/§5b accordingly.
+**Feasibility questions — status (Charles answered 2/3; `wf_8e6331d8-e91` cross-checks from literature):**
+1. **✅ RESOLVED (Charles).** The megakernel CAN issue the NVLS reduce on a subset of SMs concurrent with
+   the weight-stream — standard persistent-kernel **SM specialization**: block-index routes ~2–8 blocks to
+   `multimem.ld_reduce`/`st`, the rest to `cp.async` weight tiles; a grid-wide flag-sync gates the dependent
+   multiply. **No Hopper hardware blocker** (multimem + cooperative-groups grid sync are both sm_90). Only
+   constraint = **occupancy** (keep the reduce footprint small so the weight-stream warps stay resident).
+   Realized as a skeleton in `kernels/k6_overlap_decode.cu` (Charles). [Research will adversarially re-verify
+   the concurrency/no-contention point.]
+2. **⏳ OPEN — the make-or-break.** Real 8 KB NVLS AR latency on 8×H100: `measure_collective.sh` (NCCL NVLS
+   arm + custom multimem). Charles's read: NCCL's 16 µs may already be in-switch, so the open bet is whether
+   the *custom* multimem beats it to ≤4 µs. `wf_8e6331d8-e91` is pinning the literature floor in parallel.
+3. **✅ effectively RESOLVED (Charles).** Partial hide still wins with spec: `ladder_to_1000.py --C 7 --overlap`
+   → ~737 no-spec (matches LOOP-C's 706), and **+spec clears 1000 even at C=7 µs** (~1700 at a realistic
+   ×2.2 multiplier at the lower floor, F≈0.4 — not the optimistic ×2.86). So a *partial* hide + spec is a
+   solid lossless 1000 path; the full hide (C≤4 µs) reaches the fp8 roofline.
+
+**Net:** the lever is **de-risked** — concurrency is feasible (Q1), and even a partial hide + spec clears
+1000 (Q3). Only the magnitude (full vs partial hide) is gated on the real NVLS C (Q2), which only changes
+whether we land ~1280 (full) or ~1000–1700 (partial + spec) — both lossless, both ≥ target.
 
 ## 3. The prize (from `tools/stale_tp_ceiling.py`; the overlap math is identical for exact)
 

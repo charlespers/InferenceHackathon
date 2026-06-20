@@ -16,12 +16,15 @@ __global__ void fill_f(float* p, int n, float v){ for(int i=blockIdx.x*blockDim.
 // busy kernel to perturb scheduling / widen the race window between ranks (mimics K1..K5 load).
 __global__ void busy(float* p, int n, int iters){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n){ float a=p[i]; for(int k=0;k<iters;++k) a=a*1.0000001f+1e-7f; if(a==123456.f) p[i]=a; } }
 
-// per-collective check: copy each rank's half to host, verify == want.  Returns #bad.
+// per-collective check: copy each rank's OUTPUT half to host, verify == want.  Returns #bad.
+// OUT-OF-PLACE: the reduced result lands in the OUT region (nvls_out_off(elt_off)), NOT the IN region
+// the fill wrote.  Read OUT here to validate the all-reduce result.
 static int check_half(std::vector<NvlsCtx>& ctx, int npes, int elt_off, float want){
   int bad=0; float worst=0; int wd=-1,wi=-1; float wv=0;
+  const int out_off = nvls_out_off(elt_off);
   for(int d=0; d<npes; ++d){ RCK(cudaSetDevice(d));
     std::vector<float> h(NVLS_HIDDEN);
-    RCK(cudaMemcpy(h.data(), ctx[d].uc+elt_off, NVLS_HIDDEN*sizeof(float), cudaMemcpyDeviceToHost));
+    RCK(cudaMemcpy(h.data(), ctx[d].uc+out_off, NVLS_HIDDEN*sizeof(float), cudaMemcpyDeviceToHost));
     for(int i=0;i<NVLS_HIDDEN;++i){ float dd=fabsf(h[i]-want); if(dd>1e-2f){ bad++; if(dd>worst){worst=dd;wd=d;wi=i;wv=h[i];} } } }
   if(bad) printf("    FAIL off=%d want=%.1f : %d bad; worst gpu%d[%d]=%.4f (off %.4f)\n", elt_off, want, bad, wd, wi, wv, worst);
   return bad;

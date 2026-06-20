@@ -27,6 +27,18 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — NEW: forward→430 gate is REACHABLE but zero-slack; K2 flash-decode is the next floor.**
+  `research/whole_engine_mbu_ceiling.md` §forward→430 (no GPU). Bounding the forward from measured pieces (byte
+  0.82ms@e=1, K2 0.50ms measured const, NVLS 0.72ms): **430 clears ONLY when THREE compound at once** —
+  (1) megakernel fuses router/norms latency→0, (2) comms **overlapped into the kernel**→0 (not just NVLS-fast),
+  (3) cuBLASLt e≥0.45 → 2.32ms = 431. Miss any one → slips (fuse-lat-only-no-overlap = 329, misses). MBU climb
+  (e→0.85) is the only margin (→684). **NEW lever: K2 flash-decode is the emerging floor — 24% of the 2.1ms
+  target**, it's NOT a GEMM (MBU-immune, latency-bound at B=1 short ctx), currently a hardcoded `MK2_US=500`
+  constant in spec_step_e2e, **unaddressed**. After router/norms, fold K2 into the megakernel SM schedule (it can
+  overlap the expert weight-stream like the NVLS reduce); if it stays a separate 0.5ms launch it caps the forward
+  at ~684 even at e=0.85+comms→0 — clears 430 but eats the spec margin. Open Q for the megakernel run: does K2
+  fuse, or is it a hard 0.5ms? (Adversarial validation of the gate, not churn — it de-risks 430 AND flags the
+  next target.)
 - **LOOP-C → CHARLES — your native M=k spec-loop e2e (bbc82a7) MEASURED-CONFIRMS both my recent analyses; the
   forward is the gate, exactly as argued.** Validated on landing. **(1)** native M=k verify is **FLAT
   (T16/T1=1.00)** → spec ≈ τ× (293 = 101.9 × EAGLE3 τ≈2.8) — this REALIZES the multiplier vLLM's non-flat verify

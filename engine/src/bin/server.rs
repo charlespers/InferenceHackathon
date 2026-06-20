@@ -5,22 +5,27 @@
 ///   GET  /v1/models
 ///   GET  /v1/topology
 ///   POST /v1/chat/completions   (SSE proxy to vLLM, injects x_telemetry + x_summary)
+///   GET  /api/tasks             (who is running what right now)
 ///
-/// On startup: loads routing_stats.json + optimized_placement.json to build
-/// a RoutingSimulator. For every token vLLM generates, simulate_token() runs
-/// our Markov predictor through all 94 layers and records the hit rate.
-/// predictor_hit_rate is reported in x_summary.
+/// Task tracking: pass X-User header or "user" field in request body to identify
+/// yourself. Visit /api/tasks in a browser to see live request status.
 ///
 /// Run: cargo run --release --bin server
 /// Env: VLLM_URL (default http://localhost:8001), PORT (default 8000)
 
-use std::{convert::Infallible, sync::{Arc, Mutex}, time::Instant};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::State,
+    http::HeaderMap,
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
+        Html, IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
@@ -31,7 +36,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 
-use engine::routing::optimizer::placement_from_json;
 use engine::routing::sim::RoutingSimulator;
 
 const VLLM_URL_DEFAULT: &str = "http://localhost:8001";
@@ -42,12 +46,62 @@ const N_EXPERTS: usize = 128;
 const ROUTING_STATS_PATH: &str = "/alloc/data/routing_stats.json";
 const PLACEMENT_PATH: &str = "/alloc/data/optimized_placement.json";
 
+// ---------------------------------------------------------------------------
+// Task tracking
+// ---------------------------------------------------------------------------
+
+struct ActiveTask {
+    user: String,
+    prompt_preview: String,
+    started_at: Instant,
+    tokens: u32,
+}
+
+struct TaskTracker {
+    active: HashMap<u64, ActiveTask>,
+    next_id: u64,
+    total_served: u64,
+    server_started: Instant,
+}
+
+impl TaskTracker {
+    fn new() -> Self {
+        Self {
+            active: HashMap::new(),
+            next_id: 0,
+            total_served: 0,
+            server_started: Instant::now(),
+        }
+    }
+
+    fn register(&mut self, user: String, prompt_preview: String) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.active.insert(id, ActiveTask { user, prompt_preview, started_at: Instant::now(), tokens: 0 });
+        id
+    }
+
+    fn tick(&mut self, id: u64) {
+        if let Some(t) = self.active.get_mut(&id) { t.tokens += 1; }
+    }
+
+    fn finish(&mut self, id: u64) {
+        self.active.remove(&id);
+        self.total_served += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
+
 struct AppState {
     client: reqwest::Client,
     vllm_url: String,
     simulator: Mutex<RoutingSimulator>,
     /// Placement JSON cached for x_telemetry ({"placement": {"0": {"0": 2, ...}}})
     placement_json: Value,
+    tasks: Mutex<TaskTracker>,
 }
 
 #[tokio::main]
@@ -76,6 +130,7 @@ async fn main() {
         vllm_url,
         simulator: Mutex::new(simulator),
         placement_json,
+        tasks: Mutex::new(TaskTracker::new()),
     });
 
     let app = Router::new()
@@ -83,6 +138,7 @@ async fn main() {
         .route("/v1/models", get(models))
         .route("/v1/topology", get(topology))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/api/tasks", get(tasks_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -126,9 +182,31 @@ async fn topology(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
     let wants_stream = body["stream"].as_bool().unwrap_or(false);
+
+    // Identify the caller: X-User header, then "user" field in body, then "unknown"
+    let user = headers
+        .get("x-user")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| body["user"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Prompt preview from the last user message
+    let prompt_preview = body["messages"]
+        .as_array()
+        .and_then(|msgs| msgs.iter().rev().find(|m| m["role"] == "user"))
+        .and_then(|m| m["content"].as_str())
+        .map(|s| {
+            let trimmed = s.trim();
+            if trimmed.len() > 80 { format!("{}…", &trimmed[..80]) } else { trimmed.to_string() }
+        })
+        .unwrap_or_default();
+
+    let task_id = state.tasks.lock().unwrap().register(user, prompt_preview);
 
     // Always stream internally; non-streaming collects and wraps.
     body["stream"] = json!(true);
@@ -148,7 +226,7 @@ async fn chat_completions(
     let (tx, rx) = mpsc::channel::<String>(128);
 
     tokio::spawn(async move {
-        proxy_and_inject(state, body, vllm_url, tx).await;
+        proxy_and_inject(state, body, vllm_url, tx, task_id).await;
     });
 
     if wants_stream {
@@ -184,6 +262,7 @@ async fn proxy_and_inject(
     body: Value,
     vllm_url: String,
     tx: mpsc::Sender<String>,
+    task_id: u64,
 ) {
     let resp = match state.client.post(&vllm_url).json(&body).send().await {
         Ok(r) => r,
@@ -247,6 +326,7 @@ async fn proxy_and_inject(
                 chunk["x_telemetry"] = make_telemetry(
                     token_count, t_ms, &state.placement_json,
                 );
+                state.tasks.lock().unwrap().tick(task_id);
                 token_count += 1;
             }
 
@@ -285,6 +365,84 @@ async fn proxy_and_inject(
         }
     });
     let _ = tx.send(summary.to_string()).await;
+    state.tasks.lock().unwrap().finish(task_id);
+}
+
+// ---------------------------------------------------------------------------
+// /api/tasks — live request monitor
+// ---------------------------------------------------------------------------
+
+async fn tasks_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let tracker = state.tasks.lock().unwrap();
+    let uptime = tracker.server_started.elapsed().as_secs();
+
+    let wants_html = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/html"))
+        .unwrap_or(false);
+
+    let active: Vec<Value> = tracker.active.values().map(|t| {
+        let elapsed = t.started_at.elapsed();
+        json!({
+            "user": t.user,
+            "prompt": t.prompt_preview,
+            "elapsed_s": elapsed.as_secs(),
+            "tokens": t.tokens,
+            "tok_per_s": if elapsed.as_secs_f64() > 0.5 {
+                (t.tokens as f64 / elapsed.as_secs_f64() * 10.0).round() / 10.0
+            } else { 0.0 },
+        })
+    }).collect();
+
+    if wants_html {
+        // Simple auto-refreshing HTML table — open in browser
+        let rows = if active.is_empty() {
+            "<tr><td colspan='5' style='text-align:center;color:#888'>No active requests</td></tr>".to_string()
+        } else {
+            active.iter().map(|r| format!(
+                "<tr><td>{}</td><td>{}</td><td>{}s</td><td>{}</td><td>{} tok/s</td></tr>",
+                r["user"].as_str().unwrap_or(""),
+                r["prompt"].as_str().unwrap_or(""),
+                r["elapsed_s"],
+                r["tokens"],
+                r["tok_per_s"],
+            )).collect::<Vec<_>>().join("\n")
+        };
+
+        let html = format!(r#"<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="2">
+<title>Inference Tasks</title>
+<style>
+  body {{ font-family: monospace; background: #0d1117; color: #e6edf3; padding: 24px; }}
+  h2 {{ color: #58a6ff; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th {{ background: #161b22; color: #58a6ff; padding: 8px 12px; text-align: left; }}
+  td {{ padding: 8px 12px; border-bottom: 1px solid #21262d; }}
+  .meta {{ color: #8b949e; margin-top: 16px; font-size: 0.85em; }}
+</style>
+</head><body>
+<h2>Active Inference Requests</h2>
+<table>
+  <tr><th>User</th><th>Prompt</th><th>Elapsed</th><th>Tokens</th><th>Speed</th></tr>
+  {rows}
+</table>
+<p class="meta">Total served: {} &nbsp;|&nbsp; Uptime: {}s &nbsp;|&nbsp; Auto-refreshes every 2s</p>
+</body></html>"#, tracker.total_served, uptime);
+
+        Html(html).into_response()
+    } else {
+        Json(json!({
+            "active": active,
+            "total_served": tracker.total_served,
+            "uptime_s": uptime,
+        })).into_response()
+    }
 }
 
 // ---------------------------------------------------------------------------

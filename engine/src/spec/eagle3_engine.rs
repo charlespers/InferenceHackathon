@@ -119,7 +119,19 @@ impl<S: CandidateSource, T: ModelRunner> Eagle3Engine<S, T> {
         let tree = DraftTree { proposals: vec![proposal], draft_len: verify_depth };
         let flat = tree.flat_tokens();
         let target_logits = self.target.forward_batch(context, &flat, self.config.vocab_size)?;
-        let run = accept_multi_drafter(&tree, &target_logits, rng);
+        let mut run = accept_multi_drafter(&tree, &target_logits, rng);
+
+        // FULL-accept bonus fix (see engine/docs/spec-accept-correctness-notes.md #2): when every
+        // verified position is accepted, `accept_multi_drafter` had to use a GREEDY STAND-IN for the
+        // bonus (it has no target row for the (k+1)-th position), which can re-emit the last accepted
+        // token. Replace it with a real sample of P(· | context + accepted) — one extra target
+        // forward. This preserves exact losslessness on full-accept rounds, not just rejection rounds.
+        if run.accepted.len() == verify_depth && verify_depth > 0 {
+            let mut ctx_ext = Vec::with_capacity(context.len() + run.accepted.len());
+            ctx_ext.extend_from_slice(context);
+            ctx_ext.extend_from_slice(&run.accepted);
+            run.bonus_token = self.sample_bonus(&ctx_ext, rng)?;
+        }
 
         let stats = Eagle3RoundStats {
             n_accepted: run.n_accepted(),
@@ -201,6 +213,29 @@ impl<S: CandidateSource, T: ModelRunner> Eagle3Engine<S, T> {
             .unwrap_or(0);
         Ok(arg)
     }
+
+    /// Sample the bonus token from the exact target distribution `P(· | context)` — a categorical
+    /// draw from `softmax(target logits at the end of context)`. Unlike [`Self::fallback_decode`]
+    /// (greedy), this is a true sample, so it's lossless for temperature > 0; for a peaked
+    /// (near-deterministic) target it coincides with the argmax. Used for the full-accept bonus.
+    fn sample_bonus(&self, context: &[TokenId], rng: &mut impl RngCore) -> Result<TokenId> {
+        if context.is_empty() {
+            return Ok(0);
+        }
+        let (prefix, last) = context.split_at(context.len() - 1);
+        let logits = self.target.forward_single(prefix, last[0])?;
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
+        let u = rng.next_f32();
+        let mut cum = 0.0f32;
+        for (i, &l) in logits.iter().enumerate() {
+            cum += (l - max).exp() / sum;
+            if u <= cum {
+                return Ok(i as TokenId);
+            }
+        }
+        Ok((logits.len().saturating_sub(1)) as TokenId)
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +243,7 @@ mod tests {
     use super::*;
     use crate::routing::types::ExpertId;
     use crate::spec::route_aware::Candidate;
+    use crate::spec::types::TargetLogits;
 
     /// Mock head: every position offers two candidates that REUSE experts [0..7] (so route-aware
     /// keeps the union small), with high draft confidence (logprob → accept-prob ~0.9).
@@ -344,6 +380,78 @@ mod tests {
         // every round was degenerate → no speculating rounds, but rounds counted, τ = 1 per round
         assert_eq!(telem.snapshot().spec_rounds, 0);
         assert!((telem.mean_accept_length() - 1.0).abs() < 1e-6);
+    }
+
+    /// Deterministic reference target: the greedy continuation is `prev_token + 1` (mod vocab),
+    /// INDEPENDENT of what was drafted. It overrides `forward_batch` with the CORRECT verify layout
+    /// (`data[pos]` = the distribution predicting position `pos`'s token from `context + draft[..pos]`,
+    /// i.e. the (last_context + 1 + pos) ramp token) — not the off-by-one default. This lets the test
+    /// exercise REAL losslessness rather than a mock quirk. (See engine/docs/spec-accept-correctness-notes.md #1.)
+    struct RampTarget(usize);
+    impl ModelRunner for RampTarget {
+        fn forward_single(&self, _ctx: &[u32], tok: u32) -> Result<Vec<f32>> {
+            // predict-next after `tok`: peak at (tok+1) % vocab (used for the bonus sample / fallback)
+            let mut v = vec![0.0f32; self.0];
+            v[((tok as usize) + 1) % self.0] = 30.0;
+            Ok(v)
+        }
+        fn forward_batch(&self, context: &[u32], draft_tokens: &[u32], vocab: usize) -> Result<TargetLogits> {
+            // CORRECT verify layout (single drafter): position `pos` predicts the ramp token
+            // (last_context + 1 + pos) % vocab — independent of the draft tokens.
+            let last = *context.last().unwrap_or(&0) as usize;
+            let n = draft_tokens.len();
+            let mut data = vec![0.0f32; n * vocab];
+            for pos in 0..n {
+                data[pos * vocab + (last + 1 + pos) % vocab] = 30.0;
+            }
+            Ok(TargetLogits { data, n_positions: n, vocab_size: vocab })
+        }
+        fn vocab_size(&self) -> usize { self.0 }
+    }
+
+    /// Head that, at each position, offers the CORRECT ramp token (rotating/fresh experts) and a WRONG
+    /// distractor (reusing experts [0..8]). λ=0 drafts the correct token (higher prob) → accepted;
+    /// large λ prefers the small-union distractor → rejected → resampled to the ramp. Either way the
+    /// emitted sequence is the same target ramp — so λ changes throughput, never the output.
+    struct RampHead(usize);
+    impl CandidateSource for RampHead {
+        fn candidates(&self, context: &[TokenId], chain: &[TokenId], _w: usize) -> Vec<Candidate> {
+            let last = chain.last().or_else(|| context.last()).copied().unwrap_or(0) as usize;
+            let correct = ((last + 1) % self.0) as u32;
+            let distract = ((last + 1 + 7) % self.0) as u32;
+            let base = chain.len() as u32 * 8; // rotates → correct's experts are fresh each position
+            vec![
+                Candidate { token: correct, draft_logprob: -0.1, experts: (base..base + 8).collect() },
+                Candidate { token: distract, draft_logprob: -0.3, experts: (0u32..8).collect() },
+            ]
+        }
+    }
+
+    #[test]
+    fn decode_is_lossless_invariant_to_lambda_and_verify_depth() {
+        // THE central correctness invariant: route-awareness (λ) and adaptive verify-depth (floor)
+        // trade throughput but NEVER change the emitted tokens. With a deterministic target, the
+        // output must be the exact greedy ramp regardless of λ or floor. (Requires the full-accept
+        // bonus fix — without it, λ=0 full-accept rounds duplicate the last token and break the ramp.)
+        let vocab = 256;
+        let prompt = vec![5u32];
+        let stop = DecodeStop { max_new_tokens: 12, eos_token: None };
+        let run = |lambda: f32, floor: f32| -> Vec<TokenId> {
+            Eagle3Engine::new(
+                RouteAwareDrafter::new(RampHead(vocab), lambda),
+                RampTarget(vocab),
+                Eagle3Config { depth: 4, width: 2, vocab_size: vocab, floor_fraction: floor },
+            )
+            .decode(&prompt, &stop, &mut FixedRng)
+            .unwrap()
+            .0
+        };
+        let expected: Vec<TokenId> = (6u32..18).collect(); // ramp from prompt-last 5
+        let base = run(0.0, 0.0);
+        assert_eq!(base, expected, "lossless output = the deterministic target ramp");
+        assert_eq!(run(5.0, 0.0), expected, "λ must NOT change the output (lossless)");
+        assert_eq!(run(0.0, 0.86), expected, "verify-depth (floor) must NOT change the output");
+        assert_eq!(run(5.0, 0.86), expected, "λ and verify-depth jointly invariant");
     }
 
     #[test]

@@ -77,7 +77,7 @@ launch_measure () {
 }
 
 # stale-lock cleanup (>20 min) then atomic acquire
-[ -d /alloc/data/gpu.lock ] && [ -n "$(find /alloc/data/gpu.lock -mmin +20 2>/dev/null)" ] && rmdir /alloc/data/gpu.lock 2>/dev/null
+[ -d /alloc/data/gpu.lock ] && [ -n "$(find /alloc/data/gpu.lock -mmin +20 2>/dev/null)" ] && { rm -f /alloc/data/gpu.lock/holder; rmdir /alloc/data/gpu.lock 2>/dev/null; }
 FREE=$(freemin); echo "min GPU free ${FREE}MB" >> "$LOG"
 if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
   echo "LOOP-A(eagle3) $(date -u)" > /alloc/data/gpu.lock/holder
@@ -102,7 +102,7 @@ if [ "$FREE" -gt 65000 ] && mkdir /alloc/data/gpu.lock 2>/dev/null; then
     echo "skip 2nd tree size k=$NSPEC2 (out of slot time) — get it next slot" >> "$LOG"
   fi
 
-  rmdir /alloc/data/gpu.lock 2>/dev/null
+  rm -f /alloc/data/gpu.lock/holder; rmdir /alloc/data/gpu.lock 2>/dev/null   # holder-inside-dir: rm then rmdir
   echo "- $(date -u) LOOP-A: released gpu.lock (results /alloc/data/eagle3/)" >> "$SCHED"
 else
   echo "GPUs busy (${FREE}MB) or gpu.lock held -> NOT my window, skipping" >> "$LOG"

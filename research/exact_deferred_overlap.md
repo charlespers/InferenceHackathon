@@ -16,7 +16,12 @@
 >    system (MPK, ParallelKittens, NanoFlow, T3, TokenWeave, TileLink, Triton-distributed, HazyResearch
 >    PGL) hides the collective behind **GEMM COMPUTE**, and all **collapse/are disabled at small M**
 >    (TokenWeave turns overlap OFF < 1K tokens; FLUX *slows down* at m=64). The comms-behind-weight-read
->    idea **appears nowhere** → it's novel and unproven (not refuted, just no precedent at M=1).
+>    idea **appears nowhere in the *published* literature** → novel (not refuted, just no precedent at M=1).
+>    **✅ UPGRADE (on-box, Alyssa `overlap_decode.cu`):** the team has now **BUILT it in-house** — AR(L) ∥
+>    next-layer GEMV overlaps **lossless + reproducible** (60.4–62.4 µs/layer). So the *mechanism is
+>    DEMONSTRATED* (no longer wishful); the literature gap just means no one published it. **The gate is now
+>    the AR latency, exactly as flagged:** Alyssa's software AR is ~70 µs ≫ the ~4 µs cover → only PARTIAL
+>    hide today; shrinking it needs the custom **NVLS multimem** (NCCL-NVLS shows no gain — Alyssa+Charles).
 > 2. **The ≤4 µs NVLS floor is NOT established.** The only measured small-message multimem AR in the
 >    corpus is **~16 µs** (TokenWeave, but at ~1 MB, not 8 KB). MultiShot is "up to 3× faster than Ring
 >    at small msg" → plausibly low single-digit µs, but **the true ~8 KB 8×H100 number is unpinned (≈3–16 µs)**.

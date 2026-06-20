@@ -8,3 +8,14 @@ ctx=2048:  M=1 32.99us  M=4 41.14 (1.25x)  M=8 32.35 (0.98x)  M=16 32.84 (1.00x)
 VERDICT: TC attention is FLAT in M (M=8/M=1 ~= 1.0) vs warp-shuffle K2's ~4.0x. The M-scaling is a
 warp-shuffle/CUDA-core artifact, NOT fundamental. (M=4 ~1.3x = a cuBLAS tile-pick blip at the odd size,
 not scaling — M=8/16 align to MMA tiles and are flat.)
+
+--- FULL TC attention incl. SOFTMAX (tc_attn_full.cu/tcf), validated vs CPU fp32 (0.52% global-rel PASS) ---
+ctx=4096:  M=1 73.84us  M=4 108.32(1.47x)  M=8 94.33 (1.28x)  M=16 130.11(1.76x)
+ctx=8192:  M=1 133.93us M=4 201.94(1.51x)  M=8 183.93(1.37x)  M=16 260.44(1.95x)
+vs warp-shuffle k2 ~4x@M=8 -> TC+softmax is ~3x flatter even with a NAIVE split.
+RESIDUAL M-scaling (1.0x GEMM-only -> 1.3x with softmax) = the SPLIT design's HBM round-trip: GEMM1
+materializes M x ctx scores to HBM, softmax re-reads+re-writes, GEMM2 re-reads -> that traffic scales
+linearly in M. A FUSED FlashAttention kernel (scores in SRAM, never spilled) removes it -> approaches 1.0x.
+ABSOLUTES @M=8 ctx4096: TC+softmax 94us vs warp-shuffle k2b-best 165us (TC ~1.75x faster AND flatter).
+At M=1: TC+softmax 74us vs warp k2b 41us (warp wins -> confirms regime split: warp@M=1, fused-TC@M=k).
+CONCLUSION: build a FUSED TC flash-decode verify (FA-style, fp8 KV, tree/causal mask) — not a cuBLAS split.

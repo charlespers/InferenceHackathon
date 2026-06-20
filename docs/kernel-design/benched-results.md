@@ -58,4 +58,13 @@ vLLM fp8/EP8 **65.8 tok/s**, bf16/TP8 **85.7**, naive transformers 3.5. fp8 roof
 | **spec verify-in-one-pass** | forward scales ~linearly with draft rows (192→850 µs/layer for M=1→5) | the bench **didn't batch the weight read** — a modeling bug, not a refutation. Real batched verify is flat → spec amortizes (team's EAGLE3 measures ~3.8×). Needs a correctly-batched verify kernel. |
 | **megakernel decode** | cg::grid.sync + collective_launch combo unverified + a Q-layout bug | risky/broken — not benched. |
 
+## First REAL end-to-end sharded decode (benched, 8 GPUs, NVSHMEM)
+`kernels/decode_sharded_nvshmem.cu` — host-driven 8-PE TP shard, one-shot NVSHMEM all-reduce (validated maxerr 2.2e-6), 94 layers, latency proxy.
+```
+sharded full step:  28,136 µs/token = 35.5 tok/s  (123.6 GB/s/GPU, 3.7% peak)
+  compute-only:     22,464 µs (80%)  <- LAUNCH-OVERHEAD-bound (~850 un-graphed host launches)
+  all-reduces (189): 5,672 µs (20%)  = 30 µs/AR (one-shot = 2 barriers; not the 17µs single-barrier hope)
+```
+**Verdict:** sharding alone barely beats the 30.9 single-GPU proxy — because the host-driven step is **launch-bound**, not bandwidth-bound (per-GPU read 3.48 GB ideal = ~2 ms vs measured 22 ms compute). The fix is the same CUDA-graph capture that took the single-GPU step 8.4→30.9 (kill the ~850 launches) → compute → ~2–3 ms → step ~8 ms → **~125 tok/s**; then spec (×~2.8) → ~350; + comms/collective reduction → toward 700. The one-shot AR is **30 µs** (2 barriers), so 189× = 5.7 ms is a hard comms floor until collectives are cut or fused into the graph.
+
 **Refined path to 700 (post-squeeze):** comms can't go below ~17 µs/collective (barrier), so the levers are (1) **EP all-to-all** (17 µs, 1 barrier) not TP recdouble (51 µs, 3 barriers); (2) **halve collectives** 188→94 (1/layer); (3) **correctly-batched speculative decode** (÷~2.77–3.8 — the dominant multiplier, owned by the team's EAGLE3). Arithmetic: 94 × 17 µs = 1.6 ms comms ÷ 2.77 (spec) + ~0.5 ms compute ≈ **1.1 ms → ~900 tok/s** — reachable, but gated on the EP-sharded decode running end-to-end + the batched verify. Neither int4 nor in-kernel-launch-elision is on the path; spec + EP + fewer collectives is.

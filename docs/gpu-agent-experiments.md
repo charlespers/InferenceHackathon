@@ -110,6 +110,21 @@ Record: decode tok/s vs FP8 (expect **~1.13–1.20×** e2e, not 2× — only the
 accuracy delta. If no checkpoint exists, note it and defer (quantizing 235B is a separate task).
 See `docs/next-levers-research.md` L2.
 
+### E8 — Verify route-prediction (DirectProxy) on a real MoE  ⟵ validates `engine/routing/predictor.rs`
+Goal: confirm the team's zero-training route predictor actually predicts next-layer experts (so the
+prefetch/early-dispatch in `scheduler.rs` is worth wiring) — *before* deploying on the 235B. Pure
+inference; no engine relaunch. The box has torch 2.7.1.
+```bash
+# quick sanity on a small MoE (downloads ~14GB once), or point straight at the 235B:
+python tools/verify_route_prediction.py --model allenai/OLMoE-1B-7B-0924 --device cuda --dtype bfloat16
+python tools/verify_route_prediction.py --model /alloc/data/Qwen3-235B-A22B --device cuda --dtype bfloat16
+```
+Record: (A) DirectProxy accuracy, (B) layer-to-layer + (C) token-to-token expert overlap, all vs the
+random baseline (top_k/n_experts). **Go signal:** (A) ≫ random → prefetch is sound, and 1−(A) is the
+misprediction (wasted-prefetch) rate to budget for. Feeds the markov/route-cache work. *(I couldn't run
+this locally — no torch on the Mac, and the only cached small MoE is a hybrid-arch GGUF/MLX without clean
+router hooks — so it's queued for the box where torch + Qwen3 + standard `output_router_logits` exist.)*
+
 ## Results Log  (GPU agent: append, newest first; format below)
 <!-- ### YYYY-MM-DD  E<n> — <one-line result>
      launch/config: ...

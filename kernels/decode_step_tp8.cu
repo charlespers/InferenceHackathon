@@ -79,6 +79,7 @@
 #include <vector>
 #include <algorithm>
 #include <thread>
+#include <atomic>
 #include <cuda_runtime.h>
 #include <nccl.h>
 #include "common.cuh"
@@ -263,6 +264,7 @@ struct RankState {
   // ---- K4 (router), REPLICATED ----
   float *w_post_norm = nullptr;                              // [HIDDEN]
   fp8   *Wgate = nullptr; float *Wgate_scale = nullptr;      // [N_EXPERTS, HIDDEN], [N_EXPERTS]
+  float *g_logits = nullptr;                                 // [N_EXPERTS] gate-GEMV split-K accumulator
   int   *sel_idx = nullptr;  float *sel_w = nullptr;         // [TOP_K]
   float *y_norm = nullptr;                                   // [HIDDEN] post-norm MoE input (staged)
 
@@ -281,6 +283,12 @@ struct RankState {
   float *rank_max = nullptr;   int *rank_arg = nullptr;      // [1] each (this rank's best)
 
   K5Launch k5;                                               // K5 plan for nslot=TOP_K, inter=192
+
+  // ---- CUDA-graph capture of this rank's full token (kernels + its NCCL collectives) ----
+  cudaGraph_t     graph = nullptr;
+  cudaGraphExec_t exec  = nullptr;
+  // ---- kernels-only segment graphs (NCCL all-reduces stay eager between them) ----
+  cudaGraphExec_t exec_segA = nullptr, exec_segB = nullptr, exec_seghead = nullptr;
 };
 
 // Forward declarations of the sharded launch helpers (defined after enqueue_tp8_layer, which calls them).
@@ -294,9 +302,29 @@ static void tp8_k3_launch(RankState& S, cudaStream_t s);
 // verbatim with a different inner width.  Instead we provide thin 192-aware kernels below that mirror
 // the exact warp-per-row coalesced-fp8 idiom (identical math, just MOE_INTER_RANK as the inner dim).
 // =================================================================================================
-// gate+up shard: a_glb[slot*192 + j] = silu(s_g*<y,gate_j>) * (s_u*<y,up_j>), j in [0,192).
-// Wgu shard layout [2*192, HIDDEN]: rows [0,192) gate, [192,384) up.  One warp per (slot, j).
-extern "C" __global__ void tp8_k5a_gateup(
+// ---------------------------------------------------------------------------------------------
+// SHARDED K5: MULTIPLE-ROWS-PER-WARP (the measured win for the TP=8 shard; see k5_sharded_bench.cu).
+// ---------------------------------------------------------------------------------------------
+// At TP=8 each rank reads only ~1/8 of the experts (gate+up 12.6 MB, down 6.3 MB).  The original
+// R=1 warp-per-row kernels measured only ~15% MBU fused on this shard — STARVED.  Two distinct
+// starvations, both fixed by giving each warp R adjacent output rows (R independent in-flight loads
+// per lane, no cp.async — cp.async measured SLOWER at M=1, see k5_experts_v3.cu sweep):
+//   * Kernel A (gate+up): inner dim is HIDDEN=4096 (unchanged), but the shard has only 192 rows/
+//     expert -> 1536 row-items total under-fill the grid.  R=2 rows/warp (gate+up = 4 rows) keeps
+//     warps busy longer and lifts A from ~26% -> ~39% MBU.
+//   * Kernel B (down): inner dim shrinks 1536 -> 192 = 12 uint4 < 32 lanes (20 idle lanes/load).
+//     R=8 rows/warp packs 8 independent loads per lane -> lifts B from ~9% -> ~27% MBU.
+// Measured fused: 15% -> ~34% MBU on the 192-shard (2.2x), correctness max_rel 1.3e-5.  Compile-time
+// R; warp_dot math is byte-identical to tp8_warp_dot (split-K, hw fp8x2->half2, 2 accumulators/row).
+#ifndef TP8_K5_RA
+#define TP8_K5_RA 2     // gate+up rows per warp  (dots 2*RA = 4 weight rows/warp)
+#define TP8_K5_RB 8     // down    rows per warp
+#endif
+
+// gate+up shard: a_glb[slot*192 + j] = silu(s_g*<y,gate_j>) * (s_u*<y,up_j>), RA channels/warp.
+// Wgu shard layout [2*192, HIDDEN]: rows [0,192) gate, [192,384) up.
+template <int R>
+__device__ __forceinline__ void tp8_k5a_gateup_t(
     const float* __restrict__ y, const int* __restrict__ sel_idx,
     const fp8* const* __restrict__ Wgu, const float* const* __restrict__ Wgu_scale,
     float* __restrict__ a_glb, int nslot) {
@@ -306,22 +334,61 @@ extern "C" __global__ void tp8_k5a_gateup(
   const int lane  = threadIdx.x & 31;
   const int gwarp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int nwarp = (gridDim.x * blockDim.x) >> 5;
-  const int total = nslot * MOE_INTER_RANK;
+  const int njrow = (MOE_INTER_RANK + R - 1) / R;
+  const int total = nslot * njrow;
+  const int nv    = HIDDEN >> 4;
   for (int item = gwarp; item < total; item += nwarp) {
-    const int slot = item / MOE_INTER_RANK;
-    const int j    = item - slot * MOE_INTER_RANK;
+    const int slot = item / njrow;
+    const int j0   = (item - slot * njrow) * R;
     const int e    = sel_idx[slot];
     const fp8*   W = Wgu[e];
     const float* S = Wgu_scale[e];
-    const float g = tp8_warp_dot(W + (size_t)j * HIDDEN,                      ys, HIDDEN, lane);
-    const float u = tp8_warp_dot(W + (size_t)(MOE_INTER_RANK + j) * HIDDEN,   ys, HIDDEN, lane);
-    if (lane == 0)
-      a_glb[(size_t)slot * MOE_INTER_RANK + j] = silu(g * S[j]) * (u * S[MOE_INTER_RANK + j]);
+    const uint4* gv[R]; const uint4* uv[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+      gv[r] = reinterpret_cast<const uint4*>(W + (size_t)(j0 + r) * HIDDEN);
+      uv[r] = reinterpret_cast<const uint4*>(W + (size_t)(MOE_INTER_RANK + j0 + r) * HIDDEN);
+    }
+    float g0[R], g1[R], u0[R], u1[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) { g0[r]=g1[r]=u0[r]=u1[r]=0.f; }
+    for (int v = lane; v < nv; v += 32) {
+      const float* yy = ys + (v << 4);
+      uint4 gp[R], up[R];
+      #pragma unroll
+      for (int r = 0; r < R; ++r) { gp[r] = gv[r][v]; up[r] = uv[r][v]; }  // 2R loads in flight
+      #pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const unsigned* gu = reinterpret_cast<const unsigned*>(&gp[r]);
+        const unsigned* uu = reinterpret_cast<const unsigned*>(&up[r]);
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const float* yq = yy + (q << 2);
+          unsigned gq = gu[q]; __nv_fp8x2_e4m3 gl,gh; gl.__x=(unsigned short)(gq&0xffffu); gh.__x=(unsigned short)(gq>>16);
+          float2 gfl=__half22float2((__half2)gl), gfh=__half22float2((__half2)gh);
+          g0[r]+=yq[0]*gfl.x; g1[r]+=yq[1]*gfl.y; g0[r]+=yq[2]*gfh.x; g1[r]+=yq[3]*gfh.y;
+          unsigned uq = uu[q]; __nv_fp8x2_e4m3 ul,uh; ul.__x=(unsigned short)(uq&0xffffu); uh.__x=(unsigned short)(uq>>16);
+          float2 ufl=__half22float2((__half2)ul), ufh=__half22float2((__half2)uh);
+          u0[r]+=yq[0]*ufl.x; u1[r]+=yq[1]*ufl.y; u0[r]+=yq[2]*ufh.x; u1[r]+=yq[3]*ufh.y;
+        }
+      }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+      float gacc = g0[r]+g1[r], uacc = u0[r]+u1[r];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) { gacc+=__shfl_down_sync(0xffffffffu,gacc,o); uacc+=__shfl_down_sync(0xffffffffu,uacc,o); }
+      if (lane == 0) { const int j = j0 + r;
+        if (j < MOE_INTER_RANK)
+          a_glb[(size_t)slot * MOE_INTER_RANK + j] = silu(gacc * S[j]) * (uacc * S[MOE_INTER_RANK + j]);
+      }
+    }
   }
 }
-// down shard: h_io[o] += sel_w * s_d * <a_slot[0,192), down_o[0,192)>, accumulated into PARTIAL hidden.
-// Wd shard layout [HIDDEN, 192]: row o is the 192-wide down contraction for output channel o.
-extern "C" __global__ void tp8_k5b_down(
+// down shard: h_io[o] += sel_w * s_d * <a_slot[0,192), down_o[0,192)>, R output channels/warp.
+// Wd shard layout [HIDDEN, 192]: row o is the 192-wide (12 uint4) down contraction for channel o.
+template <int R>
+__device__ __forceinline__ void tp8_k5b_down_t(
     const int* __restrict__ sel_idx, const float* __restrict__ sel_w,
     const fp8* const* __restrict__ Wd, const float* const* __restrict__ Wd_scale,
     const float* __restrict__ a_glb, float* __restrict__ h_io, int nslot) {
@@ -332,19 +399,62 @@ extern "C" __global__ void tp8_k5b_down(
   const int lane  = threadIdx.x & 31;
   const int gwarp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int nwarp = (gridDim.x * blockDim.x) >> 5;
-  const int total = nslot * HIDDEN;
+  const int norow = (HIDDEN + R - 1) / R;
+  const int total = nslot * norow;
+  const int nv    = MOE_INTER_RANK >> 4;                     // 12 at the shard
   for (int item = gwarp; item < total; item += nwarp) {
-    const int slot = item / HIDDEN;
-    const int o    = item - slot * HIDDEN;
+    const int slot = item / norow;
+    const int o0   = (item - slot * norow) * R;
     const int e    = sel_idx[slot];
     const float gw = sel_w[slot];
     const fp8*   W = Wd[e];
     const float* S = Wd_scale[e];
-    // down inner dim is MOE_INTER_RANK=192 (multiple of 16 -> uint4 vectorization exact).
-    const float d = tp8_warp_dot(W + (size_t)o * MOE_INTER_RANK,
-                                 as + (size_t)slot * MOE_INTER_RANK, MOE_INTER_RANK, lane);
-    if (lane == 0) atomicAdd(&h_io[o], gw * d * S[o]);
+    const float* asl = as + (size_t)slot * MOE_INTER_RANK;
+    const uint4* wv[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) wv[r] = reinterpret_cast<const uint4*>(W + (size_t)(o0 + r) * MOE_INTER_RANK);
+    float a0[R], a1[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) { a0[r]=a1[r]=0.f; }
+    for (int v = lane; v < nv; v += 32) {
+      const float* yy = asl + (v << 4);
+      uint4 p[R];
+      #pragma unroll
+      for (int r = 0; r < R; ++r) p[r] = wv[r][v];           // R loads in flight per lane
+      #pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const unsigned* wu = reinterpret_cast<const unsigned*>(&p[r]);
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          unsigned wq = wu[q];
+          __nv_fp8x2_e4m3 lo,hi; lo.__x=(unsigned short)(wq&0xffffu); hi.__x=(unsigned short)(wq>>16);
+          float2 fl=__half22float2((__half2)lo), fh=__half22float2((__half2)hi);
+          const float* yq = yy + (q << 2);
+          a0[r]+=yq[0]*fl.x; a1[r]+=yq[1]*fl.y; a0[r]+=yq[2]*fh.x; a1[r]+=yq[3]*fh.y;
+        }
+      }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+      float acc = a0[r] + a1[r];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+      if (lane == 0) { const int o = o0 + r; if (o < HIDDEN) atomicAdd(&h_io[o], gw * acc * S[o]); }
+    }
   }
+}
+// Concrete entry points the launch sites + cudaFuncSetAttribute reference (template args baked in).
+extern "C" __global__ void tp8_k5a_gateup(
+    const float* __restrict__ y, const int* __restrict__ sel_idx,
+    const fp8* const* __restrict__ Wgu, const float* const* __restrict__ Wgu_scale,
+    float* __restrict__ a_glb, int nslot) {
+  tp8_k5a_gateup_t<TP8_K5_RA>(y, sel_idx, Wgu, Wgu_scale, a_glb, nslot);
+}
+extern "C" __global__ void tp8_k5b_down(
+    const int* __restrict__ sel_idx, const float* __restrict__ sel_w,
+    const fp8* const* __restrict__ Wd, const float* const* __restrict__ Wd_scale,
+    const float* __restrict__ a_glb, float* __restrict__ h_io, int nslot) {
+  tp8_k5b_down_t<TP8_K5_RB>(sel_idx, sel_w, Wd, Wd_scale, a_glb, h_io, nslot);
 }
 
 // Local fused residual add: h_dst[i] = h_src[i] + reduced[i]  (run AFTER the all-reduce of `reduced`).
@@ -353,6 +463,139 @@ extern "C" __global__ void tp8_residual_add(const float* __restrict__ h_src,
                                             float* __restrict__ h_dst) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x)
     h_dst[i] = h_src[i] + reduced[i];
+}
+
+// =================================================================================================
+// FAST TP=8 ROUTER (the #1 measured bottleneck fix).
+// -------------------------------------------------------------------------------------------------
+// The stock k4_router runs the ENTIRE gate GEMV (128 experts x 4096 fp8) on a SINGLE CTA of 8 warps
+// -> 1 of 132 SMs active, ~108 us/launch x 94 layers = ~10.2 ms/token = 59% of the kernels-only floor.
+// It is GROSSLY occupancy-starved, not bandwidth bound (only 0.52 MB read).  Fix: spread the gate GEMV
+// across the whole GPU with split-K (one warp per (expert, k-split)), then do the tiny softmax/top-8
+// selection in a second 1-CTA kernel.
+//
+//   Kernel A (tp8_k4_gate_gemv): grid of CTAs, each stages y=RMSNorm(h) into smem (redundant per-CTA
+//     RMSNorm — cheap, avoids a global y round-trip), then each warp computes a K-SLICE of one expert's
+//     dot and atomicAdds the partial into a pre-zeroed global g_logits[expert].  With K4_KSPLIT=4 that
+//     is 128*4=512 warps -> 128 CTAs of 4 warps -> fills all 132 SMs many times over.
+//   Kernel B (tp8_k4_select): 1 CTA, reads g_logits[128], applies per-expert scale, fp32 softmax,
+//     top-8 + renormalize -> sel_idx[8]/sel_w[8].  Identical selection math to k4_router (bit-for-bit).
+// Per-channel scale is applied in B (after the cross-split atomic sum), so the split-K is exact.
+// =================================================================================================
+#ifndef TP8_K4_KSPLIT
+#define TP8_K4_KSPLIT 4        // K-splits per expert (128 experts * 4 = 512 warps -> fills 132 SMs)
+#endif
+
+// Kernel A: split-K gate GEMV.  Each warp owns (expert e, ksplit ks); atomicAdds its partial dot into
+// g_logits[e] (pre-zeroed by the caller).  y is staged per-CTA via a block-wide RMSNorm of h.
+extern "C" __global__ void tp8_k4_gate_gemv(
+    const float* __restrict__ h, const float* __restrict__ w_post_norm,
+    const fp8* __restrict__ Wgate, float* __restrict__ g_logits) {
+  extern __shared__ float ys[];                            // [HIDDEN] staged y
+  // ---- block-wide RMSNorm(h) -> y (redundant across CTAs; cheap, kills the global y round-trip) ----
+  float part = 0.f;
+  for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) { float v = h[i]; part += v*v; }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) part += __shfl_down_sync(0xffffffffu, part, o);
+  __shared__ float warp_ss[32];
+  const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+  if (lane == 0) warp_ss[wid] = part;
+  __syncthreads();
+  __shared__ float rinv_sh;
+  if (threadIdx.x == 0) {
+    float ss = 0.f; int nw = (blockDim.x + 31) >> 5;
+    for (int i = 0; i < nw; i++) ss += warp_ss[i];
+    rinv_sh = rsqrtf(ss / HIDDEN + RMS_EPS);
+  }
+  __syncthreads();
+  const float rinv = rinv_sh;
+  for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) ys[i] = h[i] * rinv * w_post_norm[i];
+  __syncthreads();
+
+  // ---- split-K gate dot: warp (gwarp) -> expert e = gwarp / KSPLIT, ksplit ks = gwarp % KSPLIT ----
+  const int gwarp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int nwarp = (gridDim.x * blockDim.x) >> 5;
+  const int total = N_EXPERTS * TP8_K4_KSPLIT;
+  const int nv    = HIDDEN >> 4;                            // 256 uint4 over HIDDEN
+  const int chunk = (nv + TP8_K4_KSPLIT - 1) / TP8_K4_KSPLIT;
+  for (int item = gwarp; item < total; item += nwarp) {
+    const int e  = item / TP8_K4_KSPLIT;
+    const int ks = item - e * TP8_K4_KSPLIT;
+    const int v0 = ks * chunk, v1 = min(v0 + chunk, nv);
+    const uint4* __restrict__ wv = reinterpret_cast<const uint4*>(Wgate + (size_t)e * HIDDEN);
+    float a0 = 0.f, a1 = 0.f;
+    for (int v = v0 + lane; v < v1; v += 32) {
+      uint4 p = wv[v];
+      const unsigned* wu = reinterpret_cast<const unsigned*>(&p);
+      const float* yy = ys + (v << 4);
+      #pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        unsigned wq = wu[q];
+        __nv_fp8x2_e4m3 lo, hi; lo.__x=(unsigned short)(wq&0xffffu); hi.__x=(unsigned short)(wq>>16);
+        float2 fl=__half22float2((__half2)lo), fh=__half22float2((__half2)hi);
+        const float* yq = yy + (q << 2);
+        a0 += yq[0]*fl.x; a1 += yq[1]*fl.y; a0 += yq[2]*fh.x; a1 += yq[3]*fh.y;
+      }
+    }
+    float acc = a0 + a1;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) atomicAdd(&g_logits[e], acc);            // cross-split sum; scale applied in select
+  }
+}
+
+// Kernel B: scale + softmax + top-8 + renormalize over g_logits[128] -> sel_idx[8]/sel_w[8].
+// A whole warp loads/scales the 128 logits (4/lane) cooperatively; lane 0 does the tiny top-8.  The
+// per-expert probability is computed ONCE (vs 8x in the stock k4_router), and a running "taken" mask
+// removes the inner O(s) rescan.  Selection is argmax-equivalent to softmax-prob argmax (prob is a
+// monotone function of the logit), so we top-8 on the logit directly and softmax only the 8 winners.
+// Numerically identical SELECTION to k4_router; the 8 returned weights match to fp rounding.
+extern "C" __global__ void tp8_k4_select(
+    const float* __restrict__ g_logits, const float* __restrict__ Wgate_scale,
+    int* __restrict__ sel_idx, float* __restrict__ sel_w) {
+  __shared__ float logits[N_EXPERTS];
+  const int lane = threadIdx.x & 31;
+  for (int e = lane; e < N_EXPERTS; e += 32) logits[e] = g_logits[e] * Wgate_scale[e];
+  __syncwarp();
+  if (lane != 0) return;
+  // full-128 softmax denom FIRST (matches k4_router exactly), before any masking.
+  float mx = -FLT_MAX;
+  for (int e = 0; e < N_EXPERTS; ++e) mx = fmaxf(mx, logits[e]);
+  float sum = 0.f;
+  for (int e = 0; e < N_EXPERTS; ++e) sum += __expf(logits[e] - mx);
+  const float inv_sum = 1.f / sum;
+  // top-8 by logit (monotone in prob); mask each pick to -inf in place so it isn't repicked.
+  float logit_sel[TOP_K];
+  for (int s = 0; s < TOP_K; ++s) {
+    int bi = -1; float bv = -FLT_MAX;
+    for (int e = 0; e < N_EXPERTS; ++e) if (logits[e] > bv) { bv = logits[e]; bi = e; }
+    if (bi < 0) bi = s;
+    sel_idx[s]   = bi;
+    logit_sel[s] = logits[bi];
+    logits[bi]   = -FLT_MAX;
+  }
+  // renormalize the 8 selected probs to sum 1 (norm_topk_prob=true).
+  float chosen = 0.f;
+  for (int s = 0; s < TOP_K; ++s) { float p = __expf(logit_sel[s] - mx) * inv_sum;
+                                    sel_w[s] = p; chosen += p; }
+  const float inv_chosen = 1.f / chosen;
+  for (int s = 0; s < TOP_K; ++s) sel_w[s] *= inv_chosen;
+}
+
+// Capture-safe FAST router launch.  Spreads the gate GEMV over the whole GPU (split-K, 512 warps) then
+// selects in a tiny 1-CTA kernel.  g_logits must be pre-zeroed each call (cheap 512 B memset).  No
+// cudaFuncSetAttribute on the hot path (opted-in once in alloc_rank) -> stream-capturable.
+static inline void tp8_k4_launch(const float* h, const float* w_post_norm,
+                                 const fp8* Wgate, const float* Wgate_scale,
+                                 int* sel_idx, float* sel_w,
+                                 float* g_logits, cudaStream_t s) {
+  const int block = 128, warps = block >> 5;                // 4 warps/CTA
+  const int need_warps = N_EXPERTS * TP8_K4_KSPLIT;         // 512
+  const int ctas = (need_warps + warps - 1) / warps;        // 128 CTAs -> fills 132 SMs
+  const size_t smem = (size_t)HIDDEN * sizeof(float);
+  CK(cudaMemsetAsync(g_logits, 0, N_EXPERTS * sizeof(float), s));
+  tp8_k4_gate_gemv<<<ctas, block, smem, s>>>(h, w_post_norm, Wgate, g_logits);
+  tp8_k4_select<<<1, 32, 0, s>>>(g_logits, Wgate_scale, sel_idx, sel_w);
 }
 
 // =================================================================================================
@@ -390,7 +633,8 @@ static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
   tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_partial, h_dst);
 
   // ---- K4: router (REPLICATED) on the full post-attn residual -> sel_idx[8], sel_w[8] ----
-  k4_launch(h_dst, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, s);
+  //   capture-safe FAST launch (split-K gate GEMV across the whole GPU + tiny select kernel).
+  tp8_k4_launch(h_dst, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, S.g_logits, s);
 
   // ---- K5: sharded gate+up (192) then sharded down -> PARTIAL MoE-down hidden ----
   CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));    // accumulate partial from 0
@@ -445,6 +689,104 @@ static void enqueue_tp8_step(RankState& S) {
   NK(ncclAllReduce(S.rank_max, S.rank_max, 1, ncclFloat32, ncclMax, S.comm, s));
   NK(ncclGroupEnd());
 }
+
+// =================================================================================================
+// KERNELS-ONLY GRAPH SEGMENTS (the robust fallback when NCCL-in-graph replay is slow on this build).
+// -------------------------------------------------------------------------------------------------
+// The two all-reduces/layer chop the per-token stream into kernel-only segments.  We capture the
+// kernels of ONE layer into two segment graphs (segA = K1,K2,K3 -> attn_partial; segB = residual_add,
+// K4,K5 -> moe_partial) plus a head segment, then at replay time the host launches:
+//   [segA_graph, eager AR#1, segB_graph, eager AR#2] x 94  +  [head_graph, eager head-AR-max]
+// so every layer's ~9 kernel launches collapse to 2 graph launches, while the 189 NCCL all-reduces
+// stay EAGER (NCCL's fast path).  Host ops/token: 2*94 graph launches + 188 ARs + 2 head = ~378
+// (vs ~1100 eager), removing the bulk of the launch overhead without the slow captured-NCCL path.
+//
+// LATENCY-PROXY NOTE: a captured graph pins fixed buffer pointers, so the graphed path drops the
+// per-layer residual ping-pong and reuses FIXED h_a (in) / h_b (out) every layer.  In this proxy the
+// residual values are meaningless (they grow to nan — explicitly harmless), and the kernel shapes /
+// grids / per-token HBM byte volume are byte-identical to the eager path, so the measured us/token is
+// faithful to the launch-structure being benchmarked.
+// =================================================================================================
+// segA: K1 -> K2 -> memset(attn_partial) -> K3.  Reads h_in, writes attn_partial (partial O-proj).
+static void enqueue_tp8_segA(RankState& S, float* h_in, cudaStream_t s) {
+  tp8_k1_launch(S, h_in, s);
+  tp8_k2_launch(S, s);
+  CK(cudaMemsetAsync(S.attn_partial, 0, HIDDEN * sizeof(float), s));
+  tp8_k3_launch(S, s);
+}
+// segB: residual_add(h_in + attn_partial -> h_out) -> K4 -> memset(moe_partial) -> K5a -> K5b.
+//   attn_partial is assumed ALREADY all-reduced (eager AR#1) before this segment replays.
+static void enqueue_tp8_segB(RankState& S, float* h_in, float* h_out, cudaStream_t s) {
+  tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.attn_partial, h_out);
+  tp8_k4_launch(h_out, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, S.g_logits, s);
+  CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
+  tp8_k5a_gateup<<<S.k5.ctasA, S.k5.block, S.k5.smemA, s>>>(
+      h_out, S.sel_idx, S.Wgu_d, S.Wgu_scale_d, S.a_glb, TOP_K);
+  tp8_k5b_down<<<S.k5.ctasB, S.k5.block, S.k5.smemB, s>>>(
+      S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.moe_partial, TOP_K);
+}
+// head: residual_add(h_in + moe_partial -> h_in) -> final norm -> lm_head -> argmax_final.
+//   moe_partial is assumed ALREADY all-reduced (eager AR#2) before this segment replays.  Writes
+//   rank_max/rank_arg; the eager head-AR-max then picks the global token.
+static void enqueue_tp8_seghead(RankState& S, float* h_in, cudaStream_t s) {
+  tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.moe_partial, h_in);
+  const size_t lm_smem = (size_t)HIDDEN * sizeof(float);
+  tp8_final_norm<<<1, 256, 0, s>>>(h_in, S.w_final_norm, S.hn);
+  tp8_lmhead_argmax_partial<<<S.lm_blocks, 256, lm_smem, s>>>(
+      S.hn, S.Wlm, S.Wlm_scale, S.v_rows, S.v_off, S.block_max, S.block_arg);
+  tp8_argmax_final<<<1, 32, 0, s>>>(S.block_max, S.block_arg, S.lm_blocks, S.rank_max, S.rank_arg);
+}
+// Capture a kernel-only segment (no NCCL, no setattr inside) into an instantiated graph exec.
+template <typename Fn>
+static cudaGraphExec_t capture_segment(cudaStream_t s, Fn fn) {
+  // warm-up the segment once outside capture (first-touch), then capture.
+  fn(s); CK(cudaStreamSynchronize(s));
+  CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+  fn(s);
+  cudaGraph_t g = nullptr; CK(cudaStreamEndCapture(s, &g));
+  cudaGraphExec_t e = nullptr; CK(cudaGraphInstantiate(&e, g, nullptr, nullptr, 0));
+  cudaGraphDestroy(g);
+  return e;
+}
+// Replay ONE token in the kernels-only-graph + eager-AR mode (host launches segments, eager ARs).
+static void replay_tp8_step_kgraph(RankState& S) {
+  cudaStream_t s = S.stream;
+  for (int layer = 0; layer < N_LAYERS; ++layer) {
+    CK(cudaGraphLaunch(S.exec_segA, s));                          // K1,K2,K3 -> attn_partial
+    NK(ncclGroupStart());
+    NK(ncclAllReduce(S.attn_partial, S.attn_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s)); // eager AR#1
+    NK(ncclGroupEnd());
+    CK(cudaGraphLaunch(S.exec_segB, s));                          // resid,K4,K5 -> moe_partial
+    NK(ncclGroupStart());
+    NK(ncclAllReduce(S.moe_partial, S.moe_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s));    // eager AR#2
+    NK(ncclGroupEnd());
+  }
+  CK(cudaGraphLaunch(S.exec_seghead, s));                         // resid,norm,lm_head,argmax
+  NK(ncclGroupStart());
+  NK(ncclAllReduce(S.rank_max, S.rank_max, 1, ncclFloat32, ncclMax, S.comm, s));                 // eager head AR
+  NK(ncclGroupEnd());
+}
+
+// =================================================================================================
+// A tiny reusable sense-reversing spin barrier for the N rank-threads.  Used to make all 8 ranks
+// ENTER and EXIT cudaStreamBeginCapture/EndCapture CONCURRENTLY — the NCCL collectives recorded
+// during capture need every rank live, or ncclGroupEnd would block / capture would be inconsistent.
+// =================================================================================================
+struct SpinBarrier {
+  int n;
+  std::atomic<int> count{0};
+  std::atomic<int> sense{0};
+  explicit SpinBarrier(int n_) : n(n_) {}
+  void wait() {
+    int s = sense.load(std::memory_order_acquire);
+    if (count.fetch_add(1, std::memory_order_acq_rel) + 1 == n) {
+      count.store(0, std::memory_order_release);
+      sense.store(s ^ 1, std::memory_order_release);          // release all waiters
+    } else {
+      while (sense.load(std::memory_order_acquire) == s) { /* spin */ }
+    }
+  }
+};
 
 // =================================================================================================
 // MULTI-THREAD DRIVER — one host thread per rank/communicator (the NCCL deadlock fix).
@@ -577,11 +919,12 @@ extern "C" __global__ void tp8_k1_epilogue(
 }
 static void tp8_k1_launch(RankState& S, const float* h, cudaStream_t s) {
   // S.qkv_proj is a per-rank device scratch (allocated in alloc_rank on this rank's device).
+  // NOTE: the cudaFuncSetAttribute opt-in for the >48KB dynamic smem is done ONCE in alloc_rank
+  //   (off the hot path, outside any graph-capture region) — calling it here would abort capture.
   const int blockA = 256, warpsA = blockA >> 5;
   int needA = (QKV_OUT_RANK + warpsA - 1) / warpsA;           // 2048/8 = 256 CTAs for 1 warp/row
   int ctasA = needA < 264 ? needA : 264;
   const size_t smemA = (size_t)HIDDEN * sizeof(float);
-  cudaFuncSetAttribute(tp8_k1_qkv_gemv, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemA);
   tp8_k1_qkv_gemv<<<ctasA, blockA, smemA, s>>>(h, S.w_in_norm, S.Wqkv, S.Wqkv_scale, S.qkv_proj);
   // epilogue: 16 head rows -> 1 small CTA
   tp8_k1_epilogue<<<1, 256, 0, s>>>(S.qkv_proj, S.q_norm, S.k_norm, S.rope_cos, S.rope_sin,
@@ -697,11 +1040,12 @@ extern "C" __global__ void tp8_k3_oproj(
   }
 }
 static void tp8_k3_launch(RankState& S, cudaStream_t s) {
+  // cudaFuncSetAttribute opt-in done ONCE in alloc_rank (4KB smem here is < 48KB so it isn't even
+  //   required, but keeping it out of the hot path is mandatory for graph capture).
   const int block = 256, warps_per_cta = block >> 5;
   int ctas = (HIDDEN + warps_per_cta - 1) / warps_per_cta;
   if (ctas > 264) ctas = 264;
   const size_t smem = (size_t)Q_DIM_RANK * sizeof(float);     // 1024 floats = 4 KB
-  cudaFuncSetAttribute(tp8_k3_oproj, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
   tp8_k3_oproj<<<ctas, block, smem, s>>>(S.attn_out, S.Wo, S.Wo_scale, S.attn_partial);
 }
 
@@ -774,6 +1118,7 @@ static void alloc_rank(RankState& S, int ctx_len) {
   CK(cudaMalloc(&S.w_post_norm, HIDDEN * sizeof(float)));       fill_f32(S.w_post_norm, HIDDEN, 40u, 0.5f, true);
   CK(cudaMalloc(&S.Wgate, (size_t)N_EXPERTS * HIDDEN * sizeof(fp8)));  fill_fp8(S.Wgate, (size_t)N_EXPERTS*HIDDEN, 41u);
   CK(cudaMalloc(&S.Wgate_scale, N_EXPERTS * sizeof(float)));    fill_f32(S.Wgate_scale, N_EXPERTS, 42u, 0.02f, true);
+  CK(cudaMalloc(&S.g_logits, N_EXPERTS * sizeof(float)));       // fast-router split-K accumulator
   CK(cudaMalloc(&S.sel_idx, TOP_K * sizeof(int)));
   CK(cudaMalloc(&S.sel_w,   TOP_K * sizeof(float)));
   { std::vector<int> si(TOP_K); std::vector<float> sw(TOP_K, 1.0f/TOP_K);
@@ -805,14 +1150,17 @@ static void alloc_rank(RankState& S, int ctx_len) {
   CK(cudaMalloc(&S.a_glb, (size_t)TOP_K * MOE_INTER_RANK * sizeof(float)));
   CK(cudaMalloc(&S.moe_partial, HIDDEN * sizeof(float)));
 
-  // K5 plan: nslot=TOP_K rows for A = TOP_K*192, rows for B = TOP_K*HIDDEN; smemB = TOP_K*192 floats.
-  S.k5.block = 256;
+  // K5 plan: MULTIPLE-ROWS-PER-WARP (RA gate+up, RB down) — the measured win on the TP=8 192-shard
+  // (k5_sharded_bench.cu: R=1/block=256 -> 15% MBU; RA=2/RB=8/block=512 -> ~34% MBU, 2.2x).  Grid is
+  // row-GROUP aware: A has TOP_K*192/RA groups, B has TOP_K*HIDDEN/RB groups.  Block 512 fills the SMs.
+  S.k5.block = 512;
   {
     const int warps_per_cta = S.k5.block >> 5;
-    auto ctas_for = [&](int rows) { int need = (rows + warps_per_cta - 1) / warps_per_cta;
-                                    return std::min(std::max(need, 132), 264); };
-    S.k5.ctasA = ctas_for(TOP_K * MOE_INTER_RANK);
-    S.k5.ctasB = ctas_for(TOP_K * HIDDEN);
+    auto ctas_for = [&](int rows, int R) { int groups = (rows + R - 1) / R;
+                                           int need = (groups + warps_per_cta - 1) / warps_per_cta;
+                                           return std::min(std::max(need, 132), 264); };
+    S.k5.ctasA = ctas_for(TOP_K * MOE_INTER_RANK, TP8_K5_RA);
+    S.k5.ctasB = ctas_for(TOP_K * HIDDEN,         TP8_K5_RB);
     S.k5.smemA = (size_t)HIDDEN * sizeof(float);
     S.k5.smemB = (size_t)TOP_K * MOE_INTER_RANK * sizeof(float);   // 8*192*4 = 6 KB
   }
@@ -830,10 +1178,21 @@ static void alloc_rank(RankState& S, int ctx_len) {
   CK(cudaMalloc(&S.rank_max, sizeof(float)));
   CK(cudaMalloc(&S.rank_arg, sizeof(int)));
 
-  // dynamic-smem opt-ins for the sharded kernels.
+  // dynamic-smem opt-ins for the sharded kernels.  ALL cudaFuncSetAttribute calls live HERE (once per
+  // rank, off the hot path), so the per-token launch helpers issue ONLY kernel launches + the two
+  // all-reduces — which is what makes the whole token stream-capturable into a CUDA graph.  (The k1/k3
+  // helpers above and the capture-safe router below therefore no longer call setattr per launch.)
   CK(cudaFuncSetAttribute(tp8_k5a_gateup, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)S.k5.smemA));
   CK(cudaFuncSetAttribute(tp8_k5b_down,   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)S.k5.smemB));
   CK(cudaFuncSetAttribute(tp8_lmhead_argmax_partial,
+                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(HIDDEN*sizeof(float))));
+  CK(cudaFuncSetAttribute(tp8_k1_qkv_gemv,
+                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(HIDDEN*sizeof(float))));
+  CK(cudaFuncSetAttribute(tp8_k3_oproj,
+                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(Q_DIM_RANK*sizeof(float))));
+  CK(cudaFuncSetAttribute(k4_router,
+                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(HIDDEN*sizeof(float))));
+  CK(cudaFuncSetAttribute(tp8_k4_gate_gemv,
                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(HIDDEN*sizeof(float))));
   CK(cudaDeviceSynchronize());
 }
@@ -890,7 +1249,9 @@ static void sharded_one_layer_capture(std::vector<RankState>& R,
     tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_partial, h_dst);   // r1 = h_src + AR(O-proj)
     if (S.rank == 0) CK(cudaMemcpyAsync(r1_out_host, h_dst, HIDDEN * sizeof(float),
                                         cudaMemcpyDeviceToHost, s));
-    k4_launch(h_dst, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, s);
+    // NEW fast router (split-K gate GEMV + select) — validated here against the reference's stock
+    // single-CTA k4_router; identical math, so r2 must still match to < 1e-2.
+    tp8_k4_launch(h_dst, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, S.g_logits, s);
     CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
     tp8_k5a_gateup<<<S.k5.ctasA, S.k5.block, S.k5.smemA, s>>>(
         h_dst, S.sel_idx, S.Wgu_d, S.Wgu_scale_d, S.a_glb, TOP_K);
@@ -1157,6 +1518,105 @@ static int run_correctness_check(std::vector<RankState>& R) {
 }
 
 // =================================================================================================
+// PER-KERNEL PROFILER — definitive per-kernel-class ranking on ONE rank (rank 0 is representative).
+// -------------------------------------------------------------------------------------------------
+// Each kernel class is launched REPS times back-to-back between two cudaEvents on rank 0's stream,
+// divided by REPS to get us/launch, then multiplied by its per-token launch count (N_LAYERS for the
+// per-layer kernels, 1 for the head kernels) to get the per-token us contribution.  Inputs are the
+// rank's already-allocated dummy buffers (values are garbage in the proxy, but the kernel SHAPE / grid
+// / HBM byte-traffic are the real ones, so the timing is faithful).  No NCCL, no cross-rank sync — this
+// isolates pure kernel-execution cost, which is exactly the ~20 ms kernels-only floor we are dissecting.
+// =================================================================================================
+static void profile_per_kernel(RankState& S, int PEAK_unused) {
+  CK(cudaSetDevice(S.dev));
+  cudaStream_t s = S.stream;
+  const int REPS = 2000;
+  cudaEvent_t e0, e1;
+  CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+
+  // launch grids/smem identical to the hot-path helpers.
+  const int blockA = 256, warpsA = blockA >> 5;
+  int needA = (QKV_OUT_RANK + warpsA - 1) / warpsA; int ctasA = needA < 264 ? needA : 264;
+  const size_t k1_smem = (size_t)HIDDEN * sizeof(float);
+  const int k3_block = 256, k3_wpc = k3_block >> 5;
+  int k3_ctas = (HIDDEN + k3_wpc - 1) / k3_wpc; if (k3_ctas > 264) k3_ctas = 264;
+  const size_t k3_smem = (size_t)Q_DIM_RANK * sizeof(float);
+  const int k2_wpc = 4, k2_block = k2_wpc * 32;
+  dim3 k2gP(S.n_splits, (Q_HEADS_RANK + k2_wpc - 1) / k2_wpc);
+  dim3 k2gR((Q_HEADS_RANK + k2_wpc - 1) / k2_wpc);
+  const size_t lm_smem = (size_t)HIDDEN * sizeof(float);
+  const size_t k4_smem = (size_t)HIDDEN * sizeof(float);
+
+  struct Row { const char* name; double us_per; double per_tok; int count; bool in_sum; };
+  std::vector<Row> rows;
+  auto timeit_x = [&](const char* name, int per_tok_count, bool in_sum, auto launch) -> double {
+    // warm
+    for (int i = 0; i < 50; ++i) launch();
+    CK(cudaStreamSynchronize(s));
+    CK(cudaEventRecord(e0, s));
+    for (int i = 0; i < REPS; ++i) launch();
+    CK(cudaEventRecord(e1, s));
+    CK(cudaEventSynchronize(e1));
+    float ms = 0.f; CK(cudaEventElapsedTime(&ms, e0, e1));
+    double us_per = (double)ms * 1e3 / REPS;
+    rows.push_back({name, us_per, us_per * per_tok_count, per_tok_count, in_sum});
+    return us_per * per_tok_count;
+  };
+  auto timeit = [&](const char* name, int per_tok_count, auto launch) -> double {
+    return timeit_x(name, per_tok_count, true, launch);
+  };
+
+  printf("\n== PER-KERNEL PROFILE (rank 0, %d reps/kernel, per-token = us/launch x launches/token) ==\n", REPS);
+  // ---- attention ----
+  timeit("K1 qkv_gemv", N_LAYERS, [&]{ tp8_k1_qkv_gemv<<<ctasA, blockA, k1_smem, s>>>(
+      S.h_a, S.w_in_norm, S.Wqkv, S.Wqkv_scale, S.qkv_proj); });
+  timeit("K1 epilogue", N_LAYERS, [&]{ tp8_k1_epilogue<<<1, 256, 0, s>>>(
+      S.qkv_proj, S.q_norm, S.k_norm, S.rope_cos, S.rope_sin, S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale); });
+  timeit("K2 partial (flash-decode)", N_LAYERS, [&]{ tp8_k2_partial<<<k2gP, k2_block, 0, s>>>(
+      S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale, S.ctx_len, S.n_splits, S.rank, S.part_m, S.part_l, S.part_acc); });
+  timeit("K2 reduce", N_LAYERS, [&]{ tp8_k2_reduce<<<k2gR, k2_block, 0, s>>>(
+      S.part_m, S.part_l, S.part_acc, S.n_splits, S.attn_out); });
+  timeit("K3 oproj", N_LAYERS, [&]{ tp8_k3_oproj<<<k3_ctas, k3_block, k3_smem, s>>>(
+      S.attn_out, S.Wo, S.Wo_scale, S.attn_partial); });
+  // ---- MoE ----
+  // OLD single-CTA router (the measured bottleneck) — timed for the before->after record (NOT in sum).
+  timeit_x("K4 router OLD (1-CTA)", N_LAYERS, false, [&]{ k4_router<<<1, 256, k4_smem, s>>>(
+      S.h_a, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w); });
+  // NEW fast router: split-K gate GEMV across the whole GPU + tiny select kernel.
+  {
+    const int k4_block = 128, k4_warps = k4_block >> 5;
+    const int k4_ctas = (N_EXPERTS * TP8_K4_KSPLIT + k4_warps - 1) / k4_warps;
+    timeit("K4 gate_gemv NEW", N_LAYERS, [&]{
+      CK(cudaMemsetAsync(S.g_logits, 0, N_EXPERTS * sizeof(float), s));
+      tp8_k4_gate_gemv<<<k4_ctas, k4_block, k4_smem, s>>>(S.h_a, S.w_post_norm, S.Wgate, S.g_logits); });
+    timeit("K4 select NEW", N_LAYERS, [&]{ tp8_k4_select<<<1, 32, 0, s>>>(
+      S.g_logits, S.Wgate_scale, S.sel_idx, S.sel_w); });
+  }
+  timeit("K5a gateup", N_LAYERS, [&]{ tp8_k5a_gateup<<<S.k5.ctasA, S.k5.block, S.k5.smemA, s>>>(
+      S.h_a, S.sel_idx, S.Wgu_d, S.Wgu_scale_d, S.a_glb, TOP_K); });
+  timeit("K5b down", N_LAYERS, [&]{ tp8_k5b_down<<<S.k5.ctasB, S.k5.block, S.k5.smemB, s>>>(
+      S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.moe_partial, TOP_K); });
+  // ---- residual adds (2 per layer) + head ----
+  timeit("residual_add (x2/layer)", 2 * N_LAYERS, [&]{ tp8_residual_add<<<32, 256, 0, s>>>(
+      S.h_a, S.attn_partial, S.h_b); });
+  timeit("final_norm", 1, [&]{ tp8_final_norm<<<1, 256, 0, s>>>(S.h_a, S.w_final_norm, S.hn); });
+  timeit("lmhead_argmax_partial", 1, [&]{ tp8_lmhead_argmax_partial<<<S.lm_blocks, 256, lm_smem, s>>>(
+      S.hn, S.Wlm, S.Wlm_scale, S.v_rows, S.v_off, S.block_max, S.block_arg); });
+  timeit("argmax_final", 1, [&]{ tp8_argmax_final<<<1, 32, 0, s>>>(
+      S.block_max, S.block_arg, S.lm_blocks, S.rank_max, S.rank_arg); });
+
+  double total = 0.0; for (auto& r : rows) if (r.in_sum) total += r.per_tok;
+  // sort descending by per-token contribution.
+  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b){ return a.per_tok > b.per_tok; });
+  printf("  %-28s %10s %8s %12s %8s\n", "kernel", "us/launch", "x/token", "us/token", "%of-sum");
+  for (auto& r : rows)
+    printf("  %-28s %10.3f %8d %12.2f %7.1f%%%s\n", r.name, r.us_per, r.count, r.per_tok,
+           r.in_sum ? 100.0*r.per_tok/total : 0.0, r.in_sum ? "" : "  (excl from sum)");
+  printf("  %-28s %10s %8s %12.2f %7.1f%%\n", "SUM (kernels-only/token)", "", "", total, 100.0);
+  CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
+}
+
+// =================================================================================================
 // main() — one process, 8 GPUs, NCCL.  Measures the REAL TP=8 B=1 decode latency + AR overhead.
 // =================================================================================================
 int main(int argc, char** argv) {
@@ -1242,6 +1702,9 @@ int main(int argc, char** argv) {
     printf("\n(correctness check skipped: argv[4]==0)\n");
   }
 
+  // ---- PER-KERNEL PROFILE (rank 0): definitive per-kernel-class us/token ranking -----------------
+  profile_per_kernel(R[0], (int)PEAK);
+
   // ---- warm up once OUTSIDE timing (lazy module load, cudaFuncSetAttribute, NCCL channel setup) ----
   //   Driven via run_all_ranks (one thread/rank) so the per-rank NCCL groups can't deadlock.
   run_all_ranks(R, [](RankState& S){ enqueue_tp8_step(S); });
@@ -1295,19 +1758,147 @@ int main(int argc, char** argv) {
   CK(cudaEventElapsedTime(&ms_ar, ev0, ev1)); ms_ar /= IT;
 
   // =============================================================================================
+  // (c) CUDA-GRAPH path: capture the WHOLE token (94 layers' kernels + 188 NCCL all-reduces + head
+  //     + the head argmax-max AR) into ONE per-rank graph, then replay all 8 graphs IT times with a
+  //     single cudaGraphLaunch/rank.  This collapses the ~1100 host launches/token into 1 replay/rank.
+  //     NCCL>=2.9 records collectives enqueued during capture as graph nodes; all 8 ranks must capture
+  //     CONCURRENTLY (the collectives need every rank live) -> the SpinBarrier brackets begin/end.
+  // =============================================================================================
+  SpinBarrier cap_bar(TP);
+  std::atomic<int> capture_ok{1};
+  {
+    std::vector<std::thread> th; th.reserve(TP);
+    for (int r = 0; r < TP; ++r) {
+      th.emplace_back([&, r]() {
+        CK(cudaSetDevice(R[r].dev));
+        // warm-up one eager step OUTSIDE capture (lazy module load / any first-touch), then sync.
+        enqueue_tp8_step(R[r]);
+        CK(cudaStreamSynchronize(R[r].stream));
+        // All 8 ranks enter capture together.  ThreadLocal mode -> each thread captures only the work
+        // IT issues on its own stream (the 8 captures don't see each other's launches), while the NCCL
+        // collectives are matched across the concurrently-capturing ranks.
+        cap_bar.wait();
+        cudaError_t e = cudaStreamBeginCapture(R[r].stream, cudaStreamCaptureModeThreadLocal);
+        if (e != cudaSuccess) { capture_ok.store(0); printf("rank %d BeginCapture: %s\n", r, cudaGetErrorString(e)); }
+        enqueue_tp8_step(R[r]);                       // record ONE full token (kernels + this rank's ARs)
+        e = cudaStreamEndCapture(R[r].stream, &R[r].graph);
+        if (e != cudaSuccess) { capture_ok.store(0); printf("rank %d EndCapture: %s\n", r, cudaGetErrorString(e)); }
+        cap_bar.wait();                               // all ranks finished capture before instantiate
+        if (R[r].graph) {
+          e = cudaGraphInstantiate(&R[r].exec, R[r].graph, nullptr, nullptr, 0);
+          if (e != cudaSuccess) { capture_ok.store(0); printf("rank %d Instantiate: %s\n", r, cudaGetErrorString(e)); }
+        }
+      });
+    }
+    for (auto& t : th) t.join();
+  }
+
+  float ms_graph = 0.f;
+  size_t graph_nodes = 0;
+  if (capture_ok.load() && R[0].graph) {
+    cudaGraphGetNodes(R[0].graph, nullptr, &graph_nodes);
+    printf("\ncaptured per-rank graph: %zu nodes (rank 0).  Replaying %d iters x 8 ranks.\n",
+           graph_nodes, IT);
+    std::vector<std::thread> th; th.reserve(TP);
+    for (int r = 0; r < TP; ++r) {
+      th.emplace_back([&, r]() {
+        CK(cudaSetDevice(R[r].dev));
+        for (int i = 0; i < WARM; ++i) { CK(cudaGraphLaunch(R[r].exec, R[r].stream)); CK(cudaStreamSynchronize(R[r].stream)); }
+        if (r == 0) CK(cudaEventRecord(ev0, R[0].stream));
+        for (int i = 0; i < IT; ++i) { CK(cudaGraphLaunch(R[r].exec, R[r].stream)); CK(cudaStreamSynchronize(R[r].stream)); }
+        if (r == 0) CK(cudaEventRecord(ev1, R[0].stream));
+      });
+    }
+    for (auto& t : th) t.join();
+    CK(cudaSetDevice(0)); CK(cudaEventSynchronize(ev1));
+    CK(cudaEventElapsedTime(&ms_graph, ev0, ev1)); ms_graph /= IT;
+  } else {
+    printf("\nCUDA-GRAPH capture FAILED on at least one rank (see errors above) — graphed result skipped.\n");
+  }
+
+  // =============================================================================================
+  // (d) KERNELS-ONLY graphs + EAGER all-reduces (the robust fallback).  Each layer's ~9 kernel
+  //     launches collapse into 2 graph launches (segA, segB); the 188 NCCL all-reduces stay on
+  //     NCCL's fast EAGER path.  Host ops/token: 2*94 + 188 + 2 = ~378 (vs ~1100 eager).  No
+  //     cross-rank barrier is needed during capture here — the segments contain NO collectives —
+  //     so each rank captures its 3 kernel segments independently, then all 8 ranks replay together
+  //     with the eager ARs interleaved (which IS where the ranks rendezvous, exactly as in eager).
+  // =============================================================================================
+  float ms_kgraph = 0.f, ms_konly = 0.f;
+  cudaEvent_t g_ev_k0, g_ev_k1;
+  CK(cudaSetDevice(0)); CK(cudaEventCreate(&g_ev_k0)); CK(cudaEventCreate(&g_ev_k1));
+  {
+    std::vector<std::thread> th; th.reserve(TP);
+    for (int r = 0; r < TP; ++r) {
+      th.emplace_back([&, r]() {
+        CK(cudaSetDevice(R[r].dev));
+        RankState& S = R[r];
+        // Capture the 3 kernel-only segments (fixed buffers: h_a in, h_b out — proxy drops ping-pong).
+        S.exec_segA    = capture_segment(S.stream, [&](cudaStream_t s){ enqueue_tp8_segA(S, S.h_a, s); });
+        S.exec_segB    = capture_segment(S.stream, [&](cudaStream_t s){ enqueue_tp8_segB(S, S.h_a, S.h_b, s); });
+        S.exec_seghead = capture_segment(S.stream, [&](cudaStream_t s){ enqueue_tp8_seghead(S, S.h_b, s); });
+        CK(cudaStreamSynchronize(S.stream));
+        // time: WARM then IT replays, per-iter sync (same methodology as the eager/full-graph paths).
+        for (int i = 0; i < WARM; ++i) { replay_tp8_step_kgraph(S); CK(cudaStreamSynchronize(S.stream)); }
+        if (r == 0) CK(cudaEventRecord(ev0, R[0].stream));
+        for (int i = 0; i < IT; ++i)  { replay_tp8_step_kgraph(S); CK(cudaStreamSynchronize(S.stream)); }
+        if (r == 0) CK(cudaEventRecord(ev1, R[0].stream));
+        // ---- DIAGNOSTIC: kernels-only graphs replayed back-to-back with NO eager ARs and only ONE
+        //      sync at the end (isolates pure collapsed-kernel execution time / launch floor). ----
+        CK(cudaStreamSynchronize(S.stream));
+        if (r == 0) CK(cudaEventRecord(g_ev_k0, R[0].stream));
+        for (int i = 0; i < IT; ++i) {
+          for (int l = 0; l < N_LAYERS; ++l) { CK(cudaGraphLaunch(S.exec_segA, S.stream));
+                                               CK(cudaGraphLaunch(S.exec_segB, S.stream)); }
+          CK(cudaGraphLaunch(S.exec_seghead, S.stream));
+        }
+        if (r == 0) CK(cudaEventRecord(g_ev_k1, R[0].stream));
+        CK(cudaStreamSynchronize(S.stream));
+      });
+    }
+    for (auto& t : th) t.join();
+    CK(cudaSetDevice(0)); CK(cudaEventSynchronize(ev1));
+    CK(cudaEventElapsedTime(&ms_kgraph, ev0, ev1)); ms_kgraph /= IT;
+    CK(cudaEventSynchronize(g_ev_k1));
+    CK(cudaEventElapsedTime(&ms_konly, g_ev_k0, g_ev_k1)); ms_konly /= IT;
+    printf("\nkernels-only segment graphs captured (segA+segB+head/rank); 188 ARs eager.  Replayed %d iters x 8 ranks.\n", IT);
+    printf("DIAGNOSTIC kernels-only graph replay (NO ARs, 1 sync/IT): %.2f us/token  (pure collapsed-kernel exec floor)\n",
+           ms_konly*1e3);
+    CK(cudaEventDestroy(g_ev_k0)); CK(cudaEventDestroy(g_ev_k1));
+  }
+
+  // =============================================================================================
   // report.
   // =============================================================================================
   auto tokps = [](float ms) { return 1.0e3 / ms; };
   auto gbps  = [&](float ms) { return b_token / 1e6 / ms; };   // per-GPU bytes/ms = GB/s
-  printf("\n  %-30s %12s %12s %12s %12s\n", "metric", "us/token", "tok/s", "GB/s/GPU", "%HBMpeak");
-  printf("  %-30s %12.2f %12.1f %12.1f %11.1f%%\n", "TP=8 full step (real)",
+  printf("\n  %-34s %12s %12s %12s %12s\n", "metric", "us/token", "tok/s", "GB/s/GPU", "%HBMpeak");
+  printf("  %-34s %12.2f %12.1f %12.1f %11.1f%%\n", "TP=8 EAGER step (baseline)",
          ms_full*1e3, tokps(ms_full), gbps(ms_full), 100.0*gbps(ms_full)/PEAK);
-  printf("  %-30s %12.2f %12s %12s %12s\n", "  all-reduces only (189)",
+  if (ms_graph > 0.f)
+    printf("  %-34s %12.2f %12.1f %12.1f %11.1f%%\n", "TP=8 full NCCL-in-graph (replay)",
+           ms_graph*1e3, tokps(ms_graph), gbps(ms_graph), 100.0*gbps(ms_graph)/PEAK);
+  printf("  %-34s %12.2f %12.1f %12.1f %11.1f%%\n", "TP=8 kernels-graph + eager AR",
+         ms_kgraph*1e3, tokps(ms_kgraph), gbps(ms_kgraph), 100.0*gbps(ms_kgraph)/PEAK);
+
+  // Pick the best graphed path as the headline result.
+  float ms_best = ms_kgraph;
+  const char* best_name = "kernels-graph + eager AR";
+  if (ms_graph > 0.f && ms_graph < ms_best) { ms_best = ms_graph; best_name = "full NCCL-in-graph"; }
+  printf("\n  >>> BEST graphed path: %s  ->  %.2f us/token  =  %.1f tok/s\n",
+         best_name, ms_best*1e3, tokps(ms_best));
+  printf("  >>> SPEEDUP vs EAGER baseline: %.2fx  (%.1f%% faster; %.2f us/tok saved; %.1f -> %.1f tok/s)\n",
+         ms_full / ms_best, 100.0*(ms_full - ms_best)/ms_full, (ms_full - ms_best)*1e3,
+         tokps(ms_full), tokps(ms_best));
+
+  printf("\n  %-34s %12.2f %12s %12s %12s\n", "  all-reduces only (189)",
          ms_ar*1e3, "-", "-", "-");
-  printf("  %-30s %12.2f\n", "  -> per-all-reduce", ms_ar*1e3 / ar_per_step);
-  printf("  %-30s %12.2f  (%.1f%% of the step)\n", "  -> AR overhead / token",
+  printf("  %-34s %12.2f\n", "  -> per-all-reduce", ms_ar*1e3 / ar_per_step);
+  printf("  %-34s %12.2f  (%.1f%% of EAGER step)\n", "  -> AR overhead / token",
          ms_ar*1e3, 100.0 * ms_ar / ms_full);
-  printf("  %-30s %12.2f\n", "  compute-only (full - AR)", (ms_full - ms_ar)*1e3);
+  printf("  %-34s %12.2f\n", "  compute-only (eager - AR)", (ms_full - ms_ar)*1e3);
+  printf("  %-34s %12.2f  (%.1f%% of BEST graphed step -> the new dominant cost)\n",
+         "  AR-share of BEST graphed step", ms_ar*1e3, 100.0 * ms_ar / ms_best);
 
   // ideal weight-only tok/s if each GPU streamed its WEIGHT shard at ~45% of HBM peak (no comms, no KV):
   const double ideal_ms = (b_weight_only / 1e9) / (PEAK * 0.45 / 1e3);   // GB / (GB/s) -> ms
@@ -1317,6 +1908,13 @@ int main(int argc, char** argv) {
   printf("== done ==\n");
 
   // ---- cleanup (best-effort) ----
+  for (int r = 0; r < TP; ++r) {
+    if (R[r].exec)  cudaGraphExecDestroy(R[r].exec);
+    if (R[r].graph) cudaGraphDestroy(R[r].graph);
+    if (R[r].exec_segA)    cudaGraphExecDestroy(R[r].exec_segA);
+    if (R[r].exec_segB)    cudaGraphExecDestroy(R[r].exec_segB);
+    if (R[r].exec_seghead) cudaGraphExecDestroy(R[r].exec_seghead);
+  }
   for (int r = 0; r < TP; ++r) { ncclCommDestroy(comms[r]); }
   CK(cudaEventDestroy(ev0)); CK(cudaEventDestroy(ev1));
   return 0;

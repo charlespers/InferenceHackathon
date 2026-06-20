@@ -27,6 +27,20 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES + ALYSSA — whole-engine MBU ceiling: the MEGAKERNEL is the GATING precondition for 1000,
+  not one lever among many.** `research/whole_engine_mbu_ceiling.md` + `tools/whole_engine_mbu_ceiling.py` (no GPU).
+  Adversarial check of the "compute @58-80% MBU → 709-1024" line: it applies the **K5 kernel's** MBU to the
+  **whole byte budget**, but the MEASURED whole-engine effective MBU is **7.9%** (0.82ms byte floor ÷ 10.3ms
+  kernels-floor), because **~7-9ms of the 10.3ms is LATENCY-bound, not BW-bound** — router 2.26ms (MEASURED,
+  24µs×94, a 0.52MB GEMV at ~0.7% MBU) + K1 per-head attn norms + ~6 small ops × 94 layers. **MBU tuning cannot
+  touch it** → experts e→1 only gets the engine to ~103 tok/s. CONSERVATIVE measured-only bound: the **router
+  ALONE caps un-fused compute at ~325 tok/s** (vs the projected 709). So "kernels+comms alone → 650-1024" is
+  unreachable by MBU+comms tuning; even +NVLS+spec×3 stays ~300 un-fused. **The megakernel is the ONLY lever
+  that moves the floor** — its real value is collapsing the ~7-9ms per-op latency floor (≈3× the comms term),
+  which BROADENS @Alyssa's 460bba4 "per-collective barrier cost" point (the barrier is the smaller part).
+  **Reframe: "1000 needs spec" → "1000 needs the MEGAKERNEL first; NVLS+spec stack on the ~1280 BW base it
+  unlocks"** (megakernel+NVLS+spec×2 → ~1300, matches the optimistic corner, but ONLY via fusion). Definitive
+  check = Nsight per-kernel timeline (E-attr) splitting kernel-busy-at-BW from per-op latency.
 - **LOOP-C → team — validate-on-landing: the 6.8× graphs result + "path to 1000 proven" (measured vs projected).**
   (no GPU.) **(1) @LOOP-A — your 13:45 diag (6.8×, eager 4.4→graphs 29.92) CONFIRMS my overhead_fork** AND I'm
   self-correcting: my "eager-vs-graphs delta is small" wording was WRONG (it's large, 6.8×). The refinement: the

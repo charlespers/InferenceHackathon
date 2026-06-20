@@ -104,6 +104,21 @@ using namespace q3;
 #define GEMM_MMAX 16
 #endif
 
+// ---- LATENCY-FLOOR DIAGNOSTIC: strip the per-GEMM "glue" (quant-in + scale/epilogue/select-out +
+//   residual + memset) from the kernels-only SEGMENT graphs so segA/segB time the cuBLASLt GEMM
+//   PANELS alone (+ K2).  This bounds how much ANY glue-fusion could ever recover — it is the
+//   collapsible-floor measurement that resolves the forward->430 verdict.  TIMING-ONLY (the proxy
+//   already produces garbage residuals; this only changes us/token, not the byte volume of the GEMMs).
+//   STRIP_GLUE=1 -> drop the glue; the GEMM .run() + K2 stay.  Default 0 (the real engine path). -----
+#ifndef STRIP_GLUE
+#define STRIP_GLUE 0
+#endif
+// STRIP_K2=1 (with STRIP_GLUE=1) -> also drop K2 from segA, leaving ONLY the K1/K3 GEMM panels, to
+//   separate the K2-flash-decode latency from the glue latency.  Default 0.
+#ifndef STRIP_K2
+#define STRIP_K2 0
+#endif
+
 // ---- Pull in the existing validated kernels as ONE translation unit (same recipe as decode_step.cu).
 #define K5_NO_MAIN
 #define Q3_K1_LAUNCH_HELPER
@@ -938,31 +953,58 @@ extern "C" __global__ void tp8_k4_select(
 extern "C" __global__ void tp8_k4_select_fused(
     const __nv_bfloat16* __restrict__ D, const float* __restrict__ act_scale, int Mpad,
     const float* __restrict__ Wgate_scale, int* __restrict__ sel_idx, float* __restrict__ sel_w) {
-  __shared__ float logits[N_EXPERTS];
+  // WARP-PARALLEL select (was: serial-in-lane-0, ~7.7us/launch = the #1 glue cost).  N_EXPERTS=128 maps
+  // 4 experts/lane; the full-128 max + softmax-denom + each of the 8 top-k argmax passes are WARP
+  // reductions (8 shuffle reductions vs 1024 serial comparisons).  Selection math is BIT-IDENTICAL to
+  // the serial version (full-128 softmax denom first, top-8 by logit with -inf masking, renorm-to-1).
   const int lane = threadIdx.x & 31;
   const float as = act_scale[0];
-  for (int e = lane; e < N_EXPERTS; e += 32) logits[e] = (float)D[(size_t)e * Mpad] * as * Wgate_scale[e];
-  __syncwarp();
-  if (lane != 0) return;
+  // each lane holds its EPL=N_EXPERTS/32 logits in registers (no smem round-trip needed).
+  constexpr int EPL = N_EXPERTS / 32;             // 4 at N_EXPERTS=128
+  float lg[EPL];
+  #pragma unroll
+  for (int j = 0; j < EPL; ++j) { int e = j*32 + lane;
+    lg[j] = (float)D[(size_t)e * Mpad] * as * Wgate_scale[e]; }
+  // full-128 max (warp reduce of per-lane max).
   float mx = -FLT_MAX;
-  for (int e = 0; e < N_EXPERTS; ++e) mx = fmaxf(mx, logits[e]);
+  #pragma unroll
+  for (int j = 0; j < EPL; ++j) mx = fmaxf(mx, lg[j]);
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  // full-128 softmax denominator (warp reduce of per-lane partial sum).
   float sum = 0.f;
-  for (int e = 0; e < N_EXPERTS; ++e) sum += __expf(logits[e] - mx);
+  #pragma unroll
+  for (int j = 0; j < EPL; ++j) sum += __expf(lg[j] - mx);
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
   const float inv_sum = 1.f / sum;
-  float logit_sel[TOP_K];
-  for (int s = 0; s < TOP_K; ++s) {
-    int bi = -1; float bv = -FLT_MAX;
-    for (int e = 0; e < N_EXPERTS; ++e) if (logits[e] > bv) { bv = logits[e]; bi = e; }
-    if (bi < 0) bi = s;
-    sel_idx[s]   = bi;
-    logit_sel[s] = logits[bi];
-    logits[bi]   = -FLT_MAX;
-  }
+  // top-8 by logit: each pass is a warp argmax (each lane's best-of-EPL, then shuffle-reduce the pair).
   float chosen = 0.f;
-  for (int s = 0; s < TOP_K; ++s) { float p = __expf(logit_sel[s] - mx) * inv_sum;
-                                    sel_w[s] = p; chosen += p; }
-  const float inv_chosen = 1.f / chosen;
-  for (int s = 0; s < TOP_K; ++s) sel_w[s] *= inv_chosen;
+  for (int s = 0; s < TOP_K; ++s) {
+    // lane-local best over its EPL experts.
+    float bv = -FLT_MAX; int bi = -1;
+    #pragma unroll
+    for (int j = 0; j < EPL; ++j) { float v = lg[j]; if (v > bv) { bv = v; bi = j*32 + lane; } }
+    // warp argmax-reduce (carry the matching index; tie -> lower e, matching the serial first-wins scan).
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      int   oi = __shfl_xor_sync(0xffffffffu, bi, o);
+      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    // mask the winner to -inf in the lane that owns it so it isn't repicked.
+    if (bi >= 0 && (bi & 31) == lane) lg[bi >> 5] = -FLT_MAX;
+    if (lane == 0) {
+      sel_idx[s] = (bi < 0) ? s : bi;
+      float p = __expf(bv - mx) * inv_sum;
+      sel_w[s] = p; chosen += p;
+    }
+  }
+  if (lane == 0) {
+    const float inv_chosen = 1.f / chosen;
+    #pragma unroll
+    for (int s = 0; s < TOP_K; ++s) sel_w[s] *= inv_chosen;
+  }
 }
 #endif // USE_GEMM
 
@@ -1143,9 +1185,19 @@ static void enqueue_tp8_step(RankState& S) {
 // segA: K1 -> K2 -> memset(attn_partial) -> K3.  Reads h_in, writes attn_partial (partial O-proj).
 static void enqueue_tp8_segA(RankState& S, float* h_in, cudaStream_t s) {
 #if USE_GEMM
+#if STRIP_GLUE
+  // GEMM PANELS ONLY (+ K2): no quant-in, no K1-epilogue/RoPE, no K3 scale-epilogue.  Bounds the
+  // collapsible glue-latency floor.  Inputs are reused-fp8 buffers (already populated); timing-only.
+  S.p_qkv.run(S.xq_hidden, S.Wqkv, S.d_qkv, s);          // K1 QKV GEMM panel
+#if !STRIP_K2
+  tp8_k2_launch(S, s);                                    // K2 flash-decode (latency, MBU-immune)
+#endif
+  S.p_oproj.run(S.xq_qdim, S.Wo, S.d_oproj, s);          // K3 O-proj GEMM panel
+#else
   gemm_k1_launch(S, h_in, s);
   tp8_k2_launch(S, s);
   gemm_k3_launch(S, s);   // no memset: gemm_epi_scale fully overwrites attn_partial (see enqueue_tp8_layer)
+#endif
 #else
   tp8_k1_launch(S, h_in, s);
   tp8_k2_launch(S, s);
@@ -1157,6 +1209,13 @@ static void enqueue_tp8_segA(RankState& S, float* h_in, cudaStream_t s) {
 //   attn_reduced is the AR#1 result (eager AR ran before this segment replays; out-of-place -> OUT half).
 static void enqueue_tp8_segB(RankState& S, float* h_in, float* h_out, cudaStream_t s) {
 #if USE_GEMM
+#if STRIP_GLUE
+  // GEMM PANELS ONLY: no residual+rmsnorm+quant, no K4 select, no K5a SiLU-epilogue, no K5b down GEMV,
+  // no memset.  Just the K4-gate + K5-gateup GEMM panels.  Bounds the collapsible glue floor of segB.
+  S.p_gate.run(S.xq_hidden, S.Wgate, S.d_gate, s);                 // K4 router gate GEMM panel
+  S.p_k5gu_pack.run(S.xq_hidden, S.Wgu_pack, S.d_k5gu, s);         // K5 gate+up GEMM panel
+  S.p_k5d_pack.run(S.xq_a, S.Wd_pack, S.d_k5d, s);                 // K5 down GEMM panel (the packed flat one)
+#else
   // FUSED residual add + K4 RMSNorm + fp8 quant (matches enqueue_tp8_layer): one launch -> h_out (fp32
   // residual) + xq_hidden/act_scale (K4 GEMM input).  Then K4 GEMM+select consumes the prequantized X.
   tp8_residual_rmsnorm_quant<<<1, 1024, (size_t)HIDDEN*sizeof(float), s>>>(
@@ -1164,6 +1223,7 @@ static void enqueue_tp8_segB(RankState& S, float* h_in, float* h_out, cudaStream
   gemm_k4_launch_prequant(S, s);
   CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
   gemm_k5_launch(S, h_out, K5_SEL_PHYS_FIXED, s);   // graph-safe fixed slot->shard
+#endif
 #else
   tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.attn_reduced, h_out);
   tp8_k4_launch(h_out, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, S.g_logits, s);

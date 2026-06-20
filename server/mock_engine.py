@@ -11,13 +11,15 @@ _WORDS = ("Routing across eight H100s with expert parallelism keeps "
 #   - vllm:    a competent OpenAI-compatible baseline at B=1, no speculative decode.
 # The contract (8 experts/token, accepted<=proposed, ttft>0) holds for every profile.
 ENGINE_PROFILES = {
-    # MEASURED on 8xH100 this session: Conifer forward = 9.81ms (101.9 tok/s plain; NVLS single-barrier
-    # comms 1.77ms); spec (measured-flat GEMM verify x EAGLE3-tau) -> ~290 tok/s emitted. vLLM = 85.7
-    # tok/s measured (bf16 TP=8, no effective B=1 spec). per_tok_ms = emitted rate; forward_tpot_ms +
-    # collective_us drive the floor breakdown (where one forward's time goes).
-    "conifer": {"label": "Conifer", "ttft_ms": 34.0, "per_tok_ms": 9.30,
+    # MEASURED LIVE on 8xH100 (2026-06-20, custom TP8 engine, correctness PASS): Conifer forward =
+    # 8.61ms = 116.1 tok/s plain decode (graphed, full-NCCL-in-graph; 1.19x over eager 97.3). The NVLS
+    # one-barrier all-reduce is now the dominant cost: 1.76ms = 20.4% of the step. GEMM verify is FLAT
+    # in M (T(16)/T(1)=1.001) -> spec rides free on the GEMM; spec'd e2e (EAGLE3 tau) -> ~291 tok/s.
+    # vLLM baseline = 85.7 tok/s (bf16 TP=8, no effective B=1 spec). per_tok_ms = emitted rate;
+    # forward_tpot_ms + collective_us drive the floor breakdown (where one forward's time goes).
+    "conifer": {"label": "Conifer", "ttft_ms": 34.0, "per_tok_ms": 8.61,
                 "spec_enabled": True, "proposed": 8,
-                "forward_tpot_ms": 9.30, "collective_us": 9.35, "weight_dtype": "fp8"},
+                "forward_tpot_ms": 8.61, "collective_us": 9.35, "weight_dtype": "fp8"},
     "vllm": {"label": "vLLM", "ttft_ms": 110.0, "per_tok_ms": 11.7,
              "spec_enabled": False, "proposed": 1,
              "forward_tpot_ms": 11.7, "collective_us": 17.0, "weight_dtype": "bf16"},

@@ -5,12 +5,21 @@ export interface Telemetry {
   experts: Expert[];
   spec: { proposed: number; accepted: number };
 }
+export interface FloorBreakdown { weight: number; comms: number; kv: number; overhead: number; }
 export interface Summary {
   ttft_ms: number;
   decode_tok_per_s: number;
   prefill_tokens: number;
   completion_tokens: number;
   spec_accept_rate: number;
+  // Optimization telemetry (optional; server/optimization_telemetry.py). Absent on older backends.
+  engine?: string;
+  spec_enabled?: boolean;
+  floor_breakdown_ms?: FloorBreakdown;   // weight/comms/kv/overhead ms per token (sums≈tpot)
+  regime?: string;                       // "floor-bound" | "weight-bound"
+  next_lever?: string;
+  pct_of_ceiling?: number;               // decode_tok_per_s / ~2000 (fp8+spec ceiling)
+  pct_of_roofline?: number;
 }
 export interface GpuInfo {
   id: number;

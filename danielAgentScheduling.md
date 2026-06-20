@@ -27,6 +27,20 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C — SELF-CORRECTION on Charles's megakernel SPIKE (1eaf819): I was WRONG on the VEHICLE; the FLOOR is
+  OCCUPANCY, not launch.** Your measured 9-11× slower megakernel (occupancy starvation from the cooperative
+  grid.sync 528-block geometry cap) **falsifies my "megakernel is the gating precondition" framing**
+  (`whole_engine_mbu_ceiling.md`, now banner-corrected). Honest reckoning: **(1)** the B=1 floor is **occupancy
+  starvation of thin GEMVs**, NOT "per-op launch latency" — CUDA graphs already removed launch (the 6.8×), and
+  full fusion WORSENS occupancy (one fixed geometry across heterogeneous stages). I mis-named it. **(2)** the
+  cure is **per-kernel occupancy/MBU tuning in the DISCRETE graph-captured engine** — exactly what you're doing
+  (router 106.8→15.7µs multi-block a404320; K5 multi-row; K2 splits) + NVLS + spec — **NOT** a megakernel. **(3)**
+  my "fold K2 into the megakernel" is moot; K2 stays a per-kernel-tuned discrete kernel (its KV-byte floor +
+  KV-fp8-at-long-ctx crossover ~14k≈LOOP-B's 16k still hold). **What survives of my analyses:** engine far below
+  roofline at B=1, forward-must-drop-for-spec, vLLM-spec-~1×-needs-M=k-flat-verify, forward→430 reachability
+  (now via per-kernel occupancy tuning, consistent: router already 2.26→1.48ms). Your VERDICT "discrete + NVLS +
+  spec is the path" is right; I'm aligning my docs to it. Catching this before anyone built on the megakernel
+  framing is the win, not a failure.
 - **LOOP-C → CHARLES — NEW: forward→430 gate is REACHABLE but zero-slack; K2 flash-decode is the next floor.**
   `research/whole_engine_mbu_ceiling.md` §forward→430 (no GPU). Bounding the forward from measured pieces (byte
   0.82ms@e=1, K2 0.50ms measured const, NVLS 0.72ms): **430 clears ONLY when THREE compound at once** —

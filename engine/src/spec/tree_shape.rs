@@ -107,6 +107,80 @@ impl TreeCostModel {
     }
 }
 
+/// MEASURED K2 verify-cost ratio vs M=1 as a function of tree node count (ctx 4096, tensor-core verify,
+/// results/mk_tree_attn/tc_attn_probe_result.txt — the flatness CEILING run). Flat to ~M=16, then the TC
+/// tiles saturate the SMs and the verify re-acquires M-scaling. Use this instead of a hard `node_budget`
+/// cliff so the optimizer trades tree width against the REAL degradation.
+pub const CEILING_CTX4096: &[(u64, f32)] = &[
+    (1, 1.00), (8, 1.02), (16, 1.09), (24, 1.16), (32, 1.24), (48, 1.42), (64, 1.64),
+];
+/// ctx 8192 degrades sooner (longer per-warp draft-self + bigger score GEMM).
+pub const CEILING_CTX8192: &[(u64, f32)] = &[
+    (1, 1.00), (8, 1.05), (16, 1.14), (24, 1.21), (32, 1.38), (48, 1.76), (64, 2.21),
+];
+
+/// Piecewise-linear verify-cost ratio at `nodes` from a measured `(nodes, ratio)` curve. Clamps below the
+/// first point; linearly extrapolates past the last (so very wide trees keep getting penalized).
+pub fn verify_ratio(nodes: u64, curve: &[(u64, f32)]) -> f32 {
+    if curve.is_empty() {
+        return 1.0;
+    }
+    if nodes <= curve[0].0 {
+        return curve[0].1;
+    }
+    for w in curve.windows(2) {
+        let (n0, r0) = w[0];
+        let (n1, r1) = w[1];
+        if nodes <= n1 {
+            let t = (nodes - n0) as f32 / (n1 - n0) as f32;
+            return r0 + t * (r1 - r0);
+        }
+    }
+    // extrapolate from the last segment
+    let (n0, r0) = curve[curve.len() - 2];
+    let (n1, r1) = curve[curve.len() - 1];
+    let slope = (r1 - r0) / (n1 - n0) as f32;
+    r1 + slope * (nodes - n1) as f32
+}
+
+impl TreeCostModel {
+    /// Calibrated to our regime: flat verify cost ≈ 1.0 decode-step, EAGLE3-head draft per level ≈ 0.1.
+    /// Pair with a CEILING_* curve via [`optimal_measured`]. node_budget is a hard cap (set generous;
+    /// the curve does the real trading).
+    pub fn calibrated() -> Self {
+        TreeCostModel { verify_flat_cost: 1.0, head_level_cost: 0.1, node_budget: 256 }
+    }
+
+    /// Score using the MEASURED verify-cost curve: round_cost = depth·head + verify_flat_cost·ratio(nodes).
+    pub fn evaluate_measured(&self, m: &MeasuredAccept, branch: usize, depth: usize, curve: &[(u64, f32)]) -> TreeShape {
+        let p = m.persistence(depth);
+        let emitted = 1.0 + tree_expected_accepted(m.first_pos, p, branch, depth);
+        let nodes = tree_nodes(branch, depth);
+        let draft = depth as f32 * self.head_level_cost;
+        let round_cost = draft + self.verify_flat_cost * verify_ratio(nodes, curve);
+        let speedup = if round_cost > 0.0 { emitted / round_cost } else { 0.0 };
+        TreeShape { branch, depth, emitted, nodes, speedup }
+    }
+
+    /// Optimal (branch, depth) using the measured degradation curve (no hard cliff — the curve penalizes
+    /// over-wide trees). Returns the speedup-maximizing shape.
+    pub fn optimal_measured(&self, m: &MeasuredAccept, max_branch: usize, max_depth: usize, curve: &[(u64, f32)]) -> TreeShape {
+        let mut best = self.evaluate_measured(m, 1, 1, curve);
+        for branch in 1..=max_branch.max(1) {
+            for depth in 1..=max_depth.max(1) {
+                if tree_nodes(branch, depth) > self.node_budget {
+                    continue;
+                }
+                let s = self.evaluate_measured(m, branch, depth, curve);
+                if s.speedup > best.speedup {
+                    best = s;
+                }
+            }
+        }
+        best
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +234,46 @@ mod tests {
         let best = model.optimal(&m, 8, 8);
         assert!(best.nodes <= 16, "optimal nodes {} within budget", best.nodes);
         assert!(best.speedup >= model.evaluate(&m, 1, 1).speedup, "optimal ≥ chain fallback");
+    }
+
+    #[test]
+    fn verify_ratio_interpolates_and_extrapolates() {
+        let c = CEILING_CTX4096;
+        assert!((verify_ratio(1, c) - 1.00).abs() < 1e-6);
+        assert!((verify_ratio(16, c) - 1.09).abs() < 1e-6);
+        let mid = verify_ratio(20, c); // between (16,1.09) and (24,1.16)
+        assert!(mid > 1.09 && mid < 1.16, "interp {mid}");
+        assert!(verify_ratio(128, c) > 1.64, "extrapolates past last point");
+        // monotonic non-decreasing
+        assert!(verify_ratio(32, c) >= verify_ratio(16, c));
+    }
+
+    #[test]
+    fn measured_optimal_is_a_modest_tree_in_the_flat_regime() {
+        // With the real ceiling curve, the optimizer should pick a tree that stays in/near the flat
+        // regime (nodes within ~the ceiling), beat the chain, and not run away to huge width.
+        let m = measured();
+        let model = TreeCostModel::calibrated();
+        let best = model.optimal_measured(&m, 8, 8, CEILING_CTX4096);
+        assert!(best.branch >= 2, "trees pay: branch {} >= 2", best.branch);
+        assert!(best.nodes <= 64, "stays near the flat regime: nodes {}", best.nodes);
+        // beats the best chain under the same measured-cost model
+        let mut best_chain = model.evaluate_measured(&m, 1, 1, CEILING_CTX4096);
+        for d in 1..=8 {
+            let s = model.evaluate_measured(&m, 1, d, CEILING_CTX4096);
+            if s.speedup > best_chain.speedup { best_chain = s; }
+        }
+        assert!(best.speedup > best_chain.speedup, "tree {} > chain {}", best.speedup, best_chain.speedup);
+    }
+
+    #[test]
+    fn ctx8192_curve_penalizes_width_more_than_ctx4096() {
+        // Longer context degrades sooner -> the optimal tree should be no wider (fewer nodes) at ctx8192.
+        let m = measured();
+        let model = TreeCostModel::calibrated();
+        let b4 = model.optimal_measured(&m, 8, 8, CEILING_CTX4096);
+        let b8 = model.optimal_measured(&m, 8, 8, CEILING_CTX8192);
+        assert!(b8.nodes <= b4.nodes, "ctx8192 nodes {} <= ctx4096 nodes {}", b8.nodes, b4.nodes);
     }
 
     #[test]

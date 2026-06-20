@@ -60,19 +60,20 @@ static __global__ void softmax_ctx(__half* S,float* mxo,float* smo,int H,int M,i
 static __global__ void draft_self_tree(const __half* Q,const __half* dK,const __half* dV,const int* parent,
                                        __half* Od,float* mxo,float* smo,int H,int M,int MMAX,int d){
   int gw=(blockIdx.x*blockDim.x+threadIdx.x)>>5,lane=threadIdx.x&31; if(gw>=H*M)return;
-  int hh=gw/M,m=gw%M; float scale=rsqrtf((float)d); const __half* q=Q+((size_t)hh*MMAX+m)*d; float qr[VPL];
+  // ENGINE layout: Q/draftK/draftV are [M][H][d] (query-major, = [M][Q_DIM_RANK]); per-query stride = H*d.
+  int hh=gw/M,m=gw%M; float scale=rsqrtf((float)d); const __half* q=Q+((size_t)m*H+hh)*d; float qr[VPL];
   #pragma unroll
   for(int c=0;c<VPL;c++) qr[c]=(float)q[lane*VPL+c];
   float mx=-FLT_MAX,sm=0,acc[VPL];
   #pragma unroll
   for(int c=0;c<VPL;c++) acc[c]=0;
   for(int j=m;j>=0;j=parent[j]){
-    const __half* k=dK+((size_t)hh*MMAX+j)*d; float p=0;
+    const __half* k=dK+((size_t)j*H+hh)*d; float p=0;
     #pragma unroll
     for(int c=0;c<VPL;c++) p+=qr[c]*(float)k[lane*VPL+c];
     #pragma unroll
     for(int o=16;o>0;o>>=1) p+=__shfl_xor_sync(~0u,p,o);
-    float s=p*scale; const __half* v=dV+((size_t)hh*MMAX+j)*d;
+    float s=p*scale; const __half* v=dV+((size_t)j*H+hh)*d;
     float mn=fmaxf(mx,s),corr=__expf(mx-mn),pe=__expf(s-mn); sm=sm*corr+pe;
     #pragma unroll
     for(int c=0;c<VPL;c++) acc[c]=acc[c]*corr+pe*(float)v[lane*VPL+c];
@@ -90,7 +91,7 @@ static __global__ void merge(const __half* Oc,const float* mxc,const float* smc,
   float mc=mxc[st],sc=smc[st],md=mxd[st],sd=smd[st],mg=fmaxf(mc,md);
   float wc=sc*__expf(mc-mg),wd=sd*__expf(md-mg),den=wc+wd;
   float oc=(float)Oc[((size_t)hh*MMAX+m)*d+c],od=(float)Od[((size_t)hh*MMAX+m)*d+c];
-  O[((size_t)hh*MMAX+m)*d+c]=__float2half(den>0?(oc*wc+od*wd)/den:0.f);
+  O[((size_t)m*H+hh)*d+c]=__float2half(den>0?(oc*wc+od*wd)/den:0.f);  // out = ENGINE [M][H][d] (attn_out_mq)
 }
 
 // Launch the full verify attention. Returns 0 on success. Requires cublas handle in TENSOR_OP math mode.
@@ -98,14 +99,17 @@ static __global__ void merge(const __half* Oc,const float* mxc,const float* smc,
 static inline int verify_attn(cublasHandle_t cb,
     const __half* Q, const __half* K, const __half* V,
     const __half* draftK, const __half* draftV, const int* parent,
-    int ctx, int M, int MMAX,
+    int ctx, int M, int MMAX, int n_heads,
     __half* S, __half* Oc, __half* Od, float* mxc, float* smc, float* mxd, float* smd,
     __half* out, cudaStream_t stream=0){
-  const int H=N_Q_HEADS, d=HEAD_DIM; const float scale=1.f/sqrtf((float)d), zero=0.f, one=1.f;
+  // n_heads = Q heads this call covers. In-engine: Q_HEADS_RANK (=8 at TP8), NOT N_Q_HEADS. K/V are the
+  // (replicated) cache for the kv head(s) those Q heads map to; here each of the H heads has its own K/V
+  // slab [ctx x HEAD_DIM] (GQA broadcast = caller duplicates the kv-head slab across its Q heads).
+  const int H=n_heads, d=HEAD_DIM; const float scale=1.f/sqrtf((float)d), zero=0.f, one=1.f;
   cublasSetStream(cb, stream);
   // (A) context: S[ctx x M] = scale * K^T(ctx x d) * Q(d x M)
   if(cublasGemmStridedBatchedEx(cb,CUBLAS_OP_T,CUBLAS_OP_N, ctx,M,d, &scale,
-      K,CUDA_R_16F,d,(long long)ctx*d, Q,CUDA_R_16F,d,(long long)MMAX*d, &zero,
+      K,CUDA_R_16F,d,(long long)ctx*d, Q,CUDA_R_16F,H*d,(long long)d, &zero,  // Q engine [M][H][d]: ldb=H*d, batch-stride=d
       S,CUDA_R_16F,ctx,(long long)MMAX*ctx, H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT)!=CUBLAS_STATUS_SUCCESS) return 1;
   int w=H*M, blk=128;
   softmax_ctx<<<(w*32+blk-1)/blk,blk,0,stream>>>(S,mxc,smc,H,M,MMAX,ctx);

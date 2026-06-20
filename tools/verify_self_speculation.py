@@ -57,7 +57,8 @@ def main():
 
     @torch.no_grad()
     def lens_top(hidden, k):  # apply the model's own norm+head to an intermediate hidden state
-        logits = lm_head(norm(hidden.to(next(lm_head.parameters()).dtype)))
+        p = next(lm_head.parameters())                       # match the head's device AND dtype
+        logits = lm_head(norm(hidden.to(device=p.device, dtype=p.dtype)))  # model may shard 8-way (235B)
         return torch.topk(logits.float(), k, dim=-1).indices  # [..., k]
 
     agree1 = {d: [] for d in depths}     # shallow top-1 == full top-1

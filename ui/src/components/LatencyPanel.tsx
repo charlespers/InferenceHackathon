@@ -8,17 +8,16 @@ function Sparkline({ values }: { values: number[] }) {
     `${(i / (values.length - 1)) * 100},${30 - (v / max) * 28}`).join(" ");
   return (
     <svg viewBox="0 0 100 30" preserveAspectRatio="none" className="w-full h-10">
-      <polyline points={pts} fill="none" stroke="currentColor" strokeWidth="1"
-                className="text-emerald-400" />
+      <polyline points={pts} fill="none" stroke="var(--conifer)" strokeWidth="1" />
     </svg>
   );
 }
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="bg-neutral-900 rounded p-2">
-      <div className="text-[10px] uppercase tracking-wide text-neutral-500">{label}</div>
-      <div className="text-lg font-mono text-emerald-300">{value}</div>
+    <div className="bg-sunk border hair p-2">
+      <div className="micro">{label}</div>
+      <div className="text-lg metric-num mt-0.5" style={{ color: "var(--conifer)" }}>{value}</div>
     </div>
   );
 }
@@ -27,16 +26,16 @@ export function LatencyPanel({ telemetry, summary }: { telemetry: Telemetry[]; s
   const s = liveStats(telemetry);
   const ttft = summary ? `${summary.ttft_ms.toFixed(0)} ms` : "—";
   return (
-    <div className="border border-neutral-800 rounded-lg p-3">
-      <div className="text-xs text-neutral-400 mb-2">Latency · B=1</div>
+    <div className="panel p-3">
+      <div className="micro mb-2">Latency · B=1</div>
       <div className="grid grid-cols-2 gap-2">
         <Stat label="TTFT" value={ttft} />
         <Stat label="tok/s" value={String(s.tokPerSec)} />
         <Stat label="tokens" value={String(s.tokens)} />
         <Stat label="spec accept" value={`${Math.round(s.specAccept * 100)}%`} />
       </div>
-      <div className="mt-2 text-neutral-500">
-        <div className="text-[10px] uppercase tracking-wide mb-1">inter-token ms</div>
+      <div className="mt-3 text-ink-mute">
+        <div className="micro mb-1">inter-token ms</div>
         <Sparkline values={telemetry.map((t) => t.t_ms)} />
       </div>
     </div>

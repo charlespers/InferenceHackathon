@@ -10,32 +10,36 @@ export function GpuExpertViz({ telemetry, topology }: { telemetry: Telemetry[]; 
   const last = telemetry[telemetry.length - 1];
 
   return (
-    <div className="border border-neutral-800 rounded-lg p-3 flex-1 min-h-0 flex flex-col">
-      <div className="flex justify-between text-xs text-neutral-400 mb-2">
+    <div className="panel p-3 flex-1 min-h-0 flex flex-col">
+      <div className="flex justify-between micro mb-2">
         <span>GPU / expert routing</span>
-        {!topology && <span className="text-amber-500/70">topology unavailable — fallback</span>}
+        {!topology && <span style={{ color: "var(--studio-warn)" }}>topology unavailable — fallback</span>}
       </div>
       <div className="grid grid-cols-4 gap-2">
         {Array.from({ length: numGpus }, (_, i) => (
           <div key={i}
-               className={`rounded p-2 bg-neutral-900 border transition-colors ${
-                 hot.has(i) ? "border-emerald-400 shadow-[0_0_12px] shadow-emerald-500/40" : "border-neutral-800"}`}>
-            <div className="text-[10px] text-neutral-400">{names[i]}</div>
-            <div className="h-1.5 mt-1 rounded bg-neutral-800 overflow-hidden">
-              <div className="h-full bg-emerald-500" style={{ width: `${(hits[i] / max) * 100}%` }} />
+               className="p-2 bg-sunk border stripe transition-colors"
+               style={{
+                 borderColor: hot.has(i) ? "var(--conifer)" : "var(--studio-rule)",
+                 borderInlineStartColor: hot.has(i) ? "var(--conifer)" : "var(--studio-rule)",
+                 background: hot.has(i) ? "color-mix(in oklch, var(--conifer) 8%, var(--studio-sunk))" : undefined,
+               }}>
+            <div className="text-[10px] text-ink-mute metric-num">{names[i]}</div>
+            <div className="h-1.5 mt-1 bg-paper border hair overflow-hidden">
+              <div className="h-full" style={{ width: `${(hits[i] / max) * 100}%`, background: "var(--conifer)" }} />
             </div>
-            <div className="text-[10px] font-mono text-neutral-500 mt-1">{hits[i]}</div>
+            <div className="text-[10px] metric-num text-ink-mute mt-1">{hits[i]}</div>
           </div>
         ))}
       </div>
-      <div className="mt-3 text-[10px] text-neutral-500">
-        <div className="uppercase tracking-wide mb-1">last token experts</div>
+      <div className="mt-3 text-[10px] text-ink-mute">
+        <div className="micro mb-1">last token experts</div>
         <div className="flex flex-wrap gap-1">
           {last?.experts.map((e, i) => (
-            <span key={i} className="px-1.5 py-0.5 rounded bg-neutral-800 font-mono text-emerald-300">
+            <span key={i} className="px-1.5 py-0.5 bg-sunk border hair metric-num" style={{ color: "var(--conifer)" }}>
               L{e.layer}·E{e.expert_id}→GPU{e.gpu}
             </span>
-          )) ?? <span className="text-neutral-600">idle</span>}
+          )) ?? <span className="text-ink-faint">idle</span>}
         </div>
       </div>
     </div>

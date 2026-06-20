@@ -13,6 +13,9 @@ class ChatRequest(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 256
     stream: bool = True
+    # Non-standard, optional. Selects a serving profile for the mock so the UI can
+    # race two engines side by side ("conifer" vs "vllm"). Standard clients omit it.
+    engine: str = "conifer"
 
 
 def sse(data: dict) -> str:

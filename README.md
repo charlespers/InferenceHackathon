@@ -1,13 +1,20 @@
-# Multi-GPU Inference Console
+# Conifer · Inference, measured
 
-Minimal UI for latency-oriented, **B=1** MoE inference on **8×H100**, targeting
-**Qwen3-235B-A22B** (235B total / 22B active, 128 experts/layer, top-8 routing). It
-streams chat over an **OpenAI-compatible API** and visualizes per-token **expert→GPU
-routing** and **latency** (TTFT, tok/s, inter-token, speculative-decode acceptance).
+A latency-oriented inference console for **B=1** MoE serving on **8×H100**, targeting
+**Qwen3-235B-A22B** (235B total / 22B active, 128 experts/layer, top-8 routing). Two views:
+
+- **Race** — fires one prompt at two engines (**Conifer** vs a **vLLM** baseline) at the
+  same instant and times them on the wall clock. The speedup is *measured*, not asserted.
+  A test-time-compute panel then translates that speed into task quality: in vLLM's
+  time-to-answer, Conifer fits *k* reasoning passes → self-consistency lifts accuracy.
+- **Console** — single-stream chat with live **latency** (TTFT, tok/s, inter-token,
+  speculative-decode acceptance) and per-token **expert→GPU routing** across the 8 H100s.
 
 Built fresh for the hackathon — **no proprietary engine code is included**. The UI talks
 to any OpenAI-compatible backend over standard SSE (non-standard fields are `x_`-namespaced
-and optional). A Python mock ships so the whole thing runs and demos with no real engine.
+and optional). A Python mock ships two serving profiles so the whole thing runs and demos
+with no real engine; the accuracy curve is an illustrative self-consistency model, clearly
+labeled as such.
 
 ## Architecture
 
@@ -24,10 +31,10 @@ The seam is three endpoints: `GET /v1/models`, `GET /v1/topology`, and
 ## Run (two processes)
 
 ```bash
-# 1. backend (mock)
+# 1. backend (mock) — paces each token at the engine profile's real latency
 python -m venv .venv && source .venv/bin/activate
 pip install -r server/requirements.txt
-STREAM_DELAY=0.03 uvicorn server.main:app --host 0.0.0.0 --port 8000
+uvicorn server.main:app --host 0.0.0.0 --port 8000
 
 # 2. UI
 cd ui && npm install && npm run dev   # http://localhost:5173
@@ -36,6 +43,22 @@ cd ui && npm install && npm run dev   # http://localhost:5173
 Point the backend-url field (top-right of the UI) at your server. For the H100 box:
 `ssh -L 8000:localhost:8000 <box>`, run the server there, keep the UI pointed at
 `http://localhost:8000`.
+
+**Demo pacing.** The mock sleeps each token at its profile's real per-token latency so the
+race speedup is measured by the UI's wall clock. `STREAM_SCALE` warps time (`1.0` = real
+time; `0.5` = twice as fast for a snappier demo); `STREAM_DELAY` adds a flat per-token delay.
+
+```bash
+STREAM_SCALE=0.6 uvicorn server.main:app --host 0.0.0.0 --port 8000
+```
+
+**Race two real engines.** By default both lanes share the backend-url and differ only by an
+`engine` profile (`conifer` / `vllm`). To race real OpenAI-compatible servers head-to-head,
+point each lane at its own URL:
+
+```bash
+cd ui && VITE_CONIFER_BASE=http://localhost:8001 VITE_VLLM_BASE=http://localhost:8002 npm run dev
+```
 
 ## Swap in the real engine
 

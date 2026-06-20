@@ -17,7 +17,22 @@
 
 ## Experiment queue (priority order)
 
-### E1 — End-to-end B=1 engine baseline (FP8 + expert-parallel)  ⟵ HIGHEST
+### E0 — Real collective latency (nccl-tests)  ⟵ DO FIRST: cheapest, decides the whole strategy
+Goal: settle comms-bound vs weight-bound *without a model load*. The team's model uses
+`collective_latency_s = 5µs` (a ballpark) → TP8 comms 0.94 ms (dominant). If the real small-message
+all-reduce is ~1.5µs, comms is only 0.28 ms and **weight** dominates instead. One measurement decides
+whether to prioritize comms/prefetch or int4/kernels (see `docs/team-coordination.md`).
+```bash
+cd /workspace/nccl-tests   # already built
+./build/all_reduce_perf -b 8 -e 64K -f 2 -g 8     # 8B..64KB across 8 GPUs; read latency(us) at 8-16KB
+./build/alltoall_perf    -b 8 -e 64K -f 2 -g 8     # EP dispatch/combine latency
+```
+Record: the **8–16 KB all-reduce latency (µs)** and all-to-all latency. Then set
+`src/inferutil/hardware.py: collective_latency_s` to the measured value and re-run the bench model.
+**Go signal:** if all-reduce ≤ ~2µs → weight-bound → prioritize E7 (int4) + E4 (kernel); if ≥ ~4µs →
+comms-bound → prioritize route-prefetch (`engine/routing/scheduler.rs`) + one-shot all-reduce, then E6 spec.
+
+### E1 — End-to-end B=1 engine baseline (FP8 + expert-parallel)  ⟵ HIGHEST (after E0)
 Goal: the headline real single-user tok/s + which term dominates.
 ```bash
 # launch (served name = measure.py default)

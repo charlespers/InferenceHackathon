@@ -40,14 +40,25 @@ what the team already built, corrects one of my earlier calls, and revises the G
 *engine* path is `--enable-expert-parallel`; the *model* says a true TP8 column-shard, e.g. via a block-64
 requant or the cudarc engine, is worth ~2.8× over EP8.)
 
-## New finding + open discrepancy (what E1 resolves)
-At the TP8 **floor** (e=1.0), the model's breakdown is **weight 0.81 ms, comms 0.94 ms** — i.e. **comms
-DOMINATES**. My earlier roofline put comms at ~0.14–0.28 ms. These disagree by ~3–6×. Consequences:
-- If the team's comms model is right → **comms is the #1 lever**, and the routing `scheduler.rs`
-  (early-dispatch prefetch) + one-shot/NVSHMEM all-reduce matter *more* than any byte lever. The
-  prefetch hides ~5 µs/layer × 94 ≈ **~0.47 ms/token** — most of that 0.94 ms comms term.
-- If my lower estimate is right → weight dominates and int4/quant pays first.
-- **E1 (measured real TPOT) decides this.** Back out the true comms term: real TPOT − (weight/e) − kv.
+## The finding that decides the whole strategy: comms-bound vs weight-bound
+At the TP8 **floor** (e=1.0), the model's breakdown is **weight 0.81 ms, comms 0.94 ms** — comms
+**dominates**. My roofline put comms at ~0.14–0.28 ms. **Reconciled:** their `comms = collectives/layer ×
+n_layers × collective_latency_s`, and `latency.py`/`hardware.py` use **`collective_latency_s = 5e-6`**
+(commented *"empirical ballpark; override per run"*). So TP8 = `2 × 94 × 5µs = 0.94 ms`. My estimate used
+**~1.5µs** (tuned LL/one-shot) → 0.28 ms. **The only difference is the per-collective latency**, and the
+whole strategy hinges on it:
+
+| real all-reduce latency | TP8 comms | dominant term | #1 lever |
+|---|---|---|---|
+| ~5 µs (stock NCCL) | 0.94 ms | **comms** | route-prefetch (`scheduler.rs`) + one-shot/NVSHMEM all-reduce |
+| ~1.5 µs (tuned LL) | 0.28 ms | **weight** | int4 experts + the K5 kernel |
+| ~0.75 µs (NVSHMEM-fused) | 0.14 ms | weight | (comms paid down) |
+
+**This is measurable in seconds with NO model load** — `nccl-tests` is already built on the box
+(`/workspace/nccl-tests`). Measure the real 8–16 KB all-reduce + all-to-all latency, plug it into
+`collective_latency_s`, and the comms-vs-weight question is settled *before* spending a 15-min slot on the
+engine. See **E0** in `gpu-agent-experiments.md` (do it first — it's cheaper than E1 and decides what E1/E6/E7
+should even prioritize). The team should also set `hardware.py: collective_latency_s` from the measured value.
 
 ## Correction to my dossier (L4 route-prefetch was under-rated)
 My `next-levers-research.md` L4 called route-prediction prefetch "moot at B=1 (weights HBM-resident)."

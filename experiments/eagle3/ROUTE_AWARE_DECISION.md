@@ -1,6 +1,26 @@
 # Route-aware tree-shaping — empirical go/no-go (LOOP-A novel lever)
 
-**Status: CONTINGENT — gated on the 08:45 EAGLE3 measurement. Do NOT implement before the data.**
+**Status (UPDATED 2026-06-20 ~10:18): LITERATURE-VALIDATED on our exact model — lever upgraded from
+"likely marginal" to "build it (as adaptive verification), pending our own V/F confirmation."**
+
+## LITERATURE VALIDATION (deep-research, cited)
+- **EVICT** (Pan et al., USTC, arXiv:2605.00342, May 2026 — "Making Every Verified Token Count: Adaptive
+  Verification for MoE Speculative Decoding"): training-free, hyperparameter-free, **LOSSLESS**. Measured
+  **−32.5% activated experts, −26.6% verify latency, 1.21× avg over EAGLE-3, and 1.25× on Qwen3-235B-A22B
+  (our EXACT model)**. So expert-union-aware verification IS a real lossless win here, not marginal.
+- **KEY NUANCE:** most of EVICT's win is from verifying ~75% FEWER tokens (a tree-size/COMMS win), NOT the
+  direct weight-read (~14%). That's WHY it pays in the floor-bound regime — fewer tokens through the ~188
+  collectives. So reframe the lever: "verify fewer, expert-cheaper tokens," a comms win as much as a weight win.
+- **My novel delta vs EVICT/XShare(2602.07265)/MoE-Spec(2602.16052):** make expert-union minimization the
+  EXPLICIT PRIMARY objective of chain/verify construction (using our measured 44.6% top-8 overlap). EVICT gets
+  the union shrink as a side effect of a cost/benefit utility; nobody targets union directly.
+- **vLLM CONSTRAINT (important):** vLLM's EAGLE3 path is **CHAIN-ONLY** (no dynamic/tree drafting; issue
+  #18327 closed not-planned). So `num_speculative_tokens=K` is a linear chain, not a branching tree. My lever
+  in vLLM = **adaptive verification / chain-truncation** (EVICT-style), NOT tree-shaping. True dynamic trees
+  need SGLang or a vLLM patch.
+
+**Original status (still the empirical gate): CONTINGENT on our own EAGLE3 V/F measurement. Don't ship a
+number we haven't measured. EVICT validates the DIRECTION; our slot confirms the MAGNITUDE on our stack.**
 
 ## The lever
 EAGLE3's verify pass runs the full 235B MoE over the draft *tree* (N·k positions) in one

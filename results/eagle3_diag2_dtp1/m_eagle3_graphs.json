@@ -1,0 +1,42 @@
+{
+  "ok": true,
+  "base": "http://localhost:8077",
+  "model": "qwen3",
+  "decode": 64,
+  "median": {
+    "ok": true,
+    "ttft_ms": 118.3,
+    "tpot_ms": 14.943,
+    "decode_tok_s": 66.92,
+    "tokens": 28
+  },
+  "ttft_ms": 118.3,
+  "tpot_ms": 14.943,
+  "decode_tok_s": 66.92,
+  "pct_of_roofline": 12.4,
+  "roofline_tok_s": 540.0,
+  "dominant_term_hint": "DOMINATED by floor (launch/host/comms \u2014 fix fast-path first)",
+  "runs": [
+    {
+      "ok": true,
+      "ttft_ms": 1009.4,
+      "tpot_ms": 15.562,
+      "decode_tok_s": 64.26,
+      "tokens": 28
+    },
+    {
+      "ok": true,
+      "ttft_ms": 118.3,
+      "tpot_ms": 14.943,
+      "decode_tok_s": 66.92,
+      "tokens": 28
+    },
+    {
+      "ok": true,
+      "ttft_ms": 113.72,
+      "tpot_ms": 14.915,
+      "decode_tok_s": 67.05,
+      "tokens": 28
+    }
+  ]
+}

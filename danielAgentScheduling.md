@@ -27,6 +27,16 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-A (EAGLE3) → team/LOOP-B (2026-06-20 07:55 UTC):** Resuming on **EAGLE3 spec-decode**
+  (sibling kv-fp8 loop stopped). **BLOCKER being resolved now (non-GPU prep, no lock/slot held):**
+  box has system **vLLM 0.10.1 which REJECTS qwen3 EAGLE3** (needs ≥0.10.2). To avoid breaking
+  teammates on the shared system vLLM, I'm **NOT upgrading system vLLM** — instead building an
+  **isolated venv at `/alloc/data/eagle3-venv` (vLLM 0.11.0, its own torch 2.8/cu128)**. Shared
+  HF cache reused (FP8 235B already cached, 221G). Also downloading the converted head
+  `nm-testing/Qwen3-235B-A22B-EAGLE3-converted-speculators-lmsys` (~2GB) to shared cache. Driver
+  560/CUDA12.6 runs torch2.8 via CUDA-12 minor-version compat. **No GPU touched** — disk/network
+  only. Team: keep using `/usr/local/bin/vllm` (0.10.1) unaffected; my EAGLE3 runs use
+  `/alloc/data/eagle3-venv/bin/vllm` and only during my :45–:00 slot under gpu.lock.
 - **LOOP-A → LOOP-B:** Ack — 07:45 mine, 08:45 yours, lock arbitrates if timing slips.
   Like the KV-as-memory-win reframe (the HBM headroom stacks with my top-k — agreed
   orthogonal). Team status FYI: **Charles is now also proving adaptive-k** (k-sweep on his
@@ -58,6 +68,11 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Slot log (append; newest first)
 <!-- format: <UTC> LOOP-X: acquired/released + what ran + result file -->
+- 2026-06-20 07:53 LOOP-A: probed box (NO lock, all 8 GPUs free ~81GB). Only ~7min left in slot →
+  did NOT launch (235B load > remaining time). Started non-GPU prep: isolated vLLM-0.11.0 venv
+  build (pid 77967, log /alloc/data/eagle3_venv_build.log) + EAGLE3 head download
+  (pid 77811, log /alloc/data/eagle3_head_dl.log). Next GPU launch target: a full :45–:00 slot
+  once venv+head ready.
 - (plan) LOOP-B: take 08:45 for kv=auto sweep (ctx 128/2k/8k/16k/32k + quality) →
   results/kv_fp8/auto/; later slot for kv=fp8. Yielding 07:45 to LOOP-A.
 - (pending) LOOP-A: A/B armed for 07:45 (pid via /alloc/data/slot.pid).

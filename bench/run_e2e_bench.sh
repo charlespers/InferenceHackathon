@@ -30,11 +30,12 @@ ITERS="${2:-200}"
 HBM_GBS="${3:-3350}"
 RUN_CHECK="${4:-1}"
 USE_NVLS="${NVLS:-1}"
+USE_GEMM="${GEMM:-1}"     # 1 -> cuBLASLt fp8 tensor-core GEMM forward; 0 -> hand-rolled GEMV baseline
 
 SSH() { ssh $SSH_OPTS -p "$PORT" -i "$KEY" "$HOST" "$@"; }
 SCP() { scp $SSH_OPTS -P "$PORT" -i "$KEY" "$@"; }
 
-echo "== run_e2e_bench: ctx=$CTX_LEN iters=$ITERS hbm=$HBM_GBS check=$RUN_CHECK USE_NVLS=$USE_NVLS =="
+echo "== run_e2e_bench: ctx=$CTX_LEN iters=$ITERS hbm=$HBM_GBS check=$RUN_CHECK USE_NVLS=$USE_NVLS USE_GEMM=$USE_GEMM =="
 
 # ---- (a) ship the kernels (engine + NVLS header + all included sub-kernels) ----
 echo "-- scp kernels -> $HOST:$REMOTE_DIR/"
@@ -48,6 +49,7 @@ SCP \
   "$KERN/k3_attn_epilogue.cu" \
   "$KERN/k4_router.cu" \
   "$KERN/k5_experts.cu" \
+  "$KERN/gemm_engine.cuh" \
   "$HOST:$REMOTE_DIR/" || { echo "SCP FAILED"; exit 1; }
 
 # ---- (b) build dstp8nvls on the box (driver API -lcuda for NVLS multicast) ----
@@ -58,9 +60,9 @@ BUILD_LOG=$(SSH bash -lc "'
   NCCL_BASE=\$(python3 -c \"import nvidia.nccl,os;print(os.path.dirname(nvidia.nccl.__file__))\")
   NCCL_INC=\$NCCL_BASE/include
   NCCL_LIB=\$NCCL_BASE/lib
-  /usr/local/cuda/bin/nvcc -arch=sm_90a -O3 --use_fast_math -DUSE_NVLS=$USE_NVLS \
+  /usr/local/cuda/bin/nvcc -arch=sm_90a -O3 --use_fast_math -DUSE_NVLS=$USE_NVLS -DUSE_GEMM=$USE_GEMM \
     -I $REMOTE_DIR -I \"\$NCCL_INC\" $REMOTE_DIR/decode_step_tp8.cu \
-    -L \"\$NCCL_LIB\" -lnccl -lcuda -o /tmp/dstp8nvls 2>&1
+    -L \"\$NCCL_LIB\" -lnccl -lcuda -lcublas -lcublasLt -o /tmp/dstp8nvls 2>&1
   echo BUILD_RC=\$?
 '" 2>&1)
 echo "$BUILD_LOG"

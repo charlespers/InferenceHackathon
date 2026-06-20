@@ -37,16 +37,15 @@ def union(positions):
 
 
 def ep_factor(u, layout):
-    """Weight-term imbalance multiplier. TP: 1.0 (column-sharded, balanced). EP: busiest-rank / mean, which
-    falls from ~2.6 (few experts) toward 1.0 as the union → all 128 (every rank reads its 16). Approximated
-    by the fraction of each rank's 16 experts that are touched: experts_per_rank_touched = u/NRANK capped at 16."""
-    if layout != "ep":
+    """Weight-term imbalance multiplier (busiest-rank / mean). TP: 1.0 (column-sharded, balanced). EP: the u
+    union-experts are a subset of 128 spread over 8 ranks (16 slots each) -> hypergeometric busiest/mean,
+    which decays from ~2.5 (u≈8) to 1.0 as u→128 (finite-population correction: at u=128 every rank reads all
+    16). The form below is FITTED+VALIDATED against Monte-Carlo (validate_routing_model.py §2): predicts
+    2.36/1.65/1.26/1.13 at u=8/29/82/112 vs sim 2.54/1.69/1.25/1.12. (Replaces the old crude linear decay,
+    which over-penalized EP at mid-unions — caught by the local validation.)"""
+    if layout != "ep" or u >= E:
         return 1.0
-    per_rank = E / NRANK                      # 16 experts/rank
-    touched_per_rank = min(u / NRANK, per_rank)
-    # busiest≈full rank load once union large; imbalance ~ per_rank / max(touched_per_rank, mean). Use the
-    # balls-in-bins-ish: factor decays from ~2.6 (u=8) to ~1.0 (u=128).
-    return max(1.0, 2.6 - 1.6 * (u / E))
+    return 1.0 + 1.5 * (7.0 * (E - u) / (127.0 * max(u, 1.0))) ** 0.5
 
 
 def draft_ms_per_step(mode, draft_tp):

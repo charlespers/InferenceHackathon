@@ -32,6 +32,7 @@ class VLLMBackend(Backend):
             "temperature": req.temperature,
             "max_tokens": req.max_tokens,
             "stream": True,
+            "chat_template_kwargs": {"enable_thinking": False},
         }).encode()
 
         request = urllib.request.Request(
@@ -42,6 +43,7 @@ class VLLMBackend(Backend):
         )
 
         t_start = time.time()
+        t_first: float | None = None
         n_tokens = 0
         buf = b""
 
@@ -63,18 +65,24 @@ class VLLMBackend(Backend):
 
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                     if delta.get("content"):
-                        t_tok = (time.time() - t_start) * 1000
+                        now = time.time()
+                        if t_first is None:
+                            t_first = now  # actual time-to-first-token
+                        t_tok = (now - t_start) * 1000
                         chunk["x_telemetry"] = _make_telemetry(n_tokens, t_tok, topo)
                         n_tokens += 1
 
                     yield chunk
 
         elapsed = time.time() - t_start
+        ttft_ms = round((t_first - t_start) * 1000, 1) if t_first else 0.0
+        # decode tok/s excludes prefill: only count time after first token
+        decode_elapsed = (elapsed - (t_first - t_start)) if t_first else elapsed
         prefill_tokens = sum(len(m.content.split()) for m in req.messages)
         yield {
             "x_summary": {
-                "ttft_ms": round(elapsed * 1000 / max(n_tokens, 1), 1),
-                "decode_tok_per_s": round(n_tokens / max(elapsed, 1e-3), 1),
+                "ttft_ms": ttft_ms,
+                "decode_tok_per_s": round(max(n_tokens - 1, 0) / max(decode_elapsed, 1e-3), 1),
                 "prefill_tokens": prefill_tokens,
                 "completion_tokens": n_tokens,
                 "spec_accept_rate": 0.0,

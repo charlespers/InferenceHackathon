@@ -8,8 +8,9 @@ the UI streams, so one endpoint serves the demo and the benchmark. Stdlib-only (
 - `roofline.py` — byte budget + the bandwidth ceiling; given a measured TPOT, prints **MFU, MBU,
   arithmetic intensity vs the roofline ridge, the regime, and the dominant term** via principled
   attribution (`argmax(weight_ms, kv_ms, kernel_gap_ms)` — not a hand-tuned threshold cascade).
-- `measure.py` — streams one request, times **TTFT / TPOT / decode tok/s** from the wall clock
-  (not from a self-reported number); parses optional `x_summary`.
+- `measure.py` — streams `--repeats` requests (warmup dropped), times **TTFT / TPOT / decode
+  tok/s** from the wall clock (not a self-reported number), and reports each as a distribution
+  (mean, p50/p90/p95/p99, Student-t 95% CI); parses optional `x_summary`.
 - `sweep.py` — the **autoresearch driver**: the DoF search space + a **decision tree** mapping the
   dominant term → the next lever to try; appends each run to `results.jsonl`.
 
@@ -49,8 +50,8 @@ PYTHONPATH=src python -m inferutil.bench export --name fp8ep --format csv --out 
 
 ## Loop (use it the moment the engine is up)
 ```bash
-# 1) baseline number
-python bench/measure.py --base http://localhost:8000 --ctx 32768 --decode 128
+# 1) baseline number (5 repeats -> mean + 95% CI, not a single noisy stream)
+python bench/measure.py --base http://localhost:8000 --ctx 32768 --decode 128 --repeats 5
 
 # 2) where's the bottleneck?
 python bench/roofline.py --ctx 32768 --weight-bytes 1 --kv-bytes 1 --tpot-ms <measured>

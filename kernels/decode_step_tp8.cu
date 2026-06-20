@@ -103,6 +103,25 @@ using namespace q3;
 #ifndef GEMM_MMAX
 #define GEMM_MMAX 16
 #endif
+// Max spec-verify query positions the multi-query K2 path is sized for (the SPEC forward T(M) sweep).
+#ifndef SPEC_MMAX
+#define SPEC_MMAX 16
+#endif
+
+// ---- LATENCY-FLOOR DIAGNOSTIC: strip the per-GEMM "glue" (quant-in + scale/epilogue/select-out +
+//   residual + memset) from the kernels-only SEGMENT graphs so segA/segB time the cuBLASLt GEMM
+//   PANELS alone (+ K2).  This bounds how much ANY glue-fusion could ever recover — it is the
+//   collapsible-floor measurement that resolves the forward->430 verdict.  TIMING-ONLY (the proxy
+//   already produces garbage residuals; this only changes us/token, not the byte volume of the GEMMs).
+//   STRIP_GLUE=1 -> drop the glue; the GEMM .run() + K2 stay.  Default 0 (the real engine path). -----
+#ifndef STRIP_GLUE
+#define STRIP_GLUE 0
+#endif
+// STRIP_K2=1 (with STRIP_GLUE=1) -> also drop K2 from segA, leaving ONLY the K1/K3 GEMM panels, to
+//   separate the K2-flash-decode latency from the glue latency.  Default 0.
+#ifndef STRIP_K2
+#define STRIP_K2 0
+#endif
 
 // ---- Pull in the existing validated kernels as ONE translation unit (same recipe as decode_step.cu).
 #define K5_NO_MAIN
@@ -354,6 +373,16 @@ struct RankState {
   NvlsCtx*     nvls   = nullptr;   // NVLS multimem AR context (null -> NCCL fallback).  attn_partial/
                                    // moe_partial are repointed to nvls->uc halves when NVLS is active.
 
+  // ---- weight-prefetch overlap (USE_WEIGHT_PREFETCH; see touch_weights_kernel below) ----
+  // A second stream that, concurrently with each AR, touches (reads, discards) the NEXT segment's
+  // weights -- a path with NO data dependency on the AR's result, so this is lossless by construction
+  // (it changes nothing any kernel reads). sink[] only exists to defeat dead-code elimination.
+  cudaStream_t prefetch_stream = nullptr;
+  float* prefetch_sink = nullptr;
+  cudaEvent_t  prefetch_fork = nullptr;   // forks prefetch_stream into the same graph capture as `s`
+  cudaEvent_t  prefetch_join = nullptr;   // joins prefetch_stream back -- REQUIRED before EndCapture
+                                          // ("capturing stream has unjoined work" otherwise)
+
   // residual ping-pong (full [HIDDEN] on every rank after each all-reduce).
   float *h_a = nullptr, *h_b = nullptr;
 
@@ -371,6 +400,12 @@ struct RankState {
   // K2 partials (sized for this rank's Q_HEADS_RANK heads).
   float *part_m = nullptr, *part_l = nullptr, *part_acc = nullptr;
   float *attn_out = nullptr;                                 // [Q_DIM_RANK]
+  // ---- SPEC-VERIFY multi-query K2 scratch (M draft query positions; sized for M=SPEC_MMAX) ----
+  // q_mq: [SPEC_MMAX * Q_DIM_RANK]  (M query vectors, M independent draft candidates vs the SHARED KV).
+  // part_m/l/acc_mq: [SPEC_MMAX * Q_HEADS_RANK * n_splits (* HEAD_DIM)] — partials indexed (query,head,split).
+  float *q_mq = nullptr;                                      // [SPEC_MMAX * Q_DIM_RANK]
+  float *part_m_mq = nullptr, *part_l_mq = nullptr, *part_acc_mq = nullptr;
+  float *attn_out_mq = nullptr;                              // [SPEC_MMAX * Q_DIM_RANK]
 
   // ---- K3 (O-proj), SHARDED: this rank holds the Wo column-slice for its 8 heads ----
   // Wo_shard logical [HIDDEN, Q_DIM_RANK]: dots this rank's attn_out[Q_DIM_RANK] -> PARTIAL hidden.
@@ -456,6 +491,7 @@ struct RankState {
 // Forward declarations of the sharded launch helpers (defined after enqueue_tp8_layer, which calls them).
 static void tp8_k1_launch(RankState& S, const float* h, cudaStream_t s);
 static void tp8_k2_launch(RankState& S, cudaStream_t s);
+static void tp8_k2_launch_mq(RankState& S, int M, cudaStream_t s);   // spec-verify multi-query K2
 static void tp8_k3_launch(RankState& S, cudaStream_t s);
 
 // =================================================================================================
@@ -938,31 +974,58 @@ extern "C" __global__ void tp8_k4_select(
 extern "C" __global__ void tp8_k4_select_fused(
     const __nv_bfloat16* __restrict__ D, const float* __restrict__ act_scale, int Mpad,
     const float* __restrict__ Wgate_scale, int* __restrict__ sel_idx, float* __restrict__ sel_w) {
-  __shared__ float logits[N_EXPERTS];
+  // WARP-PARALLEL select (was: serial-in-lane-0, ~7.7us/launch = the #1 glue cost).  N_EXPERTS=128 maps
+  // 4 experts/lane; the full-128 max + softmax-denom + each of the 8 top-k argmax passes are WARP
+  // reductions (8 shuffle reductions vs 1024 serial comparisons).  Selection math is BIT-IDENTICAL to
+  // the serial version (full-128 softmax denom first, top-8 by logit with -inf masking, renorm-to-1).
   const int lane = threadIdx.x & 31;
   const float as = act_scale[0];
-  for (int e = lane; e < N_EXPERTS; e += 32) logits[e] = (float)D[(size_t)e * Mpad] * as * Wgate_scale[e];
-  __syncwarp();
-  if (lane != 0) return;
+  // each lane holds its EPL=N_EXPERTS/32 logits in registers (no smem round-trip needed).
+  constexpr int EPL = N_EXPERTS / 32;             // 4 at N_EXPERTS=128
+  float lg[EPL];
+  #pragma unroll
+  for (int j = 0; j < EPL; ++j) { int e = j*32 + lane;
+    lg[j] = (float)D[(size_t)e * Mpad] * as * Wgate_scale[e]; }
+  // full-128 max (warp reduce of per-lane max).
   float mx = -FLT_MAX;
-  for (int e = 0; e < N_EXPERTS; ++e) mx = fmaxf(mx, logits[e]);
+  #pragma unroll
+  for (int j = 0; j < EPL; ++j) mx = fmaxf(mx, lg[j]);
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  // full-128 softmax denominator (warp reduce of per-lane partial sum).
   float sum = 0.f;
-  for (int e = 0; e < N_EXPERTS; ++e) sum += __expf(logits[e] - mx);
+  #pragma unroll
+  for (int j = 0; j < EPL; ++j) sum += __expf(lg[j] - mx);
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
   const float inv_sum = 1.f / sum;
-  float logit_sel[TOP_K];
-  for (int s = 0; s < TOP_K; ++s) {
-    int bi = -1; float bv = -FLT_MAX;
-    for (int e = 0; e < N_EXPERTS; ++e) if (logits[e] > bv) { bv = logits[e]; bi = e; }
-    if (bi < 0) bi = s;
-    sel_idx[s]   = bi;
-    logit_sel[s] = logits[bi];
-    logits[bi]   = -FLT_MAX;
-  }
+  // top-8 by logit: each pass is a warp argmax (each lane's best-of-EPL, then shuffle-reduce the pair).
   float chosen = 0.f;
-  for (int s = 0; s < TOP_K; ++s) { float p = __expf(logit_sel[s] - mx) * inv_sum;
-                                    sel_w[s] = p; chosen += p; }
-  const float inv_chosen = 1.f / chosen;
-  for (int s = 0; s < TOP_K; ++s) sel_w[s] *= inv_chosen;
+  for (int s = 0; s < TOP_K; ++s) {
+    // lane-local best over its EPL experts.
+    float bv = -FLT_MAX; int bi = -1;
+    #pragma unroll
+    for (int j = 0; j < EPL; ++j) { float v = lg[j]; if (v > bv) { bv = v; bi = j*32 + lane; } }
+    // warp argmax-reduce (carry the matching index; tie -> lower e, matching the serial first-wins scan).
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      int   oi = __shfl_xor_sync(0xffffffffu, bi, o);
+      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    // mask the winner to -inf in the lane that owns it so it isn't repicked.
+    if (bi >= 0 && (bi & 31) == lane) lg[bi >> 5] = -FLT_MAX;
+    if (lane == 0) {
+      sel_idx[s] = (bi < 0) ? s : bi;
+      float p = __expf(bv - mx) * inv_sum;
+      sel_w[s] = p; chosen += p;
+    }
+  }
+  if (lane == 0) {
+    const float inv_chosen = 1.f / chosen;
+    #pragma unroll
+    for (int s = 0; s < TOP_K; ++s) sel_w[s] *= inv_chosen;
+  }
 }
 #endif // USE_GEMM
 
@@ -981,6 +1044,64 @@ static inline void tp8_k4_launch(const float* h, const float* w_post_norm,
   tp8_k4_gate_gemv<<<ctas, block, smem, s>>>(h, w_post_norm, Wgate, g_logits);
   tp8_k4_select<<<1, 32, 0, s>>>(g_logits, Wgate_scale, sel_idx, sel_w);
 }
+
+// =================================================================================================
+// Weight-prefetch overlap (USE_WEIGHT_PREFETCH, default OFF -- existing measured numbers untouched
+// unless explicitly enabled). Smaller-scope alternative to the parked persistent megakernel (acfaf05's
+// "comms-overlap measured but needs persistent megakernel ... -> parked"; the megakernel vehicle itself
+// was independently falsified, 1eaf819, 9-11x slower from grid.sync occupancy starvation). Mechanism:
+// the AR's result feeds the NEXT segment's ACTIVATION-dependent compute (a real dependency, can't be
+// removed) but NOT its WEIGHT read (no dependency at all -- the weight is fixed, read-only). So while
+// the AR runs on the main stream, a second stream concurrently touches (reads, discards) the next
+// segment's weights into L2, so that by the time the AR completes and the real consumer launches, the
+// weight is L2-resident instead of HBM-cold. Lossless by construction: the touch kernel writes nothing
+// any consumer reads, so it cannot change any numerical result -- only when bytes move, not what gets
+// computed. See research/exact_deferred_overlap.md (design) and kernels/overlap_prefetch.cu (isolated
+// microbench + bit-exact correctness gate for this exact mechanism).
+//
+// CAVEAT (3d0cd4c / 7384839, landed after this lever was first written): the team's latest latency-
+// floor verdict treats the non-GEMM floor (K2 + glue + comms) as "fusable, not freely overlappable" --
+// i.e. their current working assumption is that stream-level concurrency won't pay for free here,
+// because K2/glue are occupancy-bound (compete with the AR's own SM usage), not byte-latency-bound like
+// a pure weight read. That verdict was reached without testing this exact touch-only mechanism, so this
+// toggle is the direct, cheap way to get a real answer instead of relying on the intuition either way.
+// =================================================================================================
+#ifndef USE_WEIGHT_PREFETCH
+#define USE_WEIGHT_PREFETCH 0
+#endif
+#if USE_WEIGHT_PREFETCH
+__global__ void touch_weights_kernel(const fp8* __restrict__ W, size_t n_bytes, float* __restrict__ sink) {
+  const uint4* __restrict__ wv = reinterpret_cast<const uint4*>(W);
+  const size_t nv = n_bytes >> 4;
+  unsigned acc = 0;
+  for (size_t v = (size_t)blockIdx.x * blockDim.x + threadIdx.x; v < nv;
+       v += (size_t)gridDim.x * blockDim.x) {
+    uint4 p = wv[v];
+    acc ^= p.x ^ p.y ^ p.z ^ p.w;
+  }
+  __shared__ unsigned sh[256];
+  sh[threadIdx.x] = acc;
+  __syncthreads();
+  for (int o = blockDim.x >> 1; o > 0; o >>= 1) { if (threadIdx.x < o) sh[threadIdx.x] ^= sh[threadIdx.x + o]; __syncthreads(); }
+  if (threadIdx.x == 0) sink[blockIdx.x] = (float)sh[0];
+}
+static inline void touch_launch(const fp8* W, size_t n_bytes, float* sink, cudaStream_t s) {
+  touch_weights_kernel<<<132, 256, 0, s>>>(W, n_bytes, sink);
+}
+// segB's weights (Wgate router + Wgu_pack/Wd_pack experts) -- touched concurrently with AR#1, since
+// segB's GEMM/GEMV compute depends on AR#1's activation but its WEIGHTS do not.
+static void touch_segB_weights(RankState& S, cudaStream_t s) {
+  touch_launch(S.Wgate,   (size_t)N_EXPERTS * HIDDEN * sizeof(fp8), S.prefetch_sink, s);
+  touch_launch(S.Wgu_pack,(size_t)TOP_K * 2 * MOE_INTER_RANK * HIDDEN * sizeof(fp8), S.prefetch_sink, s);
+  touch_launch(S.Wd_pack, (size_t)TOP_K * HIDDEN * MOE_INTER_RANK * sizeof(fp8), S.prefetch_sink, s);
+}
+// next layer's segA weights (Wqkv, Wo) -- touched concurrently with AR#2, since segA(L+1)'s compute
+// depends on AR#2's activation (this layer's residual) but its WEIGHTS do not.
+static void touch_segA_weights(RankState& S, cudaStream_t s) {
+  touch_launch(S.Wqkv, (size_t)QKV_OUT_RANK * HIDDEN * sizeof(fp8), S.prefetch_sink, s);
+  touch_launch(S.Wo,   (size_t)HIDDEN * Q_DIM_RANK * sizeof(fp8), S.prefetch_sink, s);
+}
+#endif // USE_WEIGHT_PREFETCH
 
 // =================================================================================================
 // Enqueue ONE TP=8 decode layer on a rank's stream.  Returns the residual buffer holding this layer's
@@ -1013,6 +1134,11 @@ static inline void ar_sum_hidden(RankState& S, float* buf, int nvls_off, cudaStr
 static const int K5_SEL_PHYS_FIXED[TOP_K] = {0,1,2,3,4,5,6,7};
 #endif
 
+// SPEC-VERIFY width: when >0, the per-layer K2 runs the MULTI-QUERY path over g_spec_M draft query
+// positions (the verify pass).  0 = the normal B=1 single-query decode (unchanged M=1 gate path).
+// Set ONLY around the dedicated forward-T(M) sweep; left 0 everywhere else so the gate is untouched.
+static thread_local int g_spec_M = 0;
+
 static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
   cudaStream_t s = S.stream;
 
@@ -1023,15 +1149,33 @@ static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
   //   full path (its h_src is the embedding, not produced by a fused residual).
   if (S.k1_prequant) gemm_k1_launch_prequant(S, s);
   else               gemm_k1_launch(S, h_src, s);
-  // ---- K2: flash-decode (unchanged) ----
-  tp8_k2_launch(S, s);
+  // ---- K2: flash-decode.  Spec-verify width: multi-query over g_spec_M draft positions when set. ----
+  if (g_spec_M > 0) tp8_k2_launch_mq(S, g_spec_M, s);
+  else              tp8_k2_launch(S, s);
   // ---- K3: cuBLASLt fp8 O-proj GEMM -> PARTIAL hidden (h_in=0; residual added post-all-reduce) ----
   // NO memset: gemm_k3_launch's epilogue (gemm_epi_scale) WRITES every attn_partial[n] with '=' (full
   // overwrite over all HIDDEN), so the pre-zero is dead work — removed (one fewer launch/layer).  (K5
   // below DOES keep its memset: tp8_k5b_down atomicAdds into moe_partial.)
   gemm_k3_launch(S, s);
+#if USE_WEIGHT_PREFETCH
+  // Fork prefetch_stream off the capturing stream `s` RIGHT BEFORE AR#1 (not after -- the touch must
+  // start concurrently WITH the AR, not wait for it). The event-record+wait is also what pulls
+  // prefetch_stream into the SAME graph capture as `s` (CUDA stream-capture fork semantics), so this
+  // is captured into the one-graph-per-token path, not just the eager/kernels-graph fallback.
+  CK(cudaEventRecord(S.prefetch_fork, s));
+  CK(cudaStreamWaitEvent(S.prefetch_stream, S.prefetch_fork, 0));
+  touch_segB_weights(S, S.prefetch_stream);          // segB's weights -- no dependency on AR#1's result
+#endif
   // ---- AR#1 ---- (out-of-place: result lands in S.attn_reduced; residual-add reads THAT)
   ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);
+#if USE_WEIGHT_PREFETCH
+  // JOIN prefetch_stream back into `s` -- required before cudaStreamEndCapture or capture fails with
+  // "capturing stream has unjoined work". Placed right after AR#1 (not immediately after the touch
+  // launch) so the join's wait is against whichever finishes second -- if the touch genuinely overlapped
+  // AR#1 and finished first, this join costs ~0; it does not force `s` to wait before AR#1 even starts.
+  CK(cudaEventRecord(S.prefetch_join, S.prefetch_stream));
+  CK(cudaStreamWaitEvent(s, S.prefetch_join, 0));
+#endif
   // FUSED: residual add (h_dst = h_src + AR(O-proj)) + K4 RMSNorm + fp8 quant in ONE launch -> xq_hidden
   // + act_scale, so gemm_k4_launch_prequant skips its own rmsnorm_quant.  Collapses 2 launches -> 1.
   tp8_residual_rmsnorm_quant<<<1, 1024, (size_t)HIDDEN*sizeof(float), s>>>(
@@ -1041,8 +1185,19 @@ static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
   // ---- K5: cuBLASLt fp8 GROUPED gate+up/down GEMM -> PARTIAL MoE-down hidden ----
   CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
   gemm_k5_launch(S, h_dst, K5_SEL_PHYS_FIXED, s);   // proxy/graphed: fixed slot->shard (graph-safe)
+#if USE_WEIGHT_PREFETCH
+  CK(cudaEventRecord(S.prefetch_fork, s));
+  CK(cudaStreamWaitEvent(S.prefetch_stream, S.prefetch_fork, 0));
+  if (S.fuse_next_k1) touch_segA_weights(S, S.prefetch_stream);  // next layer's segA weights
+#endif
   // ---- AR#2 ----
   ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);
+#if USE_WEIGHT_PREFETCH
+  if (S.fuse_next_k1) {
+    CK(cudaEventRecord(S.prefetch_join, S.prefetch_stream));
+    CK(cudaStreamWaitEvent(s, S.prefetch_join, 0));    // join back -- see AR#1's comment above
+  }
+#endif
   // POST-MoE residual.  When fuse_next_k1 is set, fold it with the NEXT layer's K1 RMSNorm+quant:
   //   h_dst = h_dst + AR(MoE)  AND  RMSNorm(h_dst) -> xq_hidden (next K1's GEMM input).  Else plain add
   //   (the LAST layer's output goes to final_norm, not a K1).  Removes one residual_add/layer (x93).
@@ -1056,7 +1211,8 @@ static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
   // ---- K1: sharded RMSNorm + QKV GEMV (this rank's 2048 rows) + QK-norm + RoPE + KV write ----
   tp8_k1_launch(S, h_src, s);
   // ---- K2: flash-decode over this rank's Q_HEADS_RANK=8 heads (KV is the replicated full cache) ----
-  tp8_k2_launch(S, s);
+  if (g_spec_M > 0) tp8_k2_launch_mq(S, g_spec_M, s);
+  else              tp8_k2_launch(S, s);
   // ---- K3: O-proj on the [HIDDEN, Q_DIM_RANK] column-shard -> PARTIAL hidden (NO residual add yet) ---
   CK(cudaMemsetAsync(S.attn_partial, 0, HIDDEN * sizeof(float), s));   // h_in = 0 -> pure partial
   tp8_k3_launch(S, s);
@@ -1143,9 +1299,19 @@ static void enqueue_tp8_step(RankState& S) {
 // segA: K1 -> K2 -> memset(attn_partial) -> K3.  Reads h_in, writes attn_partial (partial O-proj).
 static void enqueue_tp8_segA(RankState& S, float* h_in, cudaStream_t s) {
 #if USE_GEMM
+#if STRIP_GLUE
+  // GEMM PANELS ONLY (+ K2): no quant-in, no K1-epilogue/RoPE, no K3 scale-epilogue.  Bounds the
+  // collapsible glue-latency floor.  Inputs are reused-fp8 buffers (already populated); timing-only.
+  S.p_qkv.run(S.xq_hidden, S.Wqkv, S.d_qkv, s);          // K1 QKV GEMM panel
+#if !STRIP_K2
+  tp8_k2_launch(S, s);                                    // K2 flash-decode (latency, MBU-immune)
+#endif
+  S.p_oproj.run(S.xq_qdim, S.Wo, S.d_oproj, s);          // K3 O-proj GEMM panel
+#else
   gemm_k1_launch(S, h_in, s);
   tp8_k2_launch(S, s);
   gemm_k3_launch(S, s);   // no memset: gemm_epi_scale fully overwrites attn_partial (see enqueue_tp8_layer)
+#endif
 #else
   tp8_k1_launch(S, h_in, s);
   tp8_k2_launch(S, s);
@@ -1157,6 +1323,13 @@ static void enqueue_tp8_segA(RankState& S, float* h_in, cudaStream_t s) {
 //   attn_reduced is the AR#1 result (eager AR ran before this segment replays; out-of-place -> OUT half).
 static void enqueue_tp8_segB(RankState& S, float* h_in, float* h_out, cudaStream_t s) {
 #if USE_GEMM
+#if STRIP_GLUE
+  // GEMM PANELS ONLY: no residual+rmsnorm+quant, no K4 select, no K5a SiLU-epilogue, no K5b down GEMV,
+  // no memset.  Just the K4-gate + K5-gateup GEMM panels.  Bounds the collapsible glue floor of segB.
+  S.p_gate.run(S.xq_hidden, S.Wgate, S.d_gate, s);                 // K4 router gate GEMM panel
+  S.p_k5gu_pack.run(S.xq_hidden, S.Wgu_pack, S.d_k5gu, s);         // K5 gate+up GEMM panel
+  S.p_k5d_pack.run(S.xq_a, S.Wd_pack, S.d_k5d, s);                 // K5 down GEMM panel (the packed flat one)
+#else
   // FUSED residual add + K4 RMSNorm + fp8 quant (matches enqueue_tp8_layer): one launch -> h_out (fp32
   // residual) + xq_hidden/act_scale (K4 GEMM input).  Then K4 GEMM+select consumes the prequantized X.
   tp8_residual_rmsnorm_quant<<<1, 1024, (size_t)HIDDEN*sizeof(float), s>>>(
@@ -1164,6 +1337,7 @@ static void enqueue_tp8_segB(RankState& S, float* h_in, float* h_out, cudaStream
   gemm_k4_launch_prequant(S, s);
   CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
   gemm_k5_launch(S, h_out, K5_SEL_PHYS_FIXED, s);   // graph-safe fixed slot->shard
+#endif
 #else
   tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.attn_reduced, h_out);
   tp8_k4_launch(h_out, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, S.g_logits, s);
@@ -1207,8 +1381,14 @@ static void replay_tp8_step_kgraph(RankState& S) {
   for (int layer = 0; layer < N_LAYERS; ++layer) {
     CK(cudaGraphLaunch(S.exec_segA, s));                          // K1,K2,K3 -> attn_partial
     ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);          // AR#1 (NVLS or NCCL)
+#if USE_WEIGHT_PREFETCH
+    touch_segB_weights(S, S.prefetch_stream);                     // concurrent w/ AR#1 -- no dependency
+#endif
     CK(cudaGraphLaunch(S.exec_segB, s));                          // resid,K4,K5 -> moe_partial
     ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);            // AR#2 (NVLS or NCCL)
+#if USE_WEIGHT_PREFETCH
+    if (layer + 1 < N_LAYERS) touch_segA_weights(S, S.prefetch_stream);  // concurrent w/ AR#2
+#endif
   }
   CK(cudaGraphLaunch(S.exec_seghead, s));                         // resid,norm,lm_head,argmax
   NK(ncclGroupStart());
@@ -1580,6 +1760,142 @@ extern "C" __global__ void tp8_k2_reduce(
     for (int c = 0; c < K2_VPL; c++) o[c] = racc[c] * inv;
   }
 }
+
+// =================================================================================================
+// SPEC-VERIFY MULTI-QUERY K2 — the honest M=k flash-decode for the verify pass.
+// -------------------------------------------------------------------------------------------------
+// The spec verify forward processes M draft-candidate query positions at once.  All M queries attend
+// to the SAME (already-resident) KV cache — that is the whole architectural bet: the KV HBM read is
+// the K2 cost driver at B=1, and it is M-INDEPENDENT (we load each K/V row ONCE per warp and reuse
+// it across the M queries).  Only the per-query QK·PV math + online-softmax state scales with M, and
+// that is register/ALU work the memory-bound kernel was previously stalling on.  So this kernel
+// MEASURES whether T_K2(M) ~= T_K2(1) (KV read amortizes -> flat) or whether it scales with M.
+//
+// grid = (n_splits, ceil(Q_HEADS_RANK/wpc)); each warp owns ONE (local head, split) and runs M online
+// softmaxes in registers.  Per timestep: load K row once -> M dot products; load V row once -> M PV
+// accumulations.  Partials laid out (query, head, split) so the reduce mirrors the M=1 path per query.
+// =================================================================================================
+extern "C" __global__ void tp8_k2_partial_mq(
+    const float* __restrict__ q /*[M * Q_DIM_RANK]*/,
+    const fp8*  __restrict__ kv_k, const fp8* __restrict__ kv_v,
+    const float* __restrict__ kv_k_scale, const float* __restrict__ kv_v_scale,
+    int ctx_len, int n_splits, int rank, int M,
+    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc) {
+  const int lane  = threadIdx.x & 31;
+  const int wid   = threadIdx.x >> 5;
+  const int lqh   = blockIdx.y * (blockDim.x >> 5) + wid;     // local query head 0..Q_HEADS_RANK-1
+  if (lqh >= Q_HEADS_RANK) return;
+  const int gqh   = rank * Q_HEADS_RANK + lqh;                // global query head 0..63
+  const int split = blockIdx.x;
+  const int kvh   = gqh / GQA_GROUP;                          // GQA broadcast -> KV head (replicated)
+  const int chunk = (ctx_len + n_splits - 1) / n_splits;
+  const int t0 = split * chunk, t1 = min(t0 + chunk, ctx_len);
+  const float scale = rsqrtf((float)HEAD_DIM);
+  const int kv_base = kvh * HEAD_DIM;
+  const int c0 = kv_base + lane * K2_VPL;
+  // Per-query Q registers + per-query online-softmax state.  KV scales are query-independent.
+  float qreg[SPEC_MMAX][K2_VPL], ksc[K2_VPL], vsc[K2_VPL];
+  float m[SPEC_MMAX], l[SPEC_MMAX], acc[SPEC_MMAX][K2_VPL];
+  #pragma unroll
+  for (int c = 0; c < K2_VPL; c++) { ksc[c] = kv_k_scale ? kv_k_scale[c0 + c] : 1.f;
+                                     vsc[c] = kv_v_scale ? kv_v_scale[c0 + c] : 1.f; }
+  for (int qi = 0; qi < M; qi++) {
+    const float* qv = q + (size_t)qi * Q_DIM_RANK + lqh * HEAD_DIM + lane * K2_VPL;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) qreg[qi][c] = qv[c];
+    m[qi] = -FLT_MAX; l[qi] = 0.f;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) acc[qi][c] = 0.f;
+  }
+  const unsigned* __restrict__ k32 = reinterpret_cast<const unsigned*>(kv_k);
+  const unsigned* __restrict__ v32 = reinterpret_cast<const unsigned*>(kv_v);
+  const int row_words = KV_DIM / 4, base_words = kv_base / 4;
+  for (int t = t0; t < t1; t++) {
+    // ---- load K row ONCE (M-independent HBM read), then M dot products ----
+    float kv[K2_VPL]; k2_load4(k32 + (size_t)t * row_words + base_words, lane, ksc, kv);
+    float sft[SPEC_MMAX];
+    for (int qi = 0; qi < M; qi++) {
+      float p = 0.f;
+      #pragma unroll
+      for (int c = 0; c < K2_VPL; c++) p += qreg[qi][c] * kv[c];
+      sft[qi] = k2_warp_sum(p) * scale;
+    }
+    // ---- load V row ONCE (M-independent HBM read), then M online-softmax accumulations ----
+    float vv[K2_VPL]; k2_load4(v32 + (size_t)t * row_words + base_words, lane, vsc, vv);
+    for (int qi = 0; qi < M; qi++) {
+      float mn = fmaxf(m[qi], sft[qi]);
+      float corr = __expf(m[qi] - mn), pexp = __expf(sft[qi] - mn);
+      l[qi] = l[qi] * corr + pexp;
+      #pragma unroll
+      for (int c = 0; c < K2_VPL; c++) acc[qi][c] = acc[qi][c] * corr + pexp * vv[c];
+      m[qi] = mn;
+    }
+  }
+  // partials laid out (query, head, split): pidx = ((qi*Q_HEADS_RANK)+lqh)*n_splits + split.
+  for (int qi = 0; qi < M; qi++) {
+    const size_t pidx = ((size_t)qi * Q_HEADS_RANK + lqh) * n_splits + split;
+    if (lane == 0) { part_m[pidx] = m[qi]; part_l[pidx] = l[qi]; }
+    float* ao = part_acc + pidx * HEAD_DIM + lane * K2_VPL;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) ao[c] = acc[qi][c];
+  }
+}
+// Multi-query reduce: ONE CTA per (query, local head); W warps fold the n_splits partials (same
+// log-sum-exp math as tp8_k2_reduce).  grid.x = local head, grid.y = query.  attn_out laid out
+// [M * Q_DIM_RANK] so query qi's attn output is at attn_out + qi*Q_DIM_RANK.
+extern "C" __global__ void tp8_k2_reduce_mq(
+    const float* __restrict__ part_m, const float* __restrict__ part_l,
+    const float* __restrict__ part_acc, int n_splits, int M,
+    float* __restrict__ attn_out /*[M * Q_DIM_RANK]*/) {
+  const int lane = threadIdx.x & 31;
+  const int wid  = threadIdx.x >> 5;
+  const int W    = blockDim.x >> 5;
+  const int lqh  = blockIdx.x;                  // local q head
+  const int qi   = blockIdx.y;                  // query index 0..M-1
+  if (lqh >= Q_HEADS_RANK || qi >= M) return;
+  const size_t pbase = ((size_t)qi * Q_HEADS_RANK + lqh) * n_splits;
+  float m = -FLT_MAX, l = 0.f, acc[K2_VPL];
+  #pragma unroll
+  for (int c = 0; c < K2_VPL; c++) acc[c] = 0.f;
+  for (int sp = wid; sp < n_splits; sp += W) {
+    const size_t pidx = pbase + sp;
+    float ms = part_m[pidx], ls = part_l[pidx];
+    if (ls <= 0.f) continue;
+    const float* ai = part_acc + pidx * HEAD_DIM + lane * K2_VPL;
+    float mn = fmaxf(m, ms);
+    float corr_o = __expf(m - mn), corr_s = __expf(ms - mn);
+    l = l * corr_o + ls * corr_s;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) acc[c] = acc[c] * corr_o + ai[c] * corr_s;
+    m = mn;
+  }
+  extern __shared__ float k2rm_sm[];
+  float* sm_m = k2rm_sm;  float* sm_l = sm_m + W;  float* sm_a = sm_l + W;
+  if (lane == 0) { sm_m[wid] = m; sm_l[wid] = l; }
+  float* sao = sm_a + (size_t)wid * HEAD_DIM + lane * K2_VPL;
+  #pragma unroll
+  for (int c = 0; c < K2_VPL; c++) sao[c] = acc[c];
+  __syncthreads();
+  if (wid == 0) {
+    float rm = -FLT_MAX, rl = 0.f, racc[K2_VPL];
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) racc[c] = 0.f;
+    for (int w = 0; w < W; w++) {
+      float ms = sm_m[w], ls = sm_l[w];
+      if (ls <= 0.f) continue;
+      const float* ai = sm_a + (size_t)w * HEAD_DIM + lane * K2_VPL;
+      float mn = fmaxf(rm, ms), co = __expf(rm - mn), cs = __expf(ms - mn);
+      rl = rl * co + ls * cs;
+      #pragma unroll
+      for (int c = 0; c < K2_VPL; c++) racc[c] = racc[c] * co + ai[c] * cs;
+      rm = mn;
+    }
+    float inv = (rl > 0.f) ? (1.f / rl) : 0.f;
+    float* o = attn_out + (size_t)qi * Q_DIM_RANK + lqh * HEAD_DIM + lane * K2_VPL;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) o[c] = racc[c] * inv;
+  }
+}
 // =================================================================================================
 // FIX B — FUSED TP=8 flash-decode: partial + reduce in ONE launch, partials on-chip (no HBM round-trip,
 // no 2nd kernel).  The TP=8 shard has a STRUCTURAL property the generic K2 ignored: a rank owns 8 Q
@@ -1741,6 +2057,21 @@ static void tp8_k2_launch(RankState& S, cudaStream_t s) {
 #endif
 }
 
+// SPEC-VERIFY multi-query K2 launch: M draft query positions vs the SHARED KV cache (one verify pass).
+// Same split-K partial + parallel reduce structure as the M=1 path, but each warp loads each KV row
+// ONCE and serves all M queries (the amortization being measured).  M=1 reproduces the M=1 path's grid.
+static void tp8_k2_launch_mq(RankState& S, int M, cudaStream_t s) {
+  const int warps_per_cta = 4, block = warps_per_cta * 32;
+  dim3 gP(S.n_splits, (Q_HEADS_RANK + warps_per_cta - 1) / warps_per_cta);
+  tp8_k2_partial_mq<<<gP, block, 0, s>>>(S.q_mq, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale,
+                                         S.ctx_len, S.n_splits, S.rank, M,
+                                         S.part_m_mq, S.part_l_mq, S.part_acc_mq);
+  const int rw = S.k2r_warps, rblock = rw * 32;
+  const size_t rsmem = (size_t)(2 * rw + rw * HEAD_DIM) * sizeof(float);
+  dim3 gR(Q_HEADS_RANK, M);
+  tp8_k2_reduce_mq<<<gR, rblock, rsmem, s>>>(S.part_m_mq, S.part_l_mq, S.part_acc_mq, S.n_splits, M, S.attn_out_mq);
+}
+
 // K3: O-proj on the [HIDDEN, Q_DIM_RANK] column-shard -> PARTIAL hidden (h_in = ZERO, see caller).
 extern "C" __global__ void tp8_k3_oproj(
     const float* __restrict__ attn_out /*[Q_DIM_RANK]*/,
@@ -1808,6 +2139,12 @@ static inline int tp8_k2_splits(int ctx_len) {
 }
 static void alloc_rank(RankState& S, int ctx_len) {
   CK(cudaSetDevice(S.dev));
+#if USE_WEIGHT_PREFETCH
+  CK(cudaStreamCreate(&S.prefetch_stream));
+  CK(cudaMalloc(&S.prefetch_sink, 132 * sizeof(float)));
+  CK(cudaEventCreateWithFlags(&S.prefetch_fork, cudaEventDisableTiming));
+  CK(cudaEventCreateWithFlags(&S.prefetch_join, cudaEventDisableTiming));
+#endif
   S.ctx_len  = ctx_len;
   S.n_splits = tp8_k2_splits(ctx_len);
   // K2 n_splits override (sweep the partial's split-K parallelism without a rebuild): K2_SPLITS env.
@@ -1849,6 +2186,13 @@ static void alloc_rank(RankState& S, int ctx_len) {
   CK(cudaMalloc(&S.part_l,  (size_t)Q_HEADS_RANK * S.n_splits * sizeof(float)));
   CK(cudaMalloc(&S.part_acc,(size_t)Q_HEADS_RANK * S.n_splits * HEAD_DIM * sizeof(float)));
   CK(cudaMalloc(&S.attn_out, Q_DIM_RANK * sizeof(float)));
+  // SPEC-VERIFY multi-query K2 scratch: M<=SPEC_MMAX draft query positions vs the SHARED KV.
+  CK(cudaMalloc(&S.q_mq,        (size_t)SPEC_MMAX * Q_DIM_RANK * sizeof(float)));
+  fill_f32(S.q_mq, (size_t)SPEC_MMAX * Q_DIM_RANK, 24u, 0.1f, true);   // dummy draft queries (timing-faithful)
+  CK(cudaMalloc(&S.part_m_mq,   (size_t)SPEC_MMAX * Q_HEADS_RANK * S.n_splits * sizeof(float)));
+  CK(cudaMalloc(&S.part_l_mq,   (size_t)SPEC_MMAX * Q_HEADS_RANK * S.n_splits * sizeof(float)));
+  CK(cudaMalloc(&S.part_acc_mq, (size_t)SPEC_MMAX * Q_HEADS_RANK * S.n_splits * HEAD_DIM * sizeof(float)));
+  CK(cudaMalloc(&S.attn_out_mq, (size_t)SPEC_MMAX * Q_DIM_RANK * sizeof(float)));
 
   // ---- K3 SHARD: Wo[HIDDEN, Q_DIM_RANK=1024] column-slice for this rank's heads ----
   CK(cudaMalloc(&S.Wo, (size_t)HIDDEN * Q_DIM_RANK * sizeof(fp8)));  fill_fp8(S.Wo, (size_t)HIDDEN*Q_DIM_RANK, 30u + S.rank);
@@ -2553,6 +2897,42 @@ static void profile_per_kernel(RankState& S, int PEAK_unused) {
 }
 
 // =================================================================================================
+// SPEC-VERIFY FORWARD T(M) — the HONEST full-forward at M draft query positions (the headline metric).
+// -------------------------------------------------------------------------------------------------
+// This is the measurement the prior GEMM-only flatness table CANNOT make: it runs the FULL real engine
+// forward (94 layers' K1 QKV + K2 MULTI-QUERY attention over M queries + K3 O-proj + AR#1 + K4 router +
+// K5 experts + AR#2, + final norm + lm_head + head AR) at M = 1,4,8,16 on all 8 GPUs WITH the NCCL/NVLS
+// comms, and reports T(M).  K2 runs the multi-query kernel (each warp loads each KV row ONCE and serves
+// all M draft queries) so the table reveals whether K2 amortizes the shared KV read across M (flat) or
+// the per-query QK·PV math makes it scale.  GEMM panels run their pinned 16-wide fp8 tile (flat for
+// M<=16, already validated).  Returns T(M) us in out[] (per the slowest rank, IT timed iters).
+// =================================================================================================
+static void spec_forward_TM_sweep(std::vector<RankState>& R, int IT, int WARM,
+                                   cudaEvent_t ev0, cudaEvent_t ev1,
+                                   const int* Ms, int NM, double* out_us) {
+  for (int mi = 0; mi < NM; ++mi) {
+    const int M = Ms[mi];
+    float ms = 0.f;
+    std::vector<std::thread> th; th.reserve(TP);
+    for (int r = 0; r < TP; ++r) {
+      th.emplace_back([&, r, M]() {
+        CK(cudaSetDevice(R[r].dev));
+        g_spec_M = M;                                  // per-thread: this rank's K2 -> multi-query width M
+        for (int i = 0; i < WARM; ++i) { enqueue_tp8_step(R[r]); CK(cudaStreamSynchronize(R[r].stream)); }
+        if (r == 0) CK(cudaEventRecord(ev0, R[0].stream));
+        for (int i = 0; i < IT; ++i)  { enqueue_tp8_step(R[r]); CK(cudaStreamSynchronize(R[r].stream)); }
+        if (r == 0) CK(cudaEventRecord(ev1, R[0].stream));
+        g_spec_M = 0;
+      });
+    }
+    for (auto& t : th) t.join();
+    CK(cudaSetDevice(0)); CK(cudaEventSynchronize(ev1));
+    CK(cudaEventElapsedTime(&ms, ev0, ev1)); ms /= IT;
+    out_us[mi] = (double)ms * 1e3;                     // us/forward
+  }
+}
+
+// =================================================================================================
 // main() — one process, 8 GPUs, NCCL.  Measures the REAL TP=8 B=1 decode latency + AR overhead.
 // Define DSTP8_NO_MAIN before #include-ing this file to reuse RankState/alloc_rank/tp8_k1_launch/
 // tp8_k2_launch/tp8_k3_launch as a library (same convention as K5_NO_MAIN for k5_experts.cu).
@@ -2877,6 +3257,69 @@ int main(int argc, char** argv) {
   printf("\n  single-GPU cap was ~153 tok/s; TP=8 weight-only ideal (per-GPU %.2f GB @ ~45%% peak)"
          " ~ %.0f tok/s (~%.2f ms); the all-reduces + replicated-KV read add the overhead measured above.\n",
          b_weight_only/1e9, 1.0e3 / ideal_ms, ideal_ms);
+
+  // =============================================================================================
+  // THE HEADLINE: HONEST full-forward T(M) (real K2 multi-query + comms + glue) + spec'd e2e tok/s.
+  // =============================================================================================
+  {
+    // Sweep only the M values <= SPEC_MMAX (register arrays are unrolled for SPEC_MMAX; building one
+    // binary per SPEC_MMAX=1/4/8/16 keeps each K2 kernel's register footprint EXACT — no worst-case
+    // spill from a too-large SPEC_MMAX distorting the smaller-M timing).  argv[5] can pin a single M.
+    int allM[] = {1,4,8,16}; int Ms[4]; int NM = 0;
+    for (int i = 0; i < 4; ++i) if (allM[i] <= SPEC_MMAX) Ms[NM++] = allM[i];
+    double Tm[4];
+    spec_forward_TM_sweep(R, IT, WARM, ev0, ev1, Ms, NM, Tm);
+    // M=1 reference = the eager full step (same path, single-query K2): cross-check.
+    printf("\n================ HONEST SPEC-VERIFY FULL FORWARD T(M) (REAL K2 multi-query + comms + glue) ================\n");
+    printf("Full real engine forward at M draft query positions, all 8 GPUs, NCCL/NVLS comms, eager.\n");
+    printf("  %-6s %14s %12s %14s %18s\n", "M", "us/forward", "tok/s", "ratio vs M=1", "us/candidate");
+    for (int mi = 0; mi < NM; ++mi)
+      printf("  M=%-4d %14.1f %12.1f %14.3f %18.1f\n",
+             Ms[mi], Tm[mi], 1e6/Tm[mi], Tm[mi]/Tm[0], Tm[mi]/Ms[mi]);
+    const double flatMax = Tm[NM-1]/Tm[0];
+    printf("  FLATNESS (full forward, incl. K2 over k queries): T(%d)/T(1)=%.3f\n", Ms[NM-1], flatMax);
+    printf("  (eager single-query M=1 full step cross-check = %.1f us = %.1f tok/s)\n", ms_full*1e3, tokps(ms_full));
+    if (flatMax < 1.15) printf("  => FLAT: K2 AMORTIZES the shared KV read across k draft queries (verify(k) ~= decode(1)).\n");
+    else                printf("  => SCALES: K2 cost grows with k (per-query QK.PV not hidden) — verify(k) > decode(1).\n");
+
+    // ---- spec'd e2e tok/s = E[accepted] / T_forward(M=k).  n-gram tau (MEASURED) + EAGLE3 tau (cited). ----
+    // n-gram free-draft (CPU hash lookup ~0 us): spec = tau / T_forward(k).
+    struct TauPt { const char* name; int k; double tau; double draft_us; };
+    // MEASURED n-gram tau (ngram_drafter_tau.py, real Qwen3 tokens; ngram_tau_session.txt this session).
+    TauPt ngram[] = { {"ngram k=4  (n=1, interp)", 4, 1.589, 0.0},   // between measured k=3(1.529) and k=5(1.608)
+                      {"ngram k=8  (n=2 MEASURED)", 8, 1.6981, 0.0},
+                      {"ngram k=16 (n=2 MEASURED)", 16, 1.7511, 0.0} };
+    // EAGLE3 cited tau range (defensible; the box's 1.27 was a target-variant mismatch, see eagle3_tau.txt).
+    // realistic tensor-core draft cost from spec_loop_e2e.txt PART 3: ~239 us/step on draft_tp=8 head.
+    const double draft_step_us = 239.0;
+    TauPt eagle[] = { {"EAGLE3 conservative 2.2", 4, 2.200, 3*draft_step_us},
+                      {"EAGLE3 conservative 2.5", 8, 2.499, 7*draft_step_us},
+                      {"EAGLE3 expected     2.8", 4, 2.800, 3*draft_step_us},
+                      {"EAGLE3 expected     3.8", 8, 3.761, 7*draft_step_us},
+                      {"EAGLE3 optimistic   3.5", 4, 3.500, 3*draft_step_us},
+                      {"EAGLE3 optimistic   5.9", 8, 5.917, 7*draft_step_us} };
+    auto Tk = [&](int k)->double{ for(int mi=0;mi<NM;mi++) if(Ms[mi]==k) return Tm[mi];
+                                  return Tm[NM-1]; };
+    printf("\n-- spec'd e2e tok/s = E[accepted]/(T_forward(k)+draft).  T_forward MEASURED above. --\n");
+    printf("  %-28s %4s %10s %14s %12s %12s\n", "drafter / tau", "k", "tau", "T_fwd(k) us", "draft us", "SPEC tok/s");
+    double best_ng=0; for (auto& p : ngram) { double t=Tk(p.k); double spec=p.tau/((t+p.draft_us)/1e6);
+      if (spec>best_ng) best_ng=spec;
+      printf("  %-28s %4d %10.4f %14.1f %12.1f %12.1f\n", p.name, p.k, p.tau, t, p.draft_us, spec); }
+    double best_eg=0; for (auto& p : eagle) { double t=Tk(p.k); double spec=p.tau/((t+p.draft_us)/1e6);
+      if (spec>best_eg) best_eg=spec;
+      printf("  %-28s %4d %10.4f %14.1f %12.1f %12.1f\n", p.name, p.k, p.tau, t, p.draft_us, spec); }
+    printf("\n  >>> HONEST SPEC e2e: n-gram (MEASURED tau) BEST = %.1f tok/s ; EAGLE3 (cited tau) BEST = %.1f tok/s\n",
+           best_ng, best_eg);
+    printf("  >>> single-forward (M=1) baseline = %.1f tok/s ; gap to 1000 = %.0f tok/s (EAGLE3 best).\n",
+           tokps(ms_full), 1000.0 - best_eg);
+    // forward latency needed for 1000 tok/s at each tau (draft folded in).
+    printf("\n-- full-forward T(k) REQUIRED for 1000 tok/s spec'd (draft folded in) --\n");
+    printf("  %-28s %4s %10s %16s\n", "drafter / tau", "k", "tau", "need T_fwd<= us");
+    for (auto& p : ngram) { double need = p.tau/1000.0*1e6 - p.draft_us;
+      printf("  %-28s %4d %10.4f %16.1f  (=> %.0f tok/s engine)\n", p.name, p.k, p.tau, need, need>0?1e6/need:0); }
+    for (auto& p : eagle) { double need = p.tau/1000.0*1e6 - p.draft_us;
+      printf("  %-28s %4d %10.4f %16.1f  (=> %.0f tok/s engine)\n", p.name, p.k, p.tau, need, need>0?1e6/need:0); }
+  }
   printf("== done ==\n");
 
   // ---- cleanup (best-effort) ----

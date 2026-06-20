@@ -1,0 +1,67 @@
+// k6_overlap_decode.cu — the deferred-overlap megakernel STRUCTURE (LOOP-C's schedule + the NVLS kernel).
+// The lossless comms-hide for 1000 tok/s (results-reaction-05, research/exact_deferred_overlap.md §2b):
+// stale/predicted-TP is DEAD (info barrier); the comms is hidden LOSSLESSLY by overlapping the EXACT NVLS
+// all-reduce with the next op's HBM weight stream — different HW paths (NVLink vs HBM). This is the SM-
+// specialization skeleton: a few blocks run the multimem reduce while the rest cp.async the next weight tiles,
+// a grid barrier gates the dependent multiply on the reduced activation. ONE persistent kernel over 94 layers.
+//
+// STATUS: STRUCTURE/skeleton to integrate into the team's megakernel_decode.cu + tune on box (like K5/NVLS began).
+// Build: nvcc -O3 -arch=sm_90a k6_overlap_decode.cu -lcuda  (Hopper: multimem + cooperative-groups grid sync).
+// Make-or-break C: measure_collective.sh — C≤~4µs (≤ the ~4.3µs fp8 per-collective weight cover) ⇒ FULL hide ⇒
+// comms→0 ⇒ ~roofline (~1280, no spec needed); C=16µs ⇒ partial (~half) ⇒ ~938 with spec. Both lossless.
+
+#include <cooperative_groups.h>
+#include <cuda_fp16.h>
+namespace cg = cooperative_groups;
+
+#define NRANKS 8
+#define N_REDUCE_BLOCKS 4     // 8KB multimem needs only a few blocks; rest stream weights. TUNE {2,4,8}.
+
+// (declared in nvls_allreduce.cu / k5_experts_pipelined.cu; shown here as the overlap call sites)
+__device__ void multimem_allreduce_8kb(half* mc_ptr, int n);                 // the NVLS reduce (few blocks)
+__device__ void stream_weight_tile(const void* hbm_src, void* smem_dst, int bytes);  // cp.async (many blocks)
+__device__ void expert_gemv(const half* x, const void* w_smem, half* y, int rows, int k);
+
+// The persistent megakernel. grid = N_REDUCE_BLOCKS + (many stream/compute blocks). One launch, loops 94 layers.
+extern "C" __global__ void k6_overlap_decode(half* act,                 // residual stream (on-chip across layers)
+                                             const void* const* layer_weights, // [94] per-layer weight bases (HBM)
+                                             half* mc_buf,              // multicast buffer for the all-reduce
+                                             int num_layers) {
+    cg::grid_group grid = cg::this_grid();
+    bool is_reduce = (blockIdx.x < N_REDUCE_BLOCKS);     // SM SPECIALIZATION: reduce blocks vs stream/compute blocks
+    extern __shared__ unsigned char smem[];
+
+    for (int L = 0; L < num_layers; ++L) {
+        // ---- ATTENTION (omitted): produces attn_out into `act` (TP-sharded partial) ----
+        // ===== Collective AR-A (post-attn) || prefetch this layer's MoE gate/up weights (LOOP-C schedule) =====
+        if (is_reduce) {
+            multimem_allreduce_8kb(mc_buf, /*n=*/4096);          // EXACT in-switch reduce on a few SMs
+        } else {
+            stream_weight_tile(layer_weights[L]/*MoE gate/up*/, smem, /*bytes=*/0);  // overlap: HBM read in flight
+        }
+        grid.sync();                                              // gate the dependent multiply on the reduced act
+        // now act holds the reduced attention output AND the MoE gate/up weights are smem-resident:
+        if (!is_reduce) expert_gemv(act, smem, act, /*rows*/1536, 4096);   // MoE gate/up (uses resident weights)
+        grid.sync();
+
+        // ---- MoE down-proj (omitted): produces moe_out partial ----
+        // ===== Collective AR-M (post-MoE) || prefetch NEXT layer's QKV weights (LOOP-C schedule) =====
+        if (is_reduce) {
+            multimem_allreduce_8kb(mc_buf, 4096);
+        } else if (L + 1 < num_layers) {
+            stream_weight_tile(layer_weights[L + 1]/*next QKV*/, smem, 0);  // overlap: next-layer weights in flight
+        }
+        grid.sync();
+        // act = residual + reduced moe_out ; next layer's QKV already resident -> loop continues with no stall.
+    }
+    // final norm + lm_head + argmax (greedy fast-path) -> sampled token stays on-device for the next step.
+}
+
+// Notes for the box / the team's megakernel_decode.cu integration:
+//  * SM specialization via blockIdx is the simplest split; a work-queue is more flexible if expert routing is
+//    data-dependent (the reduce blocks could also help stream once their tiny AR is done).
+//  * The hide is `min(C, weight_cover)` per collective; cover ≈ 4.3µs fp8 (MoE gate/up ~3.7, next-QKV ~1.75).
+//    So C≤4µs fully hides; keep N_REDUCE_BLOCKS small so the stream/compute blocks stay resident (occupancy).
+//  * grid.sync() requires cooperative launch (cudaLaunchCooperativeKernel) — verify the occupancy fits one wave.
+//  * Validate: parity vs the bf16 reference (LOSSLESS — the exact AR still runs); then the e2e tok/s vs 85.7.
+//  * This subsumes K5 (the expert_gemv = the fp8 cp.async kernel) + the NVLS reduce + the fast-path loop.

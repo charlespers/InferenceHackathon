@@ -51,23 +51,26 @@ ap.add_argument("--e", type=float, default=1.0, help="measured fp8-K5 kernel eff
 ap.add_argument("--tau-mult", type=float, default=2.77, help="batched-spec multiplier (team EAGLE3 ~2.77-3.8); the dominant lever")
 ap.add_argument("--weight", choices=["fp8"], default="fp8", help="fp8 only — int4 RULED OUT at B=1 (reaction-04, 0.58x unpack-bound)")
 ap.add_argument("--host-ms", type=float, default=0.0, help="residual host/overhead after graphs+fast-path (E-attr)")
-ap.add_argument("--stale-tp", action="store_true", help="LOOP-C stale-TP hides comms (quality-gated) -> comms=0")
+ap.add_argument("--overlap", action="store_true", help="LOOP-C exact deferred-overlap (LOSSLESS): hide C behind the ~8.3us fp8 weight read -> exposed comms = max(0,C-8.3) (stale/proxy-TP is DEAD, reaction-05)")
 a = ap.parse_args()
 w = 0.78 / max(a.e, 0.05)   # fp8 weight read at measured efficiency
-c = 0.0 if a.stale_tp else a.ncoll * a.C / 1e3
+COVER_US = 4.3   # fp8 per-collective NEXT-OP weight-read cover (AR-A->MoE gate/up ~3.7us; AR-M->next QKV ~1.75us;
+                 # avg ~4.3. LOOP-C's 8.3us = the full-LAYER read, optimistic; the dependency limits it to the
+                 # next op. deferred-overlap hides up to COVER of C -> FULL hide needs C<=~4us (multimem in-switch).)
+c = (a.ncoll * max(0.0, a.C - COVER_US) / 1e3) if a.overlap else (a.ncoll * a.C / 1e3)
 tpot, tk = tput(a.host_ms, c, w, kv, a.tau_mult)
 print(f"\n=== LIVE (C={a.C}us e={a.e} tau×{a.tau_mult} weight={a.weight}"
-      f"{' +stale-TP' if a.stale_tp else ''} host={a.host_ms}ms) ===")
+      f"{' +overlap(lossless)' if a.overlap else ''} host={a.host_ms}ms) ===")
 print(f"  weight {w:.2f} + comms {c:.2f} + host {a.host_ms:.2f}  / spec {a.tau_mult}  = {tpot:.2f} ms -> {tk:.0f} tok/s"
       f"  {'>>> 1000 CLEARED' if tk>=1000 else f'(gap {1000-tk:.0f})'}")
 if tk < 1000:
     gap = 1000 - tk
     print(f"  next lever for the {gap:.0f} gap:", end=" ")
-    if c > 1.0 and not a.stale_tp:
-        print(f"comms {c:.1f}ms dominates -> cut COUNT (--ncoll 94 via EP 1-barrier), --stale-tp, or hope multimem<16us.")
+    if c > 1.0 and not a.overlap:
+        print(f"comms {c:.1f}ms dominates -> --overlap (lossless deferred-overlap), or push multimem in-switch C<=4us (then overlap fully hides it).")
     elif a.tau_mult < 3.0: print("spec under-delivering -> bigger/better batched verify (team EAGLE3 ~3.8); fix the batched-verify kernel.")
     elif a.e < 0.85: print("kernel under roofline -> tune fp8-K5 e (cp.async, k5-tuning-roadmap).")
-    else: print("close -> --stale-tp to hide the last comms, or push --ncoll / --tau-mult.")
+    else: print("close -> --overlap (lossless) hides the last comms, or push multimem C<=4us / --tau-mult.")
 print("\nreaction-04: per-collective C is BARRIER-floored ~16us. Comms attack = COUNT (--ncoll) + batched spec,")
 print("NOT per-collective latency (unless measure_collective.sh shows multimem in-switch beats 16us). int4 ruled out.")
 print("Team's measured path: --C 16 --ncoll 94 --tau-mult 2.77 -> ~960.  Cheap first ship: spec+prefix ~300.")

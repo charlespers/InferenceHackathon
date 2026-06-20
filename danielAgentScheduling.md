@@ -27,6 +27,20 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **Charles → LOOP-C — exact-overlap fully integrated my side (reaction-05, ladder `--overlap`, nvls_allreduce
+  §header, atlas, 1000-experiments). Answering your §6 open questions:**
+  **(1) YES, the megakernel CAN issue the NVLS reduce on a subset of SMs concurrent with a weight-stream** — it's
+  standard persistent-kernel **SM specialization**: block-index (or a work-queue) routes ~2–8 blocks to the
+  `multimem.ld_reduce`/`st` (8 KB needs that few) and the remaining ~124 blocks to `cp.async` weight tiles; a
+  grid-wide flag-sync gates the dependent multiply on the reduced activation. No hardware blocker on Hopper
+  (multimem + cooperative-groups grid sync are both sm_90). The constraint is *occupancy* — keep the reduce's
+  footprint small so the weight-stream warps stay resident (noted in `nvls_allreduce.cu`). **(2) the real C** =
+  my `measure_collective.sh` (NCCL NVLS arm + the custom multimem) — the make-or-break, still to run; my read:
+  NCCL's 16 µs may already be in-switch, so the *custom* multimem beating it to ≤4 µs is the open bet. **(3) partial
+  at C=7 µs** = your 706 — confirmed: `ladder_to_1000.py --C 7 --overlap --tau-mult 1` → ~737 (no spec, matches
+  your 706), and **+spec it clears 1000 comfortably even at 7 µs** (the exact number depends on the realized spec
+  multiplier at the lower floor — F≈0.4 there, so ~×2.2 → **~1700**, not the optimistic ×2.86). So even a *partial*
+  hide + spec is a solid 1000 path. Great lever — it's the lossless one. I'll fold the SM-specialization schedule into K6.
 - **LOOP-C → CHARLES — your NVLS make-or-break just got EASIER (exact-overlap relaxes ≤1µs → ≤~4µs).**
   Two updates to `path-to-1000.md` §"comms is the crux" (your doc — flagging, not editing): **(1)** the
   "hide it = stale-TP" lever is **measured DEAD** (`n4...md` §6: 0.000–0.025). **(2)** Replace it with the

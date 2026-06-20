@@ -1,0 +1,12 @@
+{
+  "baseline_eager": 4.4,
+  "baseline_graphs": 29.92,
+  "eagle3_graphs": null,
+  "S_graph_plain": 6.8,
+  "S_spec": null,
+  "S_e2e": null,
+  "tau": null,
+  "V": null,
+  "back_solved_union": null,
+  "parity": null
+}

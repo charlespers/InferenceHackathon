@@ -1,0 +1,111 @@
+armed Sat Jun 20 11:07:42 UTC 2026 — waiting for a NOW (box-free, user-authorized) (EAGLE3)
+slot start Sat Jun 20 11:07:42 UTC 2026
+min GPU free 80547MB
+=== launch eagle3_eager Sat Jun 20 11:07:43 UTC 2026: --enforce-eager --speculative-config {"method":"eagle3","model":"nm-testing/Qwen3-235B-A22B-EAGLE3-converted-speculators-lmsys","num_speculative_tokens":3,"draft_tensor_parallel_size":8} ===
+eagle3_eager serving — measuring decode tok/s + capturing greedy
+measuring http://localhost:8077 model=qwen3 decode=64 x3 ...
+  run 1: {'ok': True, 'ttft_ms': 2077.42, 'tpot_ms': 101.428, 'decode_tok_s': 9.86, 'tokens': 48}
+  run 2: {'ok': True, 'ttft_ms': 109.75, 'tpot_ms': 96.041, 'decode_tok_s': 10.41, 'tokens': 48}
+  run 3: {'ok': True, 'ttft_ms': 110.48, 'tpot_ms': 96.128, 'decode_tok_s': 10.4, 'tokens': 48}
+
+=== BASELINE ===
+  TTFT      110.48 ms
+  TPOT      96.128 ms/token
+  decode    10.4 tok/s  (1.9% of ~540.0 roofline)
+  bottleneck hint: DOMINATED by floor (launch/host/comms — fix fast-path first)
+  -> /alloc/data/eagle3/m_eagle3_eager.json
+  [1/10] ok (445 chars)
+  [2/10] ok (37 chars)
+  [3/10] ok (400 chars)
+  [4/10] ok (272 chars)
+  [5/10] ok (473 chars)
+  [6/10] ok (288 chars)
+  [7/10] ok (440 chars)
+  [8/10] ok (415 chars)
+  [9/10] ok (20 chars)
+  [10/10] ok (195 chars)
+-> /alloc/data/eagle3/q_eagle3_eager.json
+--- eagle3_eager spec/accept metrics (server log) ---
+[1;36m(Worker_TP0_EP0 pid=146645)[0;0m INFO 06-20 11:08:29 [gpu_model_runner.py:3328] Using auxiliary layers from speculative config: (1, 46, 90)
+[1;36m(Worker_TP1_EP1 pid=146646)[0;0m INFO 06-20 11:08:29 [gpu_model_runner.py:3328] Using auxiliary layers from speculative config: (1, 46, 90)
+[1;36m(APIServer pid=146013)[0;0m INFO 06-20 11:09:28 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.23, Accepted throughput: 0.67 tokens/s, Drafted throughput: 8.57 tokens/s, Accepted: 7 tokens, Drafted: 90 tokens, Per-position acceptance rate: 0.167, 0.033, 0.033, Avg Draft acceptance rate: 7.8%
+[1;36m(APIServer pid=146013)[0;0m INFO 06-20 11:09:38 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.38, Accepted throughput: 3.80 tokens/s, Drafted throughput: 29.40 tokens/s, Accepted: 38 tokens, Drafted: 294 tokens, Per-position acceptance rate: 0.310, 0.050, 0.020, Avg Draft acceptance rate: 12.9%
+[1;36m(APIServer pid=146013)[0;0m INFO 06-20 11:09:48 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.63, Accepted throughput: 5.70 tokens/s, Drafted throughput: 26.60 tokens/s, Accepted: 57 tokens, Drafted: 266 tokens, Per-position acceptance rate: 0.411, 0.144, 0.078, Avg Draft acceptance rate: 21.4%
+[1;36m(APIServer pid=146013)[0;0m INFO 06-20 11:09:58 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.38, Accepted throughput: 3.90 tokens/s, Drafted throughput: 30.50 tokens/s, Accepted: 39 tokens, Drafted: 305 tokens, Per-position acceptance rate: 0.304, 0.069, 0.010, Avg Draft acceptance rate: 12.8%
+[1;36m(APIServer pid=146013)[0;0m INFO 06-20 11:10:08 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.38, Accepted throughput: 3.80 tokens/s, Drafted throughput: 29.80 tokens/s, Accepted: 38 tokens, Drafted: 298 tokens, Per-position acceptance rate: 0.267, 0.069, 0.040, Avg Draft acceptance rate: 12.8%
+[1;36m(APIServer pid=146013)[0;0m INFO 06-20 11:10:18 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.64, Accepted throughput: 6.50 tokens/s, Drafted throughput: 30.30 tokens/s, Accepted: 65 tokens, Drafted: 303 tokens, Per-position acceptance rate: 0.422, 0.147, 0.069, Avg Draft acceptance rate: 21.5%
+  scraped 28 spec metric lines -> metrics_eagle3_eager.txt
+=== launch baseline_eager Sat Jun 20 11:10:47 UTC 2026: --enforce-eager ===
+baseline_eager serving — measuring decode tok/s + capturing greedy
+measuring http://localhost:8077 model=qwen3 decode=64 x3 ...
+  run 1: {'ok': True, 'ttft_ms': 1072.37, 'tpot_ms': 100.597, 'decode_tok_s': 9.94, 'tokens': 64}
+  run 2: {'ok': True, 'ttft_ms': 108.27, 'tpot_ms': 99.0, 'decode_tok_s': 10.1, 'tokens': 64}
+  run 3: {'ok': True, 'ttft_ms': 108.35, 'tpot_ms': 99.336, 'decode_tok_s': 10.07, 'tokens': 64}
+
+=== BASELINE ===
+  TTFT      108.35 ms
+  TPOT      99.336 ms/token
+  decode    10.07 tok/s  (1.9% of ~540.0 roofline)
+  bottleneck hint: DOMINATED by floor (launch/host/comms — fix fast-path first)
+  -> /alloc/data/eagle3/m_baseline_eager.json
+  [1/10] ok (445 chars)
+  [2/10] ok (37 chars)
+  [3/10] ok (400 chars)
+  [4/10] ok (272 chars)
+  [5/10] ok (473 chars)
+  [6/10] ok (288 chars)
+  [7/10] ok (440 chars)
+  [8/10] ok (415 chars)
+  [9/10] ok (20 chars)
+  [10/10] ok (195 chars)
+-> /alloc/data/eagle3/q_baseline_eager.json
+--- baseline_eager spec/accept metrics (server log) ---
+[1;36m(EngineCore_DP0 pid=149343)[0;0m INFO 06-20 11:10:59 [core.py:93] Initializing a V1 LLM engine (v0.11.2) with config: model='Qwen/Qwen3-235B-A22B-Instruct-2507-FP8', speculative_config=None, tokenizer='Qwen/Qwen3-235B-A22B-Instruct-2507-FP8', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=8192, download_dir=None, load_format=auto, tensor_parallel_size=8, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=fp8, enforce_eager=True, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=qwen3, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all', '+quant_fp8'], 'splitting_ops': None, 'compile_mm_encoder': False, 'use_inductor': None, 'compile_sizes': [], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {}, 'max_cudagraph_capture_size': 0, 'local_cache_dir': None}
+  scraped 0 spec metric lines -> metrics_baseline_eager.txt
+=== launch eagle3_eager_k8 Sat Jun 20 11:13:58 UTC 2026: --enforce-eager --speculative-config {"method":"eagle3","model":"nm-testing/Qwen3-235B-A22B-EAGLE3-converted-speculators-lmsys","num_speculative_tokens":8,"draft_tensor_parallel_size":8} ===
+eagle3_eager_k8 serving — measuring decode tok/s + capturing greedy
+measuring http://localhost:8077 model=qwen3 decode=64 x3 ...
+  run 1: {'ok': True, 'ttft_ms': 1192.27, 'tpot_ms': 120.36, 'decode_tok_s': 8.31, 'tokens': 48}
+  run 2: {'ok': True, 'ttft_ms': 119.33, 'tpot_ms': 113.856, 'decode_tok_s': 8.78, 'tokens': 48}
+  run 3: {'ok': True, 'ttft_ms': 118.71, 'tpot_ms': 114.747, 'decode_tok_s': 8.71, 'tokens': 48}
+
+=== BASELINE ===
+  TTFT      118.71 ms
+  TPOT      114.747 ms/token
+  decode    8.71 tok/s  (1.6% of ~540.0 roofline)
+  bottleneck hint: DOMINATED by floor (launch/host/comms — fix fast-path first)
+  -> /alloc/data/eagle3/m_eagle3_eager_k8.json
+  [1/10] ok (445 chars)
+  [2/10] ok (37 chars)
+  [3/10] ok (400 chars)
+  [4/10] ok (272 chars)
+  [5/10] ok (473 chars)
+  [6/10] ok (288 chars)
+  [7/10] ok (440 chars)
+  [8/10] ok (415 chars)
+  [9/10] ok (20 chars)
+  [10/10] ok (195 chars)
+-> /alloc/data/eagle3/q_eagle3_eager_k8.json
+--- eagle3_eager_k8 spec/accept metrics (server log) ---
+[1;36m(Worker_TP5_EP5 pid=151812)[0;0m INFO 06-20 11:14:43 [gpu_model_runner.py:3328] Using auxiliary layers from speculative config: (1, 46, 90)
+[1;36m(APIServer pid=151395)[0;0m INFO 06-20 11:15:18 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.33, Accepted throughput: 2.09 tokens/s, Drafted throughput: 48.16 tokens/s, Accepted: 22 tokens, Drafted: 506 tokens, Per-position acceptance rate: 0.258, 0.045, 0.030, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 4.3%
+[1;36m(APIServer pid=151395)[0;0m INFO 06-20 11:15:28 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.43, Accepted throughput: 3.60 tokens/s, Drafted throughput: 62.00 tokens/s, Accepted: 36 tokens, Drafted: 620 tokens, Per-position acceptance rate: 0.313, 0.048, 0.024, 0.012, 0.012, 0.012, 0.012, 0.000, Avg Draft acceptance rate: 5.8%
+[1;36m(APIServer pid=151395)[0;0m INFO 06-20 11:15:38 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.47, Accepted throughput: 4.00 tokens/s, Drafted throughput: 67.00 tokens/s, Accepted: 40 tokens, Drafted: 670 tokens, Per-position acceptance rate: 0.360, 0.058, 0.035, 0.012, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 6.0%
+[1;36m(APIServer pid=151395)[0;0m INFO 06-20 11:15:48 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.43, Accepted throughput: 3.70 tokens/s, Drafted throughput: 67.40 tokens/s, Accepted: 37 tokens, Drafted: 674 tokens, Per-position acceptance rate: 0.349, 0.070, 0.012, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 5.5%
+[1;36m(APIServer pid=151395)[0;0m INFO 06-20 11:15:58 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.27, Accepted throughput: 2.30 tokens/s, Drafted throughput: 66.40 tokens/s, Accepted: 23 tokens, Drafted: 664 tokens, Per-position acceptance rate: 0.221, 0.035, 0.012, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 3.5%
+[1;36m(APIServer pid=151395)[0;0m INFO 06-20 11:16:08 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.72, Accepted throughput: 6.20 tokens/s, Drafted throughput: 66.30 tokens/s, Accepted: 62 tokens, Drafted: 663 tokens, Per-position acceptance rate: 0.395, 0.151, 0.081, 0.035, 0.023, 0.023, 0.012, 0.000, Avg Draft acceptance rate: 9.4%
+[1;36m(APIServer pid=151395)[0;0m INFO 06-20 11:16:18 [metrics.py:100] SpecDecoding metrics: Mean acceptance length: 1.51, Accepted throughput: 4.30 tokens/s, Drafted throughput: 66.00 tokens/s, Accepted: 43 tokens, Drafted: 660 tokens, Per-position acceptance rate: 0.353, 0.071, 0.024, 0.024, 0.024, 0.012, 0.000, 0.000, Avg Draft acceptance rate: 6.5%
+  scraped 38 spec metric lines -> metrics_eagle3_eager_k8.txt
+=== EAGLE3 lossless parity gate (eager: baseline vs eagle3 greedy) ===
+=== adaptive-top-k quality gate (10 prompts) ===
+  mean word-prefix agreement : 100.0%
+  exact-match rate           : 100.0%
+  verdict                    : SHIP (outputs ~identical)
+    100.0%  =  Write a Python function to check if a string is a 
+    100.0%  =  What is the capital of Australia? Answer in one se
+    100.0%  =  Explain the difference between a stack and a queue
+    100.0%  =  Compute 17 * 23 and show your steps.
+    100.0%  =  Write the first paragraph of a story about a light
+-> /alloc/data/eagle3/parity_gate_eager.json
+fatal: could not read Username for 'https://github.com': No such device or address
+slot done Sat Jun 20 11:16:43 UTC 2026

@@ -68,6 +68,23 @@ Qwen3-MoE 235B-A22B EAGLE3 support is explicitly claimed by the vLLM/speculators
 3. **CUDA-graph compatibility — the main one.** EAGLE3 + graph mode has a documented history of startup failures that disappear under **`--enforce-eager`**. Plan: **first launch with `--enforce-eager`** to confirm correctness and measure accept length; then drop it to capture graphs for the real perf number. If graphs crash, that's the known issue, not your config. If you run full-cudagraph/fullgraph EAGLE, `cudagraph_capture_sizes` must account for spec tokens (~`n*(K+1)` per batch size).
 4. **EAGLE3 + EP interaction.** MoE + EAGLE3 is newer than dense + EAGLE3; the eagle3-quant-config / MoE-backend propagation fixes are recent. Validate **lossless parity** (your existing token-level parity gate) before trusting throughput — a silently-wrong draft still "works" but accept length collapses.
 5. **Verifier pin.** The nm-testing head's `speculators_config.verifier` is pinned to `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8` — matches your target exactly, so no mismatch. If you serve a different target revision, regenerate via path (B).
+7. **vLLM 0.11.0 LACKS Qwen3-MoE EAGLE3 (MEASURED 2026-06-20 — the real min version).** The earlier
+   "needs ≥0.10.2" is WRONG for the MoE target. 0.10.2/0.11.0 have EAGLE3 for Llama + DENSE Qwen3 only.
+   `Qwen3MoeForCausalLM` gains the `SupportsEagle3` aux-hidden-state interface only via **PR #26485**
+   (merged 2025-10-11), which **missed the 0.11.0 tag (Oct 2) by 9 days** → first ships in **vLLM 0.11.1**.
+   On 0.11.0 the run dies at drafter load: `RuntimeError: Model does not support EAGLE3 interface but
+   aux_hidden_state_outputs was requested` (gpu_model_runner.py). **FIX: `pip install vllm==0.11.2
+   transformers==4.57.1`** (0.11.2 = most baked; transformers<5 is properly pinned there).
+8. **prometheus_fastapi_instrumentator vs Starlette 1.x — NOT fixed by upgrading vLLM (MEASURED 2026-06-20).**
+   `prometheus_fastapi_instrumentator` (8.0.0, what vLLM 0.11.0 AND 0.11.2 pull) calls `route.path` on every
+   request, but **starlette 1.x puts a `_IncludedRouter` (no `.path`) in `app.routes`** → EVERY HTTP request
+   500s: `AttributeError: '_IncludedRouter' object has no attribute 'path'`. The model loads fine (70 GB/GPU)
+   but is UNREACHABLE — the readiness curl never passes, so the slot silently times out with no number. This
+   recurs on 0.11.2 (the coherent dep set still ships the bad combo). **FIX (verified non-GPU via FastAPI
+   TestClient):** patch `prometheus_fastapi_instrumentator/routing.py` — guard `route_name = route.path` →
+   `route_name = getattr(route, "path", None)` + `if route_name is None: continue` (both occurrences in
+   `_get_route_name`). The box venv build script reapplies this. Verify: a TestClient on an `include_router`
+   app + `Instrumentator().instrument(app)` returns 200, not 500.
 6. **transformers UPPER-BOUND (MEASURED 2026-06-20).** vLLM 0.11.0 requires only `transformers>=4.55.2` with **no upper bound**, so a fresh `pip install vllm==0.11.0` pulls **transformers 5.x** (5.12.1), which **removed `all_special_tokens_extended`** → vLLM's `get_cached_tokenizer` crashes at startup with `AttributeError: Qwen2Tokenizer has no attribute all_special_tokens_extended` (hits BOTH spec and plain baseline — it's pre-GPU, at tokenizer init, nothing to do with EAGLE3). **Fix: pin `transformers==4.57.1`** (contemporary with vLLM 0.11.0; tokenizers 0.22.2 OK). Reproduce/verify NON-GPU: `python -c "from vllm.transformers_utils.tokenizer import get_tokenizer; get_tokenizer('Qwen/Qwen3-235B-A22B-Instruct-2507-FP8')"`. The box venv `/alloc/data/eagle3-venv` + its build script are already pinned.
 
 ---

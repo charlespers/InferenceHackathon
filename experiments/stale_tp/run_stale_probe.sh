@@ -30,11 +30,9 @@ TOK=${TOK:-96}                               # greedy tokens per prompt (parity 
 # is the sanity FLOOR (must degrade → proves the probe detects breakage); higher K and
 # temporal are opportunistic. Ordered by priority (slot may end early).
 SWEEP=(
-  "layer proxy 2 lyr_proxy_k2"
-  "layer proxy 4 lyr_proxy_k4"
+  "layer predicted 2 lyr_pred_k2"
+  "layer predicted 4 lyr_pred_k4"
   "layer local 2 lyr_local_k2"
-  "layer proxy 8 lyr_proxy_k8"
-  "temporal proxy 2 tmp_proxy_k2"
 )
 
 mins () { echo $((10#$(date +%M))); }

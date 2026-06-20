@@ -1,0 +1,17 @@
+{
+  "base": "http://localhost:8077",
+  "model": "qwen3",
+  "tokens": 64,
+  "completions": {
+    "Write a Python function to check if a string is a palindrome.": "Here are several Python functions to check if a string is a palindrome:\n\n## Basic Version\n```python\ndef is_palindrome(s):\n    \"\"\"\n    Check if a string is a palindrome (case-sensitive).\n    \n    Args:\n        s (str): The string to check\n        \n    Returns:\n        bool: True if the",
+    "What is the capital of Australia? Answer in one sentence.": "The capital of Australia is Canberra.",
+    "Explain the difference between a stack and a queue.": "A **stack** and a **queue** are both abstract data types used to store and manage collections of elements, but they differ in how elements are added and removed.\n\n### Stack (Last In, First Out - LIFO)\n- **Principle**: The last element added is the first one to be removed.\n-",
+    "Compute 17 * 23 and show your steps.": "To compute $ 17 \\times 23 $, we can use the **distributive property** to break it down into simpler parts.\n\n### Step 1: Break down one of the numbers\nLet's break 23 into $ 20 + 3 $:\n\n$$\n17 \\",
+    "Write the first paragraph of a story about a lighthouse keeper.": "The wind howled like a thing alive the night Elias Thorne arrived on Gullrock Isle, tearing at his coat and snatching the breath from his lungs as he climbed the slick, black stone steps that wound up the cliff face. Salt stung his eyes, and the sea below roared, a churning",
+    "List the planets of the solar system in order from the sun.": "The planets of the solar system in order from the Sun are:\n\n1. Mercury  \n2. Venus  \n3. Earth  \n4. Mars  \n5. Jupiter  \n6. Saturn  \n7. Uranus  \n8. Neptune  \n\nThese eight planets orbit the Sun, with the first four being terrestrial (rocky) planets",
+    "Implement binary search in Python with comments.": "Sure! Here's a clear and well-commented implementation of **binary search** in Python:\n\n```python\ndef binary_search(arr, target):\n    \"\"\"\n    Perform binary search on a sorted list to find the index of the target value.\n    \n    Parameters:\n        arr (list): A sorted list of elements (in",
+    "Summarize what HTTP status code 404 means.": "HTTP status code 404, also known as \"Not Found,\" indicates that the server could not find the requested resource. This typically occurs when a user tries to access a webpage or file that doesn't exist, has been moved, or has a broken or mistyped URL. It's a client error status code",
+    "Translate 'I would like a coffee' into French.": "Je voudrais un caf\u00e9.",
+    "What is recursion? Give a one-line example.": "Recursion is a programming technique where a function calls itself to solve a smaller instance of the same problem.  \n**Example:** `def factorial(n): return 1 if n == 0 else n * factorial(n - 1)`"
+  }
+}

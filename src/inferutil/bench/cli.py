@@ -15,6 +15,7 @@ from .runner import run_benchmark
 from .telemetry import NvmlTelemetry, NullTelemetry
 from .store import (write_run, load_run, load_latest, result_to_x_summary, RunRecord)
 from .report import format_result, format_compare
+from .gate import Thresholds, evaluate
 
 DEFAULT_RESULTS_DIR = "results"
 
@@ -76,6 +77,20 @@ def _cmd_report(args) -> None:
           else format_result(rec))
 
 
+def _cmd_gate(args) -> None:
+    rec = _resolve(args)
+    th = Thresholds(min_decode_tok_per_s=args.min_tok_s, max_ttft_s=args.max_ttft_s,
+                    min_pct_of_floor=args.min_pct_floor, min_quality_match=args.min_quality)
+    g = evaluate(rec.result, th)
+    if g.passed:
+        print(f"GATE PASS  [{rec.runid}] {rec.config.name}")
+    else:
+        print(f"GATE FAIL  [{rec.runid}] {rec.config.name}")
+        for f in g.failures:
+            print(f"  - {f}")
+        raise SystemExit(1)
+
+
 def _cmd_compare(args) -> None:
     for runid in (args.a, args.b):
         path = os.path.join(args.results_dir, args.name, runid + ".json")
@@ -114,6 +129,15 @@ def main(argv=None) -> None:
     rp.add_argument("runid", nargs="?", default="latest")
     rp.add_argument("--json", action="store_true")
     rp.set_defaults(func=_cmd_report)
+
+    gp = sub.add_parser("gate", help="pass/fail a stored run against thresholds")
+    gp.add_argument("--name", default="default")
+    gp.add_argument("runid", nargs="?", default="latest")
+    gp.add_argument("--min-tok-s", type=float, default=None)
+    gp.add_argument("--max-ttft-s", type=float, default=None)
+    gp.add_argument("--min-pct-floor", type=float, default=None)
+    gp.add_argument("--min-quality", type=float, default=None)
+    gp.set_defaults(func=_cmd_gate)
 
     cp = sub.add_parser("compare", help="diff two stored runs")
     cp.add_argument("--name", default="default")

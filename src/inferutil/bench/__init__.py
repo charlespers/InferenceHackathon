@@ -8,22 +8,29 @@ docs/superpowers/specs/2026-06-19-inference-benchmark-harness-design.md.
 """
 
 from .config import BenchConfig, config_id
-from .engine import Engine, MockEngine, ExpertRoute, PrefillResult, DecodeStep
+from .engine import Engine, MockEngine, ExpertRoute, PrefillResult, DecodeStep, StepBreakdown
 from .telemetry import (GpuSample, TelemetrySource, NullTelemetry,
                         FakeTelemetrySource, NvmlTelemetry)
 from .metrics import (BenchResult, TelemetrySummary, bytes_per_token,
-                      summarize_telemetry, build_result)
+                      summarize_telemetry, build_result, MeasuredBreakdown,
+                      aggregate_breakdown)
 from .runner import run_benchmark
 from .store import (RunRecord, write_run, load_run, load_all, load_latest,
                     result_to_x_summary)
+from .quality import QualityResult, match_rate
+from .gate import Thresholds, GateResult, evaluate
 
 __all__ = [
     "BenchConfig", "config_id",
     "Engine", "MockEngine", "ExpertRoute", "PrefillResult", "DecodeStep",
+    "StepBreakdown",
     "GpuSample", "TelemetrySource", "NullTelemetry", "FakeTelemetrySource",
     "NvmlTelemetry",
     "BenchResult", "TelemetrySummary", "bytes_per_token", "summarize_telemetry",
     "build_result", "run_benchmark",
+    "MeasuredBreakdown", "aggregate_breakdown",
     "RunRecord", "write_run", "load_run", "load_all", "load_latest",
     "result_to_x_summary",
+    "QualityResult", "match_rate",
+    "Thresholds", "GateResult", "evaluate",
 ]

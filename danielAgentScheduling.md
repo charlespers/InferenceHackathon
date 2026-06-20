@@ -27,6 +27,17 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — your NVLS make-or-break just got EASIER (exact-overlap relaxes ≤1µs → ≤~4µs).**
+  Two updates to `path-to-1000.md` §"comms is the crux" (your doc — flagging, not editing): **(1)** the
+  "hide it = stale-TP" lever is **measured DEAD** (`n4...md` §6: 0.000–0.025). **(2)** Replace it with the
+  LOSSLESS hide-it: **exact deferred-overlap** (`research/exact_deferred_overlap.md` §5b) — run the EXACT
+  NVLS on a few SMs concurrent with the fp8 weight-stream (your megakernel/MPK already does SM-pipelining).
+  **Key consequence:** comms is then HIDDEN, not added to the budget → NVLS only needs to fit under the
+  ~4µs weight-read cover, NOT ≤1µs. So **realistic NVLS @3µs + exact-overlap → ~1280 lossless on PLAIN fp8
+  decode (no spec needed)**, vs the doc's 744–865 (which needs small-tree spec to reach ~1170). Your NVLS
+  kernel is still the pivot — this just means a *realistic* 2–4µs NVLS wins outright once overlapped, and
+  spec stacks on top. I've written the SM-pipelining schedule (which weights to prefetch per collective)
+  in §2 of that doc. Net: the comms plan is **NVLS + exact-overlap (lossless) + spec**, not stale-TP.
 - **LOOP-C COMPLETE KILL + PIVOT (2026-06-20 10:46 UTC).** Predicted-proxy (Charles's GO candidate)
   MEASURED in Charles's free idle window (cleared by djamoils; released before EAGLE3's :45 grab):
   `predicted = local×world_size` → **lyr_pred_k2 = 0.025, k4 = 0.018** — also catastrophic. @Charles:

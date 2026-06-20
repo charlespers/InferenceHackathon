@@ -16,13 +16,16 @@ while :; do m=$((10#$(date +%M))); [ "$m" -ge 30 ] && [ "$m" -le 43 ] && break; 
 mf=0; for i in $(seq 1 18); do mf=$(free_min); [ "${mf:-0}" -gt 70000 ] && break; sleep 10; done
 if [ "${mf:-0}" -lt 70000 ]; then log "=== ABORT: GPUs busy (${mf}MiB) ==="; touch "$DONE"; exit 0; fi
 
-log "=== launch bf16 pure-TP8 + prefix-cache + n-gram(k=8) + NCCL_PROTO=LL $(date -u +%H:%M:%S)UTC (free ${mf}MiB) ==="
+log "=== launch FULL cheap-wins config (docs/vllm-b1-config.md): bf16 TP8 + prefix-cache + n-gram(k=8) + LL + max-num-seqs=1 + V1 + no-chunked-prefill $(date -u +%H:%M:%S)UTC (free ${mf}MiB) ==="
 cd /root
-setsid env NCCL_PROTO=LL NCCL_MAX_NCHANNELS=2 python3 -m vllm.entrypoints.openai.api_server --model "$MODEL" \
+# host-floor knobs (max-num-seqs=1, V1, no-chunked-prefill, no-logging) work on 0.10.1; EAGLE3 (run_eagle3.sh) needs 0.10.2.
+setsid env NCCL_PROTO=LL NCCL_MAX_NCHANNELS=2 VLLM_USE_V1=1 python3 -m vllm.entrypoints.openai.api_server --model "$MODEL" \
   --served-model-name "$SERVED" --tensor-parallel-size 8 --dtype bfloat16 --enable-prefix-caching \
   --speculative-config '{"method":"ngram","num_speculative_tokens":8,"prompt_lookup_max":4,"prompt_lookup_min":1}' \
-  --port 8001 --max-model-len 4096 --gpu-memory-utilization 0.92 --trust-remote-code \
+  --max-num-seqs 1 --disable-log-requests \
+  --port 8001 --max-model-len 4096 --gpu-memory-utilization 0.90 --trust-remote-code \
   > /root/vllm_best.log 2>&1 < /dev/null &
+# NOTE: if --no-enable-chunked-prefill is rejected by this build, drop it (and add it back if short-prompt TTFT is high).
 VPID=$!; ready=0
 for i in $(seq 1 110); do curl -s -m4 http://localhost:8001/v1/models 2>/dev/null | grep -q "$SERVED" && { ready=1; log "  READY ~$((i*5))s"; break; }; sleep 5; done
 if [ "$ready" -ne 1 ]; then log "  DID NOT COME UP (some flag may be unsupported; tail:)"; tail -25 /root/vllm_best.log >> "$RES"; kill -9 -"$VPID" 2>/dev/null; touch "$DONE"; exit 0; fi

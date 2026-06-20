@@ -82,3 +82,11 @@ ctx=8192: rel=0.49% PASS, FLAT 1.03x@M=16 (abs M=1..16: 558/559/563/573us)
    engine path does NOT materialize: use cuBLASLt NATIVE fp8 GEMM (no dequant pass) or load fp8 inline like
    mk_tree_attn_fp8's k2_load4. So the representative fp8 cost ~ the fp16 number (81us@M=8) or LESS (half HBM
    on the KV read). The dequant proxy only validates accuracy+flatness, not the absolute. NEXT: native-fp8 GEMM.
+
+=== FLATNESS CEILING (tcvc, tree verify M up to 64) — the tree node_budget ===
+ctx=4096: M=1/8/16/24/32/48/64 -> 74.5/76.1/81.2/86.5/92.1/105.9/122.3us (ratio 1.00/1.02/1.09/1.16/1.24/1.42/1.64)
+ctx=8192: M=1/8/16/24/32/48/64 -> 128.5/135.3/146.2/155.9/177.2/225.4/284.2us (ratio 1.00/1.05/1.14/1.21/1.38/1.76/2.21)
+correctness rel 0.37-0.46% PASS. => FLAT to ~M=16 (<1.1x), near-flat to ~M=24, degrades past M=32 (TC tiles
+saturate the SMs; ctx8192 degrades sooner = longer per-warp draft-self + bigger score GEMM). PRACTICAL TREE
+NODE_BUDGET ~16-24 @ctx4096 (feed into tree_shape::TreeCostModel.node_budget). Beyond ~32 nodes the verify
+re-acquires M-scaling -> diminishing tree-width returns. Confirms wide trees pay ONLY up to the ceiling.

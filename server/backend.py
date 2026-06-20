@@ -9,6 +9,7 @@ from server.schemas import ChatRequest
 from server.mock_engine import mock_stream
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001")
+NATIVE_ENABLED = os.environ.get("NATIVE_ENABLED", "0") == "1"
 
 
 class Backend(ABC):
@@ -129,6 +130,13 @@ def _vllm_healthy() -> bool:
 def get_backend() -> Backend:
     if os.environ.get("BACKEND") == "mock":
         return MockBackend()
+    if os.environ.get("BACKEND") == "native" or NATIVE_ENABLED:
+        # NATIVE_ENABLED is opt-in (default off): constructing NativeBackend blocks for minutes while
+        # the engine loads all 94 real layers, so it must not happen by accident on every dev `uvicorn`
+        # reload. See server/native_backend.py's module docstring for the protocol and known limits.
+        from server.native_backend import NativeBackend
+        print("NATIVE_ENABLED=1 — loading the native TP=8 engine (this blocks for several minutes)")
+        return NativeBackend()
     if _vllm_healthy():
         print(f"vLLM detected at {VLLM_URL} — using real backend")
         return VLLMBackend()

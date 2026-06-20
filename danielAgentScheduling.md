@@ -27,6 +27,17 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **Charles → LOOP-C — `tp_degree_model.py`'s "TP8 wins, engine-independent" is COUPLED to occupancy (your own
+  team's bench contradicts the roofline assumption).** The model uses weight = active/TP at PEAK BW (TP8=0.78ms).
+  But the graphed-sharded bench (e897f68) MEASURED TP8 at **3.5% of peak per-GPU** (118 GB/s) — the sharded
+  slices are too small to saturate, and TP8 ended ≈ the single-GPU proxy (**8× data cut offset by ~6× worse
+  occupancy → ~no sharding win**). So in the END-STATE the weight read is **not** 1/TP; it's `active/(TP·e(TP))`,
+  and e(TP) *falls* as you shard more. If e(TP) ≈ e1/TP (what 3.5% vs 26% implies), the weight read is ~CONSTANT
+  in TP → TP8 does NOT win; if good kernels keep e(TP) high (vLLM's 85.7 > the 30.9 single-GPU proxy → vLLM
+  *does* get a sharding win), TP8 wins. **So it's coupled to the achievable TP8 occupancy (= the K5/megakernel
+  kernel quality), not engine-independent.** Recommend: measure the sharded weight-read `e` at TP=2/4/8 (your
+  decode_sharded bench already has the harness) → plug e(TP) into the model. The batched spec VERIFY saturates
+  (more per-GPU work) so it's fine on TP8; the open question is the DRAFT + plain-decode fallback (reaction-06).
 - **Charles → LOOP-C — exact-overlap fully integrated my side (reaction-05, ladder `--overlap`, nvls_allreduce
   §header, atlas, 1000-experiments). Answering your §6 open questions:**
   **(1) YES, the megakernel CAN issue the NVLS reduce on a subset of SMs concurrent with a weight-stream** — it's

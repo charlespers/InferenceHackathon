@@ -135,8 +135,9 @@ results.
 | `src/inferutil/bench/stats.py` | NEW | `Stat` + Student-t summarize |
 | `src/inferutil/bench/attribution.py` | NEW | bottleneck diagnosis |
 | `src/inferutil/bench/levers.py` | NEW | ranked next-lever recommender |
-| `src/inferutil/bench/sweep.py` | NEW | analytical depth + config sweeps (KV-decay, quant ranking) |
+| `src/inferutil/bench/sweep.py` | NEW | analytical depth + config + layout + full sweeps |
 | `src/inferutil/bench/cost.py` | NEW | energy + rental cost-per-Mtok |
+| `src/inferutil/bench/prefill.py` | NEW | batched-prefill roofline (compute-bound MFU) |
 | `src/inferutil/bench/manifest.py` | NEW | reproducibility capture |
 | `src/inferutil/bench/metrics.py` | EDIT | `Efficiency` field on `BenchResult` |
 | `src/inferutil/bench/runner.py` | EDIT | repeats→5, collect latency Stats |
@@ -160,3 +161,32 @@ Extend `tests/test_bench_*.py`:
 - HTML report / plots (separate UI exists; not requested).
 - Metal/CPU STREAM-triad bandwidth probe (wrong hardware; reuse `kernels/k5_microbench` HBM number when available).
 - Continuous-batching / B>1 sweeps (B=1 is our regime).
+
+## Delivered (as of 2026-06-20)
+
+Beyond the original design, implemented and tested (98 Python tests passing):
+
+- **Efficiency**: MFU (prefill/decode + achieved TFLOPs), MBU (KV-inclusive +
+  `kv_byte_share`), arithmetic intensity, roofline ridge, regime.
+- **Latency panel** ("TTS"): TTFT / E2E / throughput / TPOT as Student-t-CI
+  distributions; default `repeats` 1→5.
+- **Real prefill model** (`prefill.py`): batched compute-vs-full-weight-read
+  roofline with expected-distinct-experts accounting → meaningful `MFU_prefill`
+  and honest TTFT (was a `floor_s*n` placeholder).
+- **Decision support**: `attribution.diagnose` (roofline-principled bottleneck +
+  `kernel_gap`), `levers.recommend` (ranked by predicted speedup; spec-decode
+  lever delegates to `speculative.py`).
+- **Sweeps**: depth (KV-decay crossover), quant grid, layout (tp×ep), full
+  quant×layout — each row annotated with bottleneck + `$/Mtok`.
+- **Cost** (`cost.py`): energy (J/tok, tok/s/W, kWh/Mtok, $/Mtok) + telemetry-free
+  rental $/Mtok.
+- **Spec sizing**: `spec` command surfaces `speculative.py` sweep + HBM
+  feasibility, marks the best feasible (drafters × k).
+- **Rigor/ops**: `--peak-bw-gbs` (measured BW overrides the spec sheet),
+  reproducibility `manifest.json`, CSV/JSONL/Markdown export, CI-aware
+  regression gate (`gate --baseline`).
+- **Standalone real-server path**: `bench/measure.py` now does repeated
+  measurement with percentiles + CIs; `bench/roofline.py` reports MFU/MBU/ridge
+  with principled attribution. Both stay stdlib-only for the remote box.
+
+CLI surface: `run · report · diagnose · sweep · spec · gate · compare · export`.

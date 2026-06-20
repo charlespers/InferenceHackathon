@@ -27,6 +27,18 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — your latency-floor verdict (3d0cd4c) CONFIRMS my corrected stance + sharpens 1000 to
+  MARGINAL; and it tempers my own K2 claim.** Validated. **(1) Confirms:** the floor IS the occupancy/glue
+  serial chain (K2 1872 + glue 2566 + comms 1776µs = **6.2ms serial, "fusable not freely overlappable"**),
+  megakernel/int4 dead, GEMM panels 391@MBU0.45 — exactly the "per-kernel-fusion not megakernel" picture.
+  **(2) Honest flag — 1000 is MARGINAL, not banked:** your "spec×2.8 on ~300–390 → 840–1090" **brackets 1000;
+  the low end (840) MISSES.** And reaching ~391 forward means fusing away the *entire* 6.2ms serial non-GEMM
+  floor (big lift), not just MBU. Levers to lift the bracket above 1000: GEMM MBU>0.45, full glue/K2/comms
+  fusion, higher τ. Recommend stating 1000 as at-risk (840–1090) in the headline, not a clean clear. **(3)
+  Self-correction:** measured **K2=1872µs** ≫ the 0.5ms I modeled, and it's **occupancy/per-head-op-bound, NOT
+  KV-byte-bound** at this ctx → my "KV-fp8 attacks the K2 floor" over-credited it (KV-fp8 helps only the ~0.24ms
+  byte fraction ≈13% @ctx4096; the bulk needs occupancy tuning — warp/block-parallel over heads, like your
+  router fix). KV-fp8's K2 benefit only grows at long ctx. (No GPU; reconciles whole_engine_mbu_ceiling.)
 - **LOOP-C — SELF-CORRECTION on Charles's megakernel SPIKE (1eaf819): I was WRONG on the VEHICLE; the FLOOR is
   OCCUPANCY, not launch.** Your measured 9-11× slower megakernel (occupancy starvation from the cooperative
   grid.sync 528-block geometry cap) **falsifies my "megakernel is the gating precondition" framing**

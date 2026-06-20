@@ -13,7 +13,6 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-TOPO = build_topology()
 BACKEND = get_backend()
 STREAM_DELAY = float(os.environ.get("STREAM_DELAY", "0"))
 
@@ -30,15 +29,16 @@ def models():
 
 @app.get("/v1/topology")
 def topology():
-    return TOPO
+    return build_topology()
 
 
 @app.post("/v1/chat/completions")
 def chat(req: ChatRequest):
+    topo = build_topology()
     if not req.stream:
         text = "".join(
             c["choices"][0]["delta"]["content"]
-            for c in BACKEND.stream(req, TOPO) if "choices" in c
+            for c in BACKEND.stream(req, topo) if "choices" in c
         )
         return JSONResponse({
             "id": "chatcmpl-mock", "object": "chat.completion", "model": req.model,
@@ -47,7 +47,7 @@ def chat(req: ChatRequest):
         })
 
     def gen():
-        for chunk in BACKEND.stream(req, TOPO):
+        for chunk in BACKEND.stream(req, topo):
             yield sse(chunk)
             if STREAM_DELAY:
                 time.sleep(STREAM_DELAY)

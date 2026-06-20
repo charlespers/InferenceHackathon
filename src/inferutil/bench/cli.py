@@ -20,8 +20,9 @@ from .store import (write_run, load_run, load_latest, load_all,
                     result_to_x_summary, RunRecord, export_csv, export_jsonl,
                     export_markdown)
 from .report import (format_result, format_compare, format_diagnosis,
-                     format_sweep, format_spec_sweep, format_plan)
-from ..speculative import sweep as spec_sweep, memory_feasibility
+                     format_sweep, format_spec_floor, format_plan)
+from .spec_model import spec_sweep
+from ..speculative import memory_feasibility
 from .attribution import diagnose
 from .levers import recommend
 from .manifest import build_manifest
@@ -218,11 +219,11 @@ def _cmd_sweep(args) -> None:
 
 
 def _cmd_spec(args) -> None:
-    rows = spec_sweep(alphas=[args.alpha], ks=args.ks, n_drafters_list=args.drafters,
-                      drafter_cost_ratio=args.drafter_cost)
+    rows = spec_sweep(args.accept, args.floor, ks=tuple(args.ks), ns=tuple(args.drafters))
     feasibility = memory_feasibility(draft_model_gb=args.draft_gb,
                                      use_fp8_target=not args.bf16_target)
-    print(format_spec_sweep(rows, feasibility, base_tok_s=args.base_tok_s))
+    print(format_spec_floor(rows, feasibility, accept=args.accept, floor=args.floor,
+                            base_tok_s=args.base_tok_s))
 
 
 def _cmd_export(args) -> None:
@@ -354,14 +355,14 @@ def main(argv=None) -> None:
     sw.set_defaults(func=_cmd_sweep)
 
     spc = sub.add_parser("spec",
-                         help="size speculative decoding (drafters x k) + HBM feasibility")
-    spc.add_argument("--alpha", type=float, default=0.7, help="per-token acceptance rate")
-    spc.add_argument("--ks", type=int, nargs="+", default=[4, 8, 16],
+                         help="floor-aware spec-decode sizing (drafters x k) + HBM feasibility")
+    spc.add_argument("--accept", type=float, default=0.7, help="per-token acceptance rate")
+    spc.add_argument("--floor", type=float, default=0.86,
+                     help="floor fraction F of TPOT (overhead+comms); high=floor-bound -> big trees win")
+    spc.add_argument("--ks", type=int, nargs="+", default=[2, 4, 8],
                      help="draft lengths to sweep")
-    spc.add_argument("--drafters", type=int, nargs="+", default=[1, 2, 4, 8],
+    spc.add_argument("--drafters", type=int, nargs="+", default=[1, 2, 4],
                      help="drafter counts to sweep")
-    spc.add_argument("--drafter-cost", type=float, default=0.05,
-                     help="drafter/target active-param cost ratio")
     spc.add_argument("--draft-gb", type=float, default=3.4, help="one draft model size (GB)")
     spc.add_argument("--bf16-target", action="store_true",
                      help="target weights in bf16 (default fp8) -> less HBM headroom")

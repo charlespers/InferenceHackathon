@@ -25,6 +25,8 @@ from .stats import Stat, summarize, means_differ
 from .attribution import Bottleneck, diagnose
 from .levers import Lever, recommend
 from .prefill import prefill_latency
+from .spec_model import (SpecRow, spec_speedup, spec_sweep, expected_emitted,
+                         verify_cost)
 from .sweep import (SweepPoint, depth_sweep, config_sweep,
                     quant_grid, layout_grid, full_grid, realized_efficiency)
 from .cost import energy_metrics, rental_usd_per_mtok
@@ -50,6 +52,7 @@ __all__ = [
     "Bottleneck", "diagnose",
     "Lever", "recommend",
     "prefill_latency",
+    "SpecRow", "spec_speedup", "spec_sweep", "expected_emitted", "verify_cost",
     "SweepPoint", "depth_sweep", "config_sweep",
     "quant_grid", "layout_grid", "full_grid", "realized_efficiency",
     "energy_metrics", "rental_usd_per_mtok",

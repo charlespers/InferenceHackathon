@@ -52,12 +52,18 @@ def test_bottleneck_annotation_marks_targeting_lever():
 
 
 def test_spec_speedup_monotonic_in_accept_rate():
-    # delegates to inferutil.speculative.wall_clock_speedup
-    lo = _spec_speedup(0.3, 4)
-    hi = _spec_speedup(0.8, 4)
-    assert hi > lo > 1.0
-    # more drafters -> higher speedup at fixed accept rate
-    assert _spec_speedup(0.5, 4, n_drafters=4) > _spec_speedup(0.5, 4, n_drafters=1)
+    # floor-aware model (bench.spec_model); monotone in acceptance at fixed floor
+    assert _spec_speedup(0.8, 4, 1, 0.5) > _spec_speedup(0.3, 4, 1, 0.5)
+
+
+def test_spec_lever_regime_aware_floor():
+    # floor-bound (high F) -> big trees win; weight-bound (F=0) -> small trees win
+    small_wb = _spec_speedup(0.7, 2, 1, 0.0)
+    big_wb = _spec_speedup(0.7, 8, 4, 0.0)
+    small_fb = _spec_speedup(0.7, 2, 1, 0.9)
+    big_fb = _spec_speedup(0.7, 8, 4, 0.9)
+    assert small_wb > big_wb     # weight-bound: big tree's expert-union tax loses
+    assert big_fb > small_fb     # floor-bound: big tree wins
 
 
 if __name__ == "__main__":

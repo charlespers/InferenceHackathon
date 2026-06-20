@@ -171,6 +171,33 @@ def format_plan(record: RunRecord, bottleneck, levers, best_point=None) -> str:
     return "\n".join(lines)
 
 
+def format_spec_floor(rows, feasibility: dict, *, accept: float, floor: float,
+                      base_tok_s=None) -> str:
+    """Floor-aware spec-decode sizing table (bench.spec_model): emitted/verify/speedup
+    per (k, N), HBM-feasibility, best feasible. F high → big trees win; F→0 → small."""
+    max_drafters = feasibility.get("max_drafters", 0)
+    feasible = [r for r in rows if r.n_drafters <= max_drafters]
+    best = max(feasible, key=lambda r: r.speedup) if feasible else None
+    lines = [
+        f"== SPEC-DECODE SIZING (floor-aware)  accept={accept:.2f}  F={floor:.2f} ==",
+        f"  HBM headroom: {feasibility.get('hbm_headroom_gb')} GB "
+        f"(fp8 target={feasibility.get('use_fp8_target')}) -> fits <= {max_drafters} drafters",
+        f"  {'k':>3}{'N':>3}{'emitted':>9}{'verifyX':>9}{'speedup':>9}{'fits':>6}",
+    ]
+    for r in rows:
+        fits = "yes" if r.n_drafters <= max_drafters else "no"
+        star = "  *best" if (best and r is best) else ""
+        tok = f"  -> {base_tok_s * r.speedup:.0f} tok/s" if base_tok_s else ""
+        lines.append(f"  {r.draft_len:>3}{r.n_drafters:>3}{r.emitted:>9.2f}"
+                     f"{r.verify_cost:>8.2f}x{r.speedup:>8.2f}x{fits:>6}{star}{tok}")
+    if best:
+        lines.append(f"  -> best feasible: k={best.draft_len} N={best.n_drafters} "
+                     f"=> {best.speedup:.2f}x")
+    lines.append("  (floor-aware: F high -> big trees win; F->0 -> small trees win. "
+                 "Gate go/no-go on realized tok/s.)")
+    return "\n".join(lines)
+
+
 def format_diagnosis(record: RunRecord, levers=None) -> str:
     """Bottleneck diagnosis + ranked next-lever recommendations for one run."""
     b = diagnose(record.result)

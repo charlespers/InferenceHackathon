@@ -33,7 +33,7 @@ def test_cli_analytical_commands_do_not_raise():
     main(["sweep", "--layout", "--dtype", "1"])
     main(["sweep", "--full", "--decode", "16"])
     main(["sweep", "--depths", "512,32768", "--dtype", "1"])
-    main(["spec", "--alpha", "0.7", "--base-tok-s", "260"])
+    main(["spec", "--accept", "0.7", "--floor", "0.86", "--base-tok-s", "260"])
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ use engine::routing::sim::RoutingSimulator;
 
 const VLLM_URL_DEFAULT: &str = "http://localhost:8001";
 const PORT_DEFAULT: u16 = 8000;
+const TASKS_PORT_DEFAULT: u16 = 9000;
 const N_GPUS: usize = 8;
 const N_LAYERS: usize = 94;
 const N_EXPERTS: usize = 128;
@@ -295,6 +296,10 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(PORT_DEFAULT);
+    let tasks_port: u16 = std::env::var("TASKS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(TASKS_PORT_DEFAULT);
 
     let simulator = RoutingSimulator::from_routing_stats(ROUTING_STATS_PATH)
         .unwrap_or_else(|e| {
@@ -309,7 +314,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client: reqwest::Client::new(),
-        vllm_url,
+        vllm_url: vllm_url.clone(),
         simulator: Mutex::new(simulator),
         placement_json,
         tasks: Mutex::new(TaskTracker::new()),
@@ -320,19 +325,32 @@ async fn main() {
     // Background GPU + vLLM metrics poller
     tokio::spawn(stats_poller(Arc::clone(&state)));
 
-    let app = Router::new()
+    // Main proxy — port 8000
+    let proxy_app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/topology", get(topology))
         .route("/v1/chat/completions", post(chat_completions))
+        .layer(CorsLayer::permissive())
+        .with_state(Arc::clone(&state));
+
+    // Monitor — port 9000 (only /api/tasks)
+    let tasks_app = Router::new()
         .route("/api/tasks", get(tasks_handler))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
-    let addr = format!("0.0.0.0:{port}");
-    eprintln!("[server] listening on {addr}  vllm={}", std::env::var("VLLM_URL").unwrap_or(VLLM_URL_DEFAULT.to_string()));
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let proxy_addr = format!("0.0.0.0:{port}");
+    let tasks_addr = format!("0.0.0.0:{tasks_port}");
+    eprintln!("[server] proxy on {proxy_addr}  tasks on {tasks_addr}  vllm={vllm_url}");
+
+    let proxy_listener = tokio::net::TcpListener::bind(&proxy_addr).await.unwrap();
+    let tasks_listener = tokio::net::TcpListener::bind(&tasks_addr).await.unwrap();
+
+    tokio::join!(
+        axum::serve(proxy_listener, proxy_app),
+        axum::serve(tasks_listener, tasks_app),
+    ).0.unwrap();
 }
 
 // ---------------------------------------------------------------------------

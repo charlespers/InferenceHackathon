@@ -1,113 +1,60 @@
 # Inference Server
 
-Two server options: Python (legacy, mock-capable) and Rust (production, real predictor).
-
 ---
 
-## Rust Server (preferred)
+## Rust Server
 
-Replaces the Python server. Proxies vLLM, runs the Markov predictor per token, and exposes `/api/tasks`.
+Proxies vLLM, runs the Markov predictor per token. Listens on two ports:
+
+| Port | What's there |
+|------|-------------|
+| **8000** | Main proxy: `/health`, `/v1/models`, `/v1/topology`, `/v1/chat/completions` |
+| **9000** | Monitor only: `/api/tasks` (live GPU + request dashboard) |
 
 ### Run
 
 ```bash
 # On the H100 box:
-source $HOME/.cargo/env
-cd /alloc/data/InferenceHackathon
-
-# Port 9000 is dedicated to this server — don't use 8000 (shared / Python)
-PORT=9000 cargo run --release --bin server -p engine
+source $HOME/.cargo/env && cd /alloc/data/InferenceHackathon
+cargo run --release --bin server -p engine
 ```
 
-Runs in tmux so it survives disconnects:
+In tmux:
 ```bash
-tmux new-session -d -s rustserver 'source $HOME/.cargo/env && cd /alloc/data/InferenceHackathon && PORT=9000 cargo run --release --bin server -p engine 2>&1 | tee /alloc/data/server.log'
+tmux new-session -d -s rustserver 'source $HOME/.cargo/env && cd /alloc/data/InferenceHackathon && cargo run --release --bin server -p engine 2>&1 | tee /alloc/data/server.log'
 ```
 
-### Tunnel + UI
+### Tunnel
 
 ```bash
-# Laptop:
-ssh -L 9000:localhost:9000 root@147.185.41.162 -p 31025 -N
+# Laptop — tunnel both ports:
+ssh -L 8000:localhost:8000 -L 9000:localhost:9000 root@147.185.41.162 -p 31025 -N
 ```
 
-### Endpoints
+### /api/tasks — Live GPU Monitor (port 9000)
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | `{"status":"ok"}` |
-| GET | `/v1/models` | Model list |
-| GET | `/v1/topology` | GPU stats + expert placement |
-| POST | `/v1/chat/completions` | OpenAI-compatible SSE proxy to vLLM |
-| GET | `/api/tasks` | **Live request monitor** (see below) |
+Shows GPU utilisation, vLLM queue depth, and active requests — including requests
+that bypass this server and go directly to vLLM.
 
-### /api/tasks — Live Request Monitor
-
-Shows who is running inference right now. Auto-refreshes every 2 seconds.
-
-**Browser** (returns dark-themed HTML table):
 ```
-http://localhost:9000/api/tasks
-```
-
-**JSON** (curl or scripts):
-```bash
-curl localhost:9000/api/tasks
-```
-
-```json
-{
-  "active": [
-    {
-      "user": "jaymin",
-      "prompt": "Explain the transformer attention mechanism…",
-      "elapsed_s": 12,
-      "tokens": 45,
-      "tok_per_s": 3.7
-    }
-  ],
-  "total_served": 142,
-  "uptime_s": 3600
-}
+http://localhost:9000/api/tasks        # browser (dark HTML, auto-refresh 2s)
+curl localhost:9000/api/tasks          # JSON
 ```
 
 **Tag your requests** so you appear by name:
 
 ```bash
-# X-User header:
-curl -H "X-User: jaymin" -X POST localhost:9000/v1/chat/completions ...
-
-# Or "user" field in the body:
-{"user": "jaymin", "messages": [...], "stream": true}
-
-# benchmark.py --user flag does this automatically:
-python3 tools/benchmark.py --user jaymin
+curl -H "X-User: jaymin" -X POST localhost:8000/v1/chat/completions ...
+# Or "user" field in the body. benchmark.py --user does this automatically.
 ```
-
-Untagged requests show as `unknown`.
 
 ### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `8000` | Listening port (use `9000` on the box) |
+| `PORT` | `8000` | Main proxy port |
+| `TASKS_PORT` | `9000` | /api/tasks port |
 | `VLLM_URL` | `http://localhost:8001` | vLLM backend |
-
----
-
-## Python Server (legacy)
-
-Still usable as a fallback. Supports mock mode (no vLLM needed). Does **not** have `/api/tasks` or the Rust predictor.
-
-```bash
-cd /alloc/data/InferenceHackathon
-python -m venv .venv && source .venv/bin/activate
-pip install -r server/requirements.txt
-uvicorn server.main:app --host 0.0.0.0 --port 8000
-
-# Mock mode (no vLLM):
-BACKEND=mock uvicorn server.main:app --port 8000
-```
 
 ---
 
@@ -124,12 +71,9 @@ tmux new-session -d -s vllm 'cd /alloc/data/InferenceHackathon && python3 tools/
 # Watch startup (~5 min):
 tail -f /alloc/data/vllm.log
 # Ready when you see: "Application startup complete"
-# The Rust server connects automatically; you'll see "[routing_reader] connected" in server.log
 ```
 
 ### Option B — plain vLLM
-
-No routing capture; the Rust server falls back to simulation mode.
 
 ```bash
 tmux new-session -d -s vllm 'vllm serve /alloc/data/Qwen3-235B-A22B --tensor-parallel-size 8 --port 8001 --disable-log-requests 2>&1 | tee /alloc/data/vllm.log'

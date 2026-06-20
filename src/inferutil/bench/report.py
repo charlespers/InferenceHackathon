@@ -113,6 +113,33 @@ def format_sweep(points, *, n_gpus: int = 8, usd_per_gpu_hr: float = 3.0,
     return "\n".join(lines)
 
 
+def format_spec_sweep(rows, feasibility: dict, *, base_tok_s=None) -> str:
+    """Speculative-decode sizing table: E[accepted], speedup, verify tokens, and
+    whether the drafter count fits in HBM headroom. Marks the best feasible row."""
+    max_drafters = feasibility.get("max_drafters", 0)
+    feasible = [r for r in rows if r.n_drafters <= max_drafters]
+    best = max(feasible, key=lambda r: r.speedup) if feasible else None
+    lines = [
+        "== SPEC-DECODE SWEEP ==",
+        f"  HBM headroom: {feasibility.get('hbm_headroom_gb')} GB "
+        f"(target {feasibility.get('target_weight_gb')} GB, "
+        f"fp8={feasibility.get('use_fp8_target')})  -> fits <= {max_drafters} drafters",
+        f"  {'drafters':>9}{'alpha':>7}{'k':>4}{'E[acc]':>8}{'speedup':>9}"
+        f"{'verify_tok':>11}{'fits':>6}",
+    ]
+    for r in rows:
+        fits = "yes" if r.n_drafters <= max_drafters else "no"
+        star = "  *best" if (best and r is best) else ""
+        tok = f"  -> {base_tok_s * r.speedup:.0f} tok/s" if base_tok_s else ""
+        lines.append(
+            f"  {r.n_drafters:>9}{r.alpha:>7.2f}{r.k:>4}{r.e_acc:>8.2f}"
+            f"{r.speedup:>8.2f}x{r.verify_tokens:>11}{fits:>6}{star}{tok}")
+    if best:
+        lines.append(f"  -> best feasible: {best.n_drafters} drafters x k={best.k} "
+                     f"=> {best.speedup:.2f}x")
+    return "\n".join(lines)
+
+
 def format_diagnosis(record: RunRecord, levers=None) -> str:
     """Bottleneck diagnosis + ranked next-lever recommendations for one run."""
     b = diagnose(record.result)

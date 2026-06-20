@@ -31,6 +31,9 @@ PYTHONPATH=src python -m inferutil.bench run --name fp8ep --dtype 1 --kv-dtype 2
 PYTHONPATH=src python -m inferutil.bench diagnose --name fp8ep     # bottleneck → ranked next levers
 PYTHONPATH=src python -m inferutil.bench sweep --dtype 1 --depths 512,4096,32768,131072   # KV-decay curve
 PYTHONPATH=src python -m inferutil.bench sweep --plan hybrid       # quant-grid config ranking
+PYTHONPATH=src python -m inferutil.bench sweep --layout --dtype 1  # best tp x ep at fixed precision
+PYTHONPATH=src python -m inferutil.bench sweep --full              # full quant x layout grid
+PYTHONPATH=src python -m inferutil.bench spec --alpha 0.7 --base-tok-s 260   # size spec-decode + HBM fit
 PYTHONPATH=src python -m inferutil.bench export --name fp8ep --format csv --out runs.csv
 ```
 - Reports MFU/MBU, a full latency panel (TTFT / E2E / throughput / TPOT) with **Student-t 95% CIs**,

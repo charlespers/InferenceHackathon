@@ -18,7 +18,9 @@ from .runner import run_benchmark
 from .telemetry import NvmlTelemetry, NullTelemetry
 from .store import (write_run, load_run, load_latest, load_all,
                     result_to_x_summary, RunRecord, export_csv, export_jsonl)
-from .report import format_result, format_compare, format_diagnosis, format_sweep
+from .report import (format_result, format_compare, format_diagnosis,
+                     format_sweep, format_spec_sweep)
+from ..speculative import sweep as spec_sweep, memory_feasibility
 from .attribution import diagnose
 from .levers import recommend
 from .manifest import build_manifest
@@ -158,6 +160,14 @@ def _cmd_sweep(args) -> None:
                        title=title))
 
 
+def _cmd_spec(args) -> None:
+    rows = spec_sweep(alphas=[args.alpha], ks=args.ks, n_drafters_list=args.drafters,
+                      drafter_cost_ratio=args.drafter_cost)
+    feasibility = memory_feasibility(draft_model_gb=args.draft_gb,
+                                     use_fp8_target=not args.bf16_target)
+    print(format_spec_sweep(rows, feasibility, base_tok_s=args.base_tok_s))
+
+
 def _cmd_export(args) -> None:
     records = load_all(args.name, args.results_dir)
     if not records:
@@ -251,6 +261,22 @@ def main(argv=None) -> None:
     sw.add_argument("--peak-bw-gbs", type=float, default=None,
                     help="measured HBM GB/s per GPU; overrides the spec sheet")
     sw.set_defaults(func=_cmd_sweep)
+
+    spc = sub.add_parser("spec",
+                         help="size speculative decoding (drafters x k) + HBM feasibility")
+    spc.add_argument("--alpha", type=float, default=0.7, help="per-token acceptance rate")
+    spc.add_argument("--ks", type=int, nargs="+", default=[4, 8, 16],
+                     help="draft lengths to sweep")
+    spc.add_argument("--drafters", type=int, nargs="+", default=[1, 2, 4, 8],
+                     help="drafter counts to sweep")
+    spc.add_argument("--drafter-cost", type=float, default=0.05,
+                     help="drafter/target active-param cost ratio")
+    spc.add_argument("--draft-gb", type=float, default=3.4, help="one draft model size (GB)")
+    spc.add_argument("--bf16-target", action="store_true",
+                     help="target weights in bf16 (default fp8) -> less HBM headroom")
+    spc.add_argument("--base-tok-s", type=float, default=None,
+                     help="baseline decode tok/s to project absolute speedup")
+    spc.set_defaults(func=_cmd_spec)
 
     ep = sub.add_parser("export", help="export stored runs to csv/jsonl")
     ep.add_argument("--name", default="default")

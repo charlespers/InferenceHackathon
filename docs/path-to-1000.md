@@ -26,6 +26,28 @@ no launches/host = zero overhead. **The megakernel is the linchpin of 1000 tok/s
 | **overhead** | ~7.0 ms | **~0** | **megakernel** (or graphs+fast-path, partial) | E-attr will split launch vs host vs kernel |
 | **KV** | ~0 (short ctx) | ~0 | (grows w/ ctx → fp8 KV) | — |
 
+## Reality check — at *realistic* NVLS, lossless fp8 tops ~850; 1000 needs int4 EXPERTS
+My "0.97 ms" used an optimistic **1 µs** all-reduce. In-switch NVLS on H100 NVSwitch realistically lands ~**2–4 µs**
+for 8 KB (the 188-collective comms then costs 0.38–0.75 ms, not 0.19). With **zero overhead** assumed (megakernel):
+
+| weight config | NVLS 1µs | 2µs | 3µs | 4µs |
+|---|---|---|---|---|
+| **fp8 all (lossless)** | 1033 | 865 | 744 | 653 |
+| **int4 experts + fp8 non-expert** (small gate) | 1423 | **1122** | 927 | 789 |
+| **int4 all** (gate) | 1730 | 1306 | **1048** | 876 |
+
+**So the honest conclusion is sharper than "fp8 + NVLS + megakernel":**
+- **Lossless (fp8 everywhere) tops out ~650–865 tok/s** unless the in-switch reduce truly hits ~1 µs (best case,
+  uncertain). **Pure-lossless 1000 is at the very edge of this hardware.**
+- **1000 robustly requires int4 *experts*** (fp8 keeps the non-expert/attention path) — a **small quality gate**,
+  not full int4 — which gets weight to 0.51 ms and clears 1000 at NVLS ≤ ~2.5 µs. **Plan the int4-expert quality
+  validation now** (per-channel/group AWQ on experts, gate on a needle/eval set) — it's on the critical path.
+- **Today (no NVLS, 16 µs): stuck at ~250 regardless of weight precision** — the comms wall dominates everything,
+  which is why **Stage 3 (the NVLS kernel) is the single make-or-break experiment** (`megakernel-build-plan.md`).
+
+Net: **1000 = megakernel (overhead→0) + NVLS kernel (~2 µs) + int4 experts (small gate).** Pure fp8/lossless is
+~850; the last ~150 to 1000 is the int4-expert quantization (quality-gated) or a sub-2 µs in-switch reduce.
+
 ## Why the cheap levers DON'T reach 1000 (and what they're actually for)
 - **Spec decode alone caps at ~300 tok/s.** It *amortizes* the floor over τ; at EAGLE3's τ≈3.5 that's 85.7×3.5 ≈
   300. It **cannot** reach 1000 because τ is capped (~3.5) and, worse, a big tree *reads the expert union* —
@@ -71,6 +93,7 @@ If either slips, buy margin with **lossy** levers, quality-gated:
   but **the 300→1000 leap is the megakernel or nothing.**
 
 ## One line
-**1000 tok/s is physically possible but narrow: fp8 (weight fits) + in-kernel NVLS (comms fits) + a persistent
-megakernel (overhead → 0) = 0.97 ms. Spec gets the cheap first ~3.5× to 300; the megakernel is the only path
-for the 300→1000 leap, because the floor must be *removed*, not *amortized*.**
+**1000 tok/s is physically at the edge: a persistent megakernel (overhead→0) + an in-kernel NVLS all-reduce
+(~2 µs comms) + int4 *experts* (small quality gate; pure-fp8 lossless tops ~850). Spec is the cheap first ~3.5×
+to ~300; the 300→1000 leap is the megakernel + NVLS kernel + int4-experts — the floor must be *removed*, not
+*amortized*, and the last ~150 tok/s is a quality-gated int4 step. The NVLS kernel is the make-or-break.**

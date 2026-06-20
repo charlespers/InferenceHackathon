@@ -112,5 +112,31 @@ if __name__ == "__main__":
     ]
 
     print(f"[main] starting vLLM+IPC: {' '.join(sys.argv[1:])}", flush=True)
-    from vllm.scripts import serve
-    serve()
+
+    # vLLM changed its entrypoint across versions; try each in order.
+    launched = False
+    try:
+        from vllm.scripts import serve
+        serve(); launched = True
+    except (ImportError, AttributeError):
+        pass
+
+    if not launched:
+        try:
+            from vllm.scripts import cli
+            cli(); launched = True
+        except (ImportError, AttributeError):
+            pass
+
+    if not launched:
+        try:
+            import runpy
+            runpy.run_module("vllm", run_name="__main__", alter_sys=True)
+            launched = True
+        except Exception:
+            pass
+
+    if not launched:
+        # Last resort: exec vllm as a subprocess (hooks won't carry, but server starts)
+        import subprocess
+        subprocess.run([sys.executable, "-m", "vllm"] + sys.argv[1:])

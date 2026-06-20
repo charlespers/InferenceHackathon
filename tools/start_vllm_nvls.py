@@ -167,5 +167,19 @@ if __name__ == "__main__":
     ]
 
     print(f"[main] starting vLLM with NVLS patch: {' '.join(sys.argv[1:])}", flush=True)
-    from vllm.scripts import serve
-    serve()
+
+    launched = False
+    try:
+        from vllm.scripts import serve
+        serve(); launched = True
+    except (ImportError, AttributeError):
+        pass
+    if not launched:
+        try:
+            from vllm.scripts import cli
+            cli(); launched = True
+        except (ImportError, AttributeError):
+            pass
+    if not launched:
+        import runpy
+        runpy.run_module("vllm", run_name="__main__", alter_sys=True)

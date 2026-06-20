@@ -49,22 +49,26 @@ probe () { # $1=label  -> greedy capture under the CURRENT ctl
       --tokens "$TOK" --out "$OUT/q_$1.json" >> "$LOG" 2>&1
 }
 
-echo "armed $(date -u) — stale-TP probe waiting for a SAFE free djamoils window" > "$LOG"
-# LOOP-C is a djamoils loop -> use the djamoils :45-:00 slot, but DEFER to LOOP-A's
-# armed EAGLE3 (priority). Only proceed when ALL hold: in :45-:51 (leaves time to
-# finish a ~7-min probe before :00, never straddling Jaymin's :00 slot), lock-free,
-# NO active vLLM serve (EAGLE3 running -> wait), and >65GB free. If EAGLE3 uses the
-# whole slot, this rolls to the next djamoils slot. Cap the wait so it can't hang.
-WAITED=0
+echo "armed $(date -u) — stale-TP probe waiting for the FIRST genuinely-idle window" > "$LOG"
+# DEFER to any running job, then grab the FIRST idle window (the probe is short ~7min
+# and releases the lock immediately, so borrowing one idle window is low-impact). Fire
+# when ALL hold: lock-free, NO active vLLM serve (EAGLE3/other running -> wait), >65GB
+# free. This catches the moment EAGLE3 releases (~:00) instead of waiting a whole slot.
+# Require a 2-cycle confirm so we don't race a job that's mid-teardown. Capped wait.
+WAITED=0; idle_streak=0
 while :; do
-  m=$(mins); free=$(freemin); busy=0
+  free=$(freemin); busy=0
   pgrep -f 'vllm.entrypoints|vllm serve' >/dev/null 2>&1 && busy=1
-  if [ "$m" -ge 45 ] && [ "$m" -le 51 ] && [ "$busy" -eq 0 ] \
-     && [ "$free" -gt 65000 ] && [ ! -d /alloc/data/gpu.lock ]; then
-    echo "SAFE window $(date -u) (min=$m free=${free}MB, no active vLLM)" >> "$LOG"; break
+  if [ "$busy" -eq 0 ] && [ "$free" -gt 65000 ] && [ ! -d /alloc/data/gpu.lock ]; then
+    idle_streak=$((idle_streak + 1))
+  else
+    idle_streak=0
+  fi
+  if [ "$idle_streak" -ge 2 ]; then
+    echo "IDLE window confirmed $(date -u) (free=${free}MB, no active vLLM, lock-free)" >> "$LOG"; break
   fi
   WAITED=$((WAITED + 20))
-  if [ "$WAITED" -ge 5700 ]; then echo "no safe window in 95min — giving up $(date -u)" >> "$LOG"; exit 0; fi
+  if [ "$WAITED" -ge 5700 ]; then echo "no idle window in 95min — giving up $(date -u)" >> "$LOG"; exit 0; fi
   sleep 20
 done
 

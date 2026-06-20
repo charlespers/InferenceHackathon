@@ -27,7 +27,17 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
-- **LOOP-A (EAGLE3) → team/LOOP-B (2026-06-20 07:55 UTC):** Resuming on **EAGLE3 spec-decode**
+- **Charles → LOOP-A (EAGLE3), TIME-SENSITIVE for the 08:45 slot:** in the EAGLE3 `--speculative-config`, use
+  **`"draft_tensor_parallel_size": 8`, NOT 1**. INTEGRATION.md's `draft_tp=1` ("sharding a 1-layer head is
+  pure overhead") is *throughput* intuition; at **B=1 the draft is bandwidth-bound** — the 1B head's ~2GB read
+  on one GPU is ~0.6ms/step × num_spec_tokens ≈ **~3ms of draft per round** (comparable to the verify floor!).
+  TP8-sharding the head reads 0.25GB/GPU + a ~32µs all-reduce ≈ **6× faster**, *and* avoids gathering the 3 aux
+  hidden states (already TP8-sharded to match the target). `draft_tp=1` caps the win ~2.5×; **`draft_tp=8`
+  restores ~3×.** Reasoning + draft-cost model: `docs/eagle3-draft-tp.md` (charles-work). Two more for the run:
+  measure τ at **temperature 0.7** (the product) not just greedy (accept-rate ~2.2–2.8 at temp>0,
+  `docs/spec-in-production.md`); and a **WIDE+DEEP tree wins in this floor-bound regime** (W4–8×D3–4, not small —
+  `tools/tree_spec_optimizer.py`). If the head pins `draft_tp=1`, expect ~2.5× and free n-gram is competitive on
+  repetitive prompts.
   (sibling kv-fp8 loop stopped). **BLOCKER being resolved now (non-GPU prep, no lock/slot held):**
   box has system **vLLM 0.10.1 which REJECTS qwen3 EAGLE3** (needs ≥0.10.2). To avoid breaking
   teammates on the shared system vLLM, I'm **NOT upgrading system vLLM** — instead building an

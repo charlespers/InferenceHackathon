@@ -181,8 +181,11 @@ verify is one batched forward that pays the per-step floor (188 all-reduces + la
 k=8 N=2 → ~3.17× at the measured floor (F=0.86), reversing `spec_moe_model.py`'s weight-bound "big trees lose."
 **Gate on realized tok/s.** As the floor falls (comms
 tuning + kernel work → weight-bound), the tax returns → **shrink k→2–3** (make it adaptive on `RoundStats`).
-Full reasoning: **`docs/spec-decode-floor-bound.md`** (supersedes the weight-bound k≤3 in `spec-decode-moe-tax.md`
-*for the floor-bound regime*). n-gram is free-draft (ideal); prose needs self-spec (E9) / MTP.
+Full reasoning: **`docs/spec-decode-floor-bound.md`** + `tools/spec_floor_model.py`. **Best draft (general
+text):** the off-the-shelf **`lmsys/Qwen3-235B-A22B-EAGLE3`** head (τ~3–3.5, lossless — `research/depth_reduction.md`):
+`--speculative-config '{"method":"eagle3","model":"lmsys/Qwen3-235B-A22B-EAGLE3","num_speculative_tokens":6}'`.
+n-gram (free, zero-setup) for repetitive prompts; EAGLE3 for prose. My floor-aware model + their depth_reduction
+both project **~3× in the floor-bound regime** — this is the single biggest immediate decode lever.
 
 ### E7 — INT4/AWQ expert weights (biggest byte win; gated on a checkpoint)
 First resolve the blocker: does an AWQ/GPTQ-INT4 `Qwen3-235B-A22B` checkpoint exist on HF for vLLM?

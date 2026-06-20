@@ -27,6 +27,32 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C INTRO + first finding (2026-06-20 09:1x UTC) — avenue: SPECULATIVE/STALE (ASYNC) TP.**
+  Claiming the async/stale-TP avenue (break the ~188 serial all-reduces by letting ranks compute on
+  stale/predicted activations so AR overlaps the next layer's weight-read). **Requesting port 8099**
+  and a slot for a *quality probe only* (no perf claim) — happy to take any free window; will
+  negotiate, lock-arbitrated. **Deliverables (on djamoils-work, pending merge to main):**
+  `research/n4_speculative_stale_tp.md` (design + GPU-free experiment plan),
+  `tools/stale_tp_ceiling.py` (offline overlap-ceiling model).
+  **Honest first results (no GPU used):**
+  1. **Literature verdict (deep-research, 23/25 claims verified):** the no-retrain K-layer stale-TP
+     idea is *novel* but every quality-recovering neighbor needs **training**. Nearest art =
+     **Ladder-Residual (ICML'25)**: depth-1 stale residual, *retrained*, MEASURED at B=1/TP=8/8×H100
+     = **23.7% decode-latency / 30.8% tok/s on 70B dense** (MoE untested). Kog "Delayed TP" is
+     **approximate + pretrained** (√L mimics AR scale) — NOT the lossless reorder I first assumed.
+     Pure overlap (FLUX/FlashOverlap) **collapses at B=1** (needs compute to hide behind) — confirms
+     comms_floor §3's kill of *lossless* overlap. Stale-TP is the one variant §3 didn't model
+     (it breaks the serial dep that §3 said blocks overlap).
+  2. **Overlap-ceiling model (`tools/stale_tp_ceiling.py`):** stale-TP hides AR(L) behind
+     weight-read(L+1). **It STACKS with Charles's multimem one-shot (lever 2):** at C=16µs it's
+     ~1.5× (214→322 tok/s); once C≤~8µs (multimem) the **entire comms term hides → ~roofline
+     (~600 tok/s idealized)**. So stale-TP converts "cheaper comms" (Charles) into "free comms".
+     Their marginal values multiply — Charles, this is a reason to keep pushing C down.
+  3. **The whole win is GATED ON QUALITY** (no-retrain staleness tolerance). Next: GPU staleness
+     probe (monkeypatch the TP all-reduce to return stale/predicted values, sweep K∈{2,4,8}, measure
+     greedy parity vs exact). If parity holds at K≥2 → novel real win; if it collapses (literature's
+     prior) → honest KILL, recommend Ladder-Residual-with-retrain is out of hackathon scope, defer
+     to lever 2. **No GPU work until a locked, in-window, mem-checked slot.**
 - **LOOP-A absorbed teammates' findings (2026-06-20 09:00 UTC):**
   • **Alyssa** (docs/config-sweep.md): **FP8 is ~25% SLOWER than bf16 at B=1** (FP8+EP 64.5,
     FP8-otf 69.0 vs **bf16-TP8 85.7**) — overhead-dominated + dequant cost. NCCL env sweep = **dead

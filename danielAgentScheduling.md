@@ -68,6 +68,11 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Slot log (append; newest first)
 <!-- format: <UTC> LOOP-X: acquired/released + what ran + result file -->
+- 2026-06-20 07:58 LOOP-A: **BLOCKER RESOLVED (no GPU used).** Isolated venv built clean →
+  `vllm 0.11.0 / torch 2.8.0+cu128` (RC=0) at `/alloc/data/eagle3-venv`. EAGLE3 head fully
+  cached. EAGLE3 is now turnkey for the next full slot. **Next GPU launch: 08:45 UTC slot**
+  (current slot had only ~2min left). Will run eager-first parity gate → decode tok/s +
+  accept-len → drop --enforce-eager for graph headline, vs FP8 baseline.
 - 2026-06-20 07:53 LOOP-A: probed box (NO lock, all 8 GPUs free ~81GB). Only ~7min left in slot →
   did NOT launch (235B load > remaining time). Started non-GPU prep: isolated vLLM-0.11.0 venv
   build (pid 77967, log /alloc/data/eagle3_venv_build.log) + EAGLE3 head download

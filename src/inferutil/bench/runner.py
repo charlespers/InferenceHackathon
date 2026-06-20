@@ -8,7 +8,7 @@ from .telemetry import NullTelemetry
 
 
 def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
-                  telemetry=None) -> BenchResult:
+                  telemetry=None, reference_ids=None, collect_ids=False) -> BenchResult:
     """Drive one fixed-window B=1 benchmark and return a BenchResult.
 
     Telemetry brackets ONLY the timed decode window (warmup discarded first) so
@@ -25,6 +25,7 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
     step_seconds = []
     gpu_samples = []
     last_breakdowns = []
+    last_ids = []
     ttft_s = 0.0
     prefill_tok_per_s = 0.0
     for rep in range(config.repeats):
@@ -40,6 +41,7 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
             steps = [engine.decode_step() for _ in range(config.decode_tokens - 1)]
             step_seconds = [s.seconds for s in steps]
             last_breakdowns = [s.breakdown for s in steps]
+            last_ids = [s.token_id for s in steps]
         else:
             step_seconds = [engine.decode_step().seconds for _ in range(config.decode_tokens - 1)]
         if last_rep:
@@ -48,8 +50,16 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
         samples_tok_s.append((len(step_seconds) / total) if total else float("inf"))
 
     summary = summarize_telemetry(gpu_samples, config.decode_tokens, sum(step_seconds))
-    return build_result(cfg=cfg, cluster=cluster, config=config, ttft_s=ttft_s,
-                        prefill_tok_per_s=prefill_tok_per_s,
-                        decode_step_seconds=step_seconds, telemetry_summary=summary,
-                        decode_tok_per_s_samples=samples_tok_s,
-                        step_breakdowns=last_breakdowns)
+    quality = None
+    if reference_ids is not None:
+        from .quality import match_rate
+        quality = match_rate(last_ids, reference_ids)
+    result = build_result(cfg=cfg, cluster=cluster, config=config, ttft_s=ttft_s,
+                          prefill_tok_per_s=prefill_tok_per_s,
+                          decode_step_seconds=step_seconds, telemetry_summary=summary,
+                          decode_tok_per_s_samples=samples_tok_s,
+                          step_breakdowns=last_breakdowns, quality=quality)
+    if collect_ids:
+        # attach for callers that need a reference sequence (not part of the stored schema)
+        object.__setattr__(result, "generated_token_ids", last_ids)
+    return result

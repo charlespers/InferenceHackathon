@@ -27,8 +27,11 @@ def _record_from_dict(d: dict) -> RunRecord:
     tele["per_gpu_mean_util"] = tuple(tele["per_gpu_mean_util"])
     mb = res.pop("measured_breakdown", None)
     measured = MeasuredBreakdown(**mb) if mb else None
+    qd = res.pop("quality", None)
+    from .quality import QualityResult
+    quality = QualityResult(**qd) if qd else None
     result = BenchResult(telemetry=TelemetrySummary(**tele),
-                         measured_breakdown=measured, **res)
+                         measured_breakdown=measured, quality=quality, **res)
     return RunRecord(runid=d["runid"], config=BenchConfig(**d["config"]),
                      env=d["env"], result=result)
 

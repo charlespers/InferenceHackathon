@@ -37,6 +37,7 @@ class DecodeStep:
     seconds: float
     routes: tuple = ()             # tuple[ExpertRoute, ...]; empty if not exposed
     breakdown: "StepBreakdown | None" = None
+    token_id: "int | None" = None
 
 
 @runtime_checkable
@@ -57,13 +58,15 @@ class MockEngine:
     """
 
     def __init__(self, cfg: MoEConfig, cluster: Cluster, *, efficiency: float = 1.0,
-                 jitter: float = 0.0, seed: int = 0, expose_routes: bool = False):
+                 jitter: float = 0.0, seed: int = 0, expose_routes: bool = False,
+                 quality_offset: int = 0):
         self.cfg = cfg
         self.cluster = cluster
         self.efficiency = efficiency
         self.jitter = jitter
         self.seed = seed
         self.expose_routes = expose_routes
+        self.quality_offset = quality_offset
         self._floor_s = 0.0
         self._shares = (0.0, 0.0, 0.0, 0.0)
         self._index = 0
@@ -109,4 +112,6 @@ class MockEngine:
         scale = (s / self._floor_s) if self._floor_s else 0.0
         breakdown = StepBreakdown(weight_s=w * scale, kv_s=k * scale,
                                   comms_s=c * scale, compute_s=comp * scale)
-        return DecodeStep(index=i, seconds=s, routes=routes, breakdown=breakdown)
+        token_id = ((i * 2654435761) + self.quality_offset * (i + 1)) % self.cfg.vocab
+        return DecodeStep(index=i, seconds=s, routes=routes, breakdown=breakdown,
+                          token_id=token_id)

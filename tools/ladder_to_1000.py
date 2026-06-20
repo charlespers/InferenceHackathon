@@ -29,8 +29,9 @@ add("0. baseline bf16-TP8 (measured)",            overhead, comms, weight, kv, 1
 add("1. + CUDA graphs (launch~3.5ms -> 0)",       overhead-3.5, comms, weight, kv, 1.0, "removes per-kernel launch")
 add("2. + scheduler-free B=1 loop (host~1.5 ->0)",overhead-3.5-1.5, comms, weight, kv, 1.0, "fast-path; b1-fast-path-design")
 add("3. + fp8 K5 at e->1 (kernel-ineff~2 ->0)",   overhead-3.5-1.5-2.0, comms, 0.78, kv, 1.0, "weight 1.6->0.78 fp8 AND e=0.46->1")
-add("4. + NVLS all-reduce @2us (comms 3.0->0.38)",0.0, 188*2/1e3, 0.78, kv, 1.0, "the make-or-break kernel")
-add("5. + small-tree EAGLE3 spec (x1.35 @F=0)",   0.0, 188*2/1e3, 0.78, kv, 1.35, "amortizes comms+nonexpert; tree SHRINKS at F=0")
+add("4a. comms via COUNT: EP 94 coll @16us barrier",0.0, 94*16/1e3, 0.78, kv, 1.0, "reaction-04: per-coll barrier-floored ~16us; cut COUNT 188->94")
+add("4b. (OPTIMISTIC) multimem in-switch @2us",   0.0, 188*2/1e3, 0.78, kv, 1.0, "ONLY if measure_collective.sh shows in-switch beats 16us")
+add("5. + batched spec (team EAGLE3 ÷2.77)",      0.0, 94*16/1e3, 0.78, kv, 2.77, "the dominant lever; on the 4a (EP-count) base")
 
 print(f"{'rung':46} {'TPOT ms':>8} {'tok/s':>7}   note")
 print("-"*95)
@@ -41,15 +42,19 @@ for label, tpot, tk, note in rungs:
 # ---- LIVE diagnostic: plug in the real measurements as they land ----
 import argparse
 ap = argparse.ArgumentParser(description="plug measured C/e/tau -> projected 1000-path tok/s + gap")
-ap.add_argument("--C", type=float, default=2.0, help="measured per-collective NVLS latency (us); make-or-break")
+# reaction-04: per-collective C is BARRIER-floored at ~16-17us (squeeze round). Recursive-doubling=3 barriers
+# (51us). So the comms attack is the COUNT (--ncoll: 188 TP -> ~94 EP-1-barrier) + spec, unless multimem
+# in-switch (measure_collective.sh) beats the barrier. int4 is RULED OUT at B=1 (0.58x, unpack-bound).
+ap.add_argument("--C", type=float, default=16.0, help="per-collective latency (us). MEASURED floor ~16us (1 barrier); <16 only if multimem in-switch beats it")
+ap.add_argument("--ncoll", type=int, default=188, help="collective count: 188 (TP 2/layer) -> ~94 (EP 1-barrier/layer) is the #1 comms lever now")
 ap.add_argument("--e", type=float, default=1.0, help="measured fp8-K5 kernel efficiency (0.46 today -> target ~0.85)")
-ap.add_argument("--tau-mult", type=float, default=1.35, help="measured small-tree spec multiplier at F=0")
-ap.add_argument("--weight", choices=["fp8", "int4exp"], default="fp8", help="int4exp = int4 experts + fp8 rest (cushion)")
+ap.add_argument("--tau-mult", type=float, default=2.77, help="batched-spec multiplier (team EAGLE3 ~2.77-3.8); the dominant lever")
+ap.add_argument("--weight", choices=["fp8"], default="fp8", help="fp8 only — int4 RULED OUT at B=1 (reaction-04, 0.58x unpack-bound)")
 ap.add_argument("--host-ms", type=float, default=0.0, help="residual host/overhead after graphs+fast-path (E-attr)")
 ap.add_argument("--stale-tp", action="store_true", help="LOOP-C stale-TP hides comms (quality-gated) -> comms=0")
 a = ap.parse_args()
-w = (0.78 if a.weight == "fp8" else 0.51) / max(a.e, 0.05)   # weight read at measured efficiency
-c = 0.0 if a.stale_tp else 188 * a.C / 1e3
+w = 0.78 / max(a.e, 0.05)   # fp8 weight read at measured efficiency
+c = 0.0 if a.stale_tp else a.ncoll * a.C / 1e3
 tpot, tk = tput(a.host_ms, c, w, kv, a.tau_mult)
 print(f"\n=== LIVE (C={a.C}us e={a.e} tau×{a.tau_mult} weight={a.weight}"
       f"{' +stale-TP' if a.stale_tp else ''} host={a.host_ms}ms) ===")
@@ -58,8 +63,11 @@ print(f"  weight {w:.2f} + comms {c:.2f} + host {a.host_ms:.2f}  / spec {a.tau_m
 if tk < 1000:
     gap = 1000 - tk
     print(f"  next lever for the {gap:.0f} gap:", end=" ")
-    if a.C > 3 and not a.stale_tp: print("comms still high -> push NVLS C down, or --stale-tp, or --weight int4exp.")
-    elif a.e < 0.8: print("kernel under roofline -> tune fp8-K5 e (cp.async, k5-tuning-roadmap).")
-    elif a.tau_mult < 1.3: print("spec under-delivering -> check draft_tp=8 / small tree / accept-rate.")
-    else: print("close -> --weight int4exp (cushion) or --stale-tp to hide the last comms.")
-print("\nMake-or-break = the NVLS C (run bench/measure_collective.sh first). Cheap first ship: spec+prefix ~300.")
+    if c > 1.0 and not a.stale_tp:
+        print(f"comms {c:.1f}ms dominates -> cut COUNT (--ncoll 94 via EP 1-barrier), --stale-tp, or hope multimem<16us.")
+    elif a.tau_mult < 3.0: print("spec under-delivering -> bigger/better batched verify (team EAGLE3 ~3.8); fix the batched-verify kernel.")
+    elif a.e < 0.85: print("kernel under roofline -> tune fp8-K5 e (cp.async, k5-tuning-roadmap).")
+    else: print("close -> --stale-tp to hide the last comms, or push --ncoll / --tau-mult.")
+print("\nreaction-04: per-collective C is BARRIER-floored ~16us. Comms attack = COUNT (--ncoll) + batched spec,")
+print("NOT per-collective latency (unless measure_collective.sh shows multimem in-switch beats 16us). int4 ruled out.")
+print("Team's measured path: --C 16 --ncoll 94 --tau-mult 2.77 -> ~960.  Cheap first ship: spec+prefix ~300.")

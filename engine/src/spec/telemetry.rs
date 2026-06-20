@@ -14,6 +14,7 @@
 
 use crate::spec::eagle3_engine::Eagle3RoundStats;
 use crate::spec::projection::{MeasuredAccept, RoundCostModel};
+use serde::Serialize;
 
 /// Running accumulation of spec-round outcomes. Cheap to update; clone the [`TelemetrySnapshot`] out.
 #[derive(Debug, Default, Clone)]
@@ -28,8 +29,8 @@ pub struct SpecTelemetry {
     total_union: u64,
 }
 
-/// Immutable point-in-time view of the accumulated metrics (what an SSE frame would carry).
-#[derive(Debug, Clone, PartialEq)]
+/// Immutable point-in-time view of the accumulated metrics (what an SSE frame carries).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TelemetrySnapshot {
     pub rounds: u64,
     pub spec_rounds: u64,
@@ -44,6 +45,17 @@ pub struct TelemetrySnapshot {
     pub mean_verify_depth: f32,
     /// Draft acceptance rate = accepted / drafted over speculating rounds (∈[0,1]).
     pub acceptance_rate: f32,
+}
+
+impl TelemetrySnapshot {
+    /// Serialize as a Server-Sent-Events frame for the live telemetry stream: `data: {json}\n\n`.
+    /// This is the exact payload an SSE/HTTP surface emits per snapshot — the final hop of the
+    /// "Eagle3RoundStats → SSE" wiring. Serialization can't fail for these plain scalar fields, so a
+    /// failure degrades to an empty object rather than panicking in the hot stream.
+    pub fn to_sse_frame(&self) -> String {
+        let body = serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string());
+        format!("data: {}\n\n", body)
+    }
 }
 
 impl SpecTelemetry {
@@ -109,6 +121,12 @@ impl SpecTelemetry {
             mean_verify_depth: self.mean_verify_depth(),
             acceptance_rate: self.acceptance_rate(),
         }
+    }
+
+    /// Convenience: the current snapshot as a Server-Sent-Events frame (see
+    /// [`TelemetrySnapshot::to_sse_frame`]).
+    pub fn to_sse_frame(&self) -> String {
+        self.snapshot().to_sse_frame()
     }
 
     /// Tie the realized telemetry to the projection cost model: predict the graphs-regime speedup S at
@@ -201,6 +219,23 @@ mod tests {
         assert_eq!(s.acceptance_rate, 0.0);
         // still emits the bonus token each round → τ = 0 accepted + 1 = 1.0
         assert!((s.mean_accept_length - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn snapshot_serializes_to_a_valid_sse_frame() {
+        let mut t = SpecTelemetry::new();
+        t.record(&round(2, 4, 3, 8));
+        t.record(&round(1, 4, 2, 16));
+        let frame = t.to_sse_frame();
+        assert!(frame.starts_with("data: "), "SSE frames start with 'data: '");
+        assert!(frame.ends_with("\n\n"), "SSE frames end with a blank line");
+        // The payload must be valid JSON carrying the snapshot fields.
+        let json = frame.strip_prefix("data: ").unwrap().trim_end();
+        let v: serde_json::Value = serde_json::from_str(json).expect("valid JSON payload");
+        assert_eq!(v["rounds"], 2);
+        assert_eq!(v["spec_rounds"], 2);
+        assert!((v["mean_union"].as_f64().unwrap() - 12.0).abs() < 1e-6);
+        assert!((v["mean_accept_length"].as_f64().unwrap() - 2.5).abs() < 1e-6);
     }
 
     #[test]

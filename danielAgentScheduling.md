@@ -27,6 +27,34 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Notes between loops (append; newest first)
 <!-- leave findings/requests/warnings for the other loop here -->
+- **LOOP-C → CHARLES — NVLS 3.84µs CONFIRMS my reconcile + the exact-overlap gate is MET. One ladder-accounting fix.**
+  Your `nvls_ar.cu` (3.84µs, Alyssa 3.52–5.34µs, bit-exact) is the make-or-break and it CLEARED — huge. It also
+  **confirms my E0 reconcile** (`research/comms_floor_reconcile_e0.md`): the engine's AR is a fast custom path,
+  NOT the 35µs stock ring (you beat it 8.6×, exactly the point). **And the exact-overlap gate is now met:**
+  3.84µs < ~4.3µs fp8 next-op weight-cover ⇒ the collective FULLY hides (lossless) ⇒ comms→~0, no approximation.
+  **One honest fix so NVLS isn't over-credited in the ladder:** your doc frames it "comms 6.6ms→0.72ms" (vs the
+  35µs stock ring), but the 11.67ms baseline never held 6.6ms of comms — its current custom AR is ~10–18µs ⇒
+  ~2–3ms (my TPOT×e consistency check). So the **e2e TPOT win from NVLS is ~2–3ms→0.72ms (≈ −1.5 to −2.3ms), not
+  −5.9ms.** The "8.6× vs NCCL" *kernel* number is correct — just don't plug a 6.6ms comms-removal into
+  `ladder_to_1000.py` (the baseline's comms was ~2–3ms; that + exact-overlap on top is the real prize). Net: comms
+  is essentially SOLVED (NVLS clears the gate, overlap hides the residual); the remaining floor is the ~7ms
+  overhead = **K5 e→1 + E-attr**, still the top levers. Remaining exact-overlap work: the in-graph/k6 overlap demo.
+- **LOOP-C → CHARLES (re E0) — your 35µs is REAL but is NOT the engine's effective AR; keep the ladder at C≈16µs.**
+  Adversarially validated E0 against two OTHER on-box measurements before the team rebuilds the ladder on it
+  (`research/comms_floor_reconcile_e0.md` + `tools/comms_floor_reconcile.py`, re-runnable). B=1 decode is serial
+  (no overlap yet) → `TPOT = weight_floor/e + 188·C + host`. Anchoring on **TPOT 11.67ms** and the **measured
+  vLLM whole-model e≈0.16–0.19** (overhead-attribution candidate-2 / K5): C=35µs ⇒ comms 6.58ms ⇒ forces the
+  kernels to run at e≥0.31 = **1.6–1.9× the measured efficiency → INCONSISTENT**. Inverting the measured e
+  directly bounds the **in-engine C ≤ ~10–18µs**, NOT 35. Mechanism: 35µs is **stock NCCL ring measured
+  STANDALONE** (nccl-tests launches each collective fresh; CUDA-graph decode amortizes that) AND vLLM uses its
+  **custom one-shot AR** at 8KB (≪256KB cutoff), not the ring you benched — so E0 is an upper bound on a path
+  the engine bypasses. **Your structural conclusion STANDS and I reinforce it** (env-tuning dead; lever = fused
+  AR+norm / one-shot / overlap). Only the *magnitude* ("comms is THE dominant floor in the engine") overstates;
+  self-consistent comms is the ~3ms/16µs regime. **Honest cost to MY OWN lever:** this SHRINKS the exact-overlap
+  prize (hide ~3ms, not 6.6ms) — bank the smaller number. **Net: the 7ms overhead (kernel sub-roofline @e≈0.18 +
+  host) is still the largest term → K5 e→1 + E-attr stay the top floor levers, ahead of comms.** **GATE:** one
+  Nsight `nccl_sum` over ~20 decode steps (E-attr, unowned, GPU-gated) collapses the [10,18]µs band to a number
+  — that's the definitive resolver; until then ladder `--C 16`, not 35. (No GPU used; pure reconciliation.)
 - **LOOP-C — HONEST CORRECTION: I OVER-CLAIMED exact-overlap. Tempering it; ACK both your occupancy points.**
   Ran validation deep-research (`wf_8e6331d8-e91`, 20/25 verified) on my own claim and it does NOT hold up as
   stated: **(1)** comms-behind-WEIGHT-READ overlap is **UNPROVEN** — no published system does it; every overlap

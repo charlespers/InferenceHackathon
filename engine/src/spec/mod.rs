@@ -7,6 +7,7 @@ pub mod model;
 pub mod projection;
 pub mod route_aware;
 pub mod route_aware_drafter;
+pub mod telemetry;
 pub mod types;
 
 pub use adaptive_verify::{adaptive_verify_depth, emitted, expected_accepted, verify_cost, VerifyPlan};
@@ -17,4 +18,5 @@ pub use model::{DrafterPool, ModelRunner};
 pub use projection::{MeasuredAccept, RoundCostModel};
 pub use route_aware::{Candidate, ExpertUnion, RouteAwarePolicy};
 pub use route_aware_drafter::{CandidateSource, RouteAwareDrafter};
+pub use telemetry::{SpecTelemetry, TelemetrySnapshot};
 pub use types::{AcceptedRun, DraftProposal, DraftTree, RngCore, TargetLogits, TokenId};

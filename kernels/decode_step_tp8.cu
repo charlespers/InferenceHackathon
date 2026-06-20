@@ -91,6 +91,19 @@ using namespace q3;
 #define USE_NVLS 1
 #endif
 
+// ---- GEMM toggle: build with -DUSE_GEMM=0 to fall back to the hand-rolled M=1 GEMV kernels (A/B). --
+//   USE_GEMM=1 (default) routes the dense per-rank projections (K1 QKV, K3 Oproj, K4 router gate,
+//   K5 experts gate+up/down, lm_head) through cuBLASLt fp8 tensor-core GEMM (the validated fast path,
+//   spec_verify_forward_gemm.cu).  K2 flash-decode stays as-is.  The 2 NVLS all-reduces/layer + the
+//   cross-rank correctness gate are unchanged.
+#ifndef USE_GEMM
+#define USE_GEMM 1
+#endif
+// Max verify columns the GEMM panels are built/padded for (B=1 decode uses M=1; spec verify M<=16).
+#ifndef GEMM_MMAX
+#define GEMM_MMAX 16
+#endif
+
 // ---- Pull in the existing validated kernels as ONE translation unit (same recipe as decode_step.cu).
 #define K5_NO_MAIN
 #define Q3_K1_LAUNCH_HELPER
@@ -109,6 +122,11 @@ using namespace q3;
 #define NK(x) do { ncclResult_t r_ = (x); if (r_ != ncclSuccess) {                      \
   printf("NCCL err %s:%d: %s\n", __FILE__, __LINE__, ncclGetErrorString(r_));           \
   exit(1); } } while (0)
+
+#if USE_GEMM
+#include <cublasLt.h>
+#include "gemm_engine.cuh"      // LtPanel (cuBLASLt fp8 TN-GEMM) + gemm_rmsnorm_quant / gemm_quant
+#endif
 
 // =================================================================================================
 // TP=8 shard geometry (compile-time constants derived from common.cuh).
@@ -164,6 +182,96 @@ static __device__ __forceinline__ float tp8_warp_dot(const fp8* __restrict__ w,
   return acc;
 }
 #endif // Q3_DSTP8_DEFS
+
+#if USE_GEMM
+// =================================================================================================
+// GEMM OUTPUT EPILOGUES.  cuBLASLt writes raw fp8 dots D[Mpad,N] (col-major bf16).  These tiny
+// epilogues read column 0 (the B=1 activation), apply act_scale[0] * per-channel Wscale[n], and
+// write the M=1 fp32 result the rest of the chain expects — identical to how the GEMV kernels
+// applied `r * Wscale[o]`.  (Mpad is the col-major leading dim = GEMM_MMAX rounded to 16 = 16.)
+// =================================================================================================
+// Generic: out[n] = D[col0,n] * act_scale[0] * Wscale[n].  Used for K1 QKV proj + K3 O-proj.
+extern "C" __global__ void gemm_epi_scale(
+    const __nv_bfloat16* __restrict__ D, const float* __restrict__ Wscale,
+    const float* __restrict__ act_scale, float* __restrict__ out, int N, int Mpad) {
+  const float as = act_scale[0];
+  for (int n = blockIdx.x*blockDim.x + threadIdx.x; n < N; n += gridDim.x*blockDim.x)
+    out[n] = (float)D[(size_t)n * Mpad] * as * Wscale[n];
+}
+// Router gate logits: g_logits[e] = D[col0,e] * act_scale[0]  (per-expert Wgate_scale applied in
+// tp8_k4_select, exactly as the split-K gate GEMV deferred its scale).  N == N_EXPERTS.
+extern "C" __global__ void gemm_epi_gate(
+    const __nv_bfloat16* __restrict__ D, const float* __restrict__ act_scale,
+    float* __restrict__ g_logits, int N, int Mpad) {
+  const float as = act_scale[0];
+  for (int e = blockIdx.x*blockDim.x + threadIdx.x; e < N; e += gridDim.x*blockDim.x)
+    g_logits[e] = (float)D[(size_t)e * Mpad] * as;
+}
+// K5a gate+up SwiGLU epilogue.  D is [Mpad, TOP_K*2*MOE_INTER_RANK] for the 8 routed experts' fused
+// gate+up rows (rows [0,192) gate, [192,384) up, per slot).  a_glb[slot*192+j] =
+//   silu(act_scale*Dgate * Sgu[e][j]) * (act_scale*Dup * Sgu[e][192+j]).  Mirrors tp8_k5a_gateup's
+// final-scale math byte-for-byte (just the dot came from the GEMM instead of the warp loop).
+extern "C" __global__ void gemm_epi_k5a(
+    const __nv_bfloat16* __restrict__ D, const int* __restrict__ sel_idx,
+    const float* const* __restrict__ Wgu_scale, const float* __restrict__ act_scale,
+    float* __restrict__ a_glb, int nslot, int Mpad) {
+  const float as = act_scale[0];
+  const int total = nslot * MOE_INTER_RANK;
+  for (int it = blockIdx.x*blockDim.x + threadIdx.x; it < total; it += gridDim.x*blockDim.x) {
+    const int slot = it / MOE_INTER_RANK;
+    const int j    = it - slot * MOE_INTER_RANK;
+    const int e    = sel_idx[slot];
+    const float* S = Wgu_scale[e];
+    const int gcol = slot * (2*MOE_INTER_RANK) + j;             // gate row j of this slot
+    const int ucol = slot * (2*MOE_INTER_RANK) + MOE_INTER_RANK + j;  // up row j
+    float gacc = (float)D[(size_t)gcol * Mpad] * as;
+    float uacc = (float)D[(size_t)ucol * Mpad] * as;
+    a_glb[(size_t)slot * MOE_INTER_RANK + j] = silu(gacc * S[j]) * (uacc * S[MOE_INTER_RANK + j]);
+  }
+}
+// K5b down epilogue.  D is [Mpad, TOP_K*HIDDEN]: row o of slot s = the down dot for channel o.
+//   h_io[o] += sel_w[s] * act_scale[s] * D[s*HIDDEN+o] * Sd[e][o].  atomicAdd (8 slots contribute).
+//   act_scale is PER-SLOT (each slot's a_glb quantized with its own amax scale).
+extern "C" __global__ void gemm_epi_k5b(
+    const __nv_bfloat16* __restrict__ D, const int* __restrict__ sel_idx,
+    const float* __restrict__ sel_w, const float* const* __restrict__ Wd_scale,
+    const float* __restrict__ act_scale, float* __restrict__ h_io, int nslot, int Mpad) {
+  const int total = nslot * HIDDEN;
+  for (int it = blockIdx.x*blockDim.x + threadIdx.x; it < total; it += gridDim.x*blockDim.x) {
+    const int slot = it / HIDDEN;
+    const int o    = it - slot * HIDDEN;
+    const int e    = sel_idx[slot];
+    const float gw = sel_w[slot];
+    float acc = (float)D[(size_t)(slot*HIDDEN + o) * Mpad] * act_scale[slot];
+    atomicAdd(&h_io[o], gw * acc * Wd_scale[e][o]);
+  }
+}
+// lm_head epilogue + partial argmax over this rank's vocab slice.  D is [Mpad, v_rows].
+//   logit[row] = D[col0,row] * act_scale[0] * Wlm_scale[row].  Same block-partial argmax as
+//   tp8_lmhead_argmax_partial (one block -> (max,arg) over its row stride).
+extern "C" __global__ void gemm_epi_lmhead_argmax(
+    const __nv_bfloat16* __restrict__ D, const float* __restrict__ Wlm_scale,
+    const float* __restrict__ act_scale, int n_rows, int row_offset, int Mpad,
+    float* __restrict__ block_max, int* __restrict__ block_arg) {
+  const float as = act_scale[0];
+  float my_max = -3.0e38f; int my_arg = -1;
+  for (int row = blockIdx.x*blockDim.x + threadIdx.x; row < n_rows; row += gridDim.x*blockDim.x) {
+    float v = (float)D[(size_t)row * Mpad] * as * Wlm_scale[row];
+    if (v > my_max) { my_max = v; my_arg = row_offset + row; }
+  }
+  // block reduce (max with arg)
+  __shared__ float smax[32]; __shared__ int sarg[32];
+  const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+  #pragma unroll
+  for (int o=16;o>0;o>>=1){ float om=__shfl_down_sync(0xffffffffu,my_max,o); int oa=__shfl_down_sync(0xffffffffu,my_arg,o);
+                            if (om>my_max){ my_max=om; my_arg=oa; } }
+  if (lane==0){ smax[wid]=my_max; sarg[wid]=my_arg; }
+  __syncthreads();
+  if (threadIdx.x==0){ float bm=-3.0e38f; int ba=-1; int nwc=(blockDim.x+31)>>5;
+                       for(int w=0;w<nwc;w++) if(smax[w]>bm){bm=smax[w];ba=sarg[w];}
+                       block_max[blockIdx.x]=bm; block_arg[blockIdx.x]=ba; }
+}
+#endif // USE_GEMM
 
 // Replicated final RMSNorm (same as decode_step.cu's ds_final_norm).
 extern "C" __global__ void tp8_final_norm(const float* __restrict__ h,
@@ -259,7 +367,7 @@ struct RankState {
   // KV cache: REPLICATED (all 4 KV heads), since 4 < 8 ranks.
   fp8   *kv_k = nullptr, *kv_v = nullptr;                    // [ctx_len, KV_DIM]
   float *kv_k_scale = nullptr, *kv_v_scale = nullptr;        // [KV_DIM]
-  int    ctx_len = 0, n_splits = 0;
+  int    ctx_len = 0, n_splits = 0, k2r_warps = 8;   // k2r_warps: parallel split-folds in the K2 reduce
   // K2 partials (sized for this rank's Q_HEADS_RANK heads).
   float *part_m = nullptr, *part_l = nullptr, *part_acc = nullptr;
   float *attn_out = nullptr;                                 // [Q_DIM_RANK]
@@ -267,7 +375,9 @@ struct RankState {
   // ---- K3 (O-proj), SHARDED: this rank holds the Wo column-slice for its 8 heads ----
   // Wo_shard logical [HIDDEN, Q_DIM_RANK]: dots this rank's attn_out[Q_DIM_RANK] -> PARTIAL hidden.
   fp8   *Wo = nullptr;  float *Wo_scale = nullptr;           // [HIDDEN, Q_DIM_RANK], [HIDDEN]
-  float *attn_partial = nullptr;                             // [HIDDEN] partial O-proj (pre all-reduce)
+  float *attn_partial = nullptr;                             // [HIDDEN] partial O-proj (AR INPUT; K3 writes)
+  float *attn_reduced = nullptr;                             // [HIDDEN] AR OUTPUT (residual-add reads).
+                                                             // NVLS out-of-place: OUT half; NCCL: == attn_partial.
 
   // ---- K4 (router), REPLICATED ----
   float *w_post_norm = nullptr;                              // [HIDDEN]
@@ -280,7 +390,9 @@ struct RankState {
   const fp8   **Wgu_d = nullptr;  const float **Wgu_scale_d = nullptr;  // gate+up shard [2*192, HIDDEN]
   const fp8   **Wd_d  = nullptr;  const float **Wd_scale_d  = nullptr;  // down  shard [HIDDEN, 192]
   float *a_glb = nullptr;                                    // [TOP_K * MOE_INTER_RANK]
-  float *moe_partial = nullptr;                              // [HIDDEN] partial MoE-down (pre all-reduce)
+  float *moe_partial = nullptr;                              // [HIDDEN] partial MoE-down (AR INPUT; K5b writes)
+  float *moe_reduced = nullptr;                              // [HIDDEN] AR OUTPUT (residual-add reads).
+                                                             // NVLS out-of-place: OUT half; NCCL: == moe_partial.
 
   // ---- final head, VOCAB-sharded ----
   float *w_final_norm = nullptr;                             // [HIDDEN]
@@ -291,6 +403,39 @@ struct RankState {
   float *rank_max = nullptr;   int *rank_arg = nullptr;      // [1] each (this rank's best)
 
   K5Launch k5;                                               // K5 plan for nslot=TOP_K, inter=192
+
+#if USE_GEMM
+  // ---- cuBLASLt fp8 TN-GEMM engine (replaces the dense GEMVs; K2 flash-decode unchanged) ----------
+  cublasLtHandle_t lt = nullptr;
+  // one autotuned panel per dense projection (K,N fixed; M padded to GEMM_MMAX=16).
+  LtPanel p_qkv;     // [K=HIDDEN, N=QKV_OUT_RANK]  K1 QKV
+  LtPanel p_oproj;   // [K=Q_DIM_RANK, N=HIDDEN]    K3 O-proj
+  LtPanel p_gate;    // [K=HIDDEN, N=N_EXPERTS]     K4 router gate
+  LtPanel p_k5gu;    // [K=HIDDEN, N=TOP_K*2*MOE_INTER_RANK]  K5 gate+up (8 experts fused)
+  LtPanel p_k5d;     // [K=MOE_INTER_RANK, N=TOP_K*HIDDEN]    K5 down   (8 experts fused)
+  LtPanel p_lm;      // [K=HIDDEN, N=v_rows]        lm_head
+  // activation quant scratch (col-major [K, GEMM_MMAX] fp8, zero-padded) + per-tensor act scale.
+  __nv_fp8_e4m3 *xq_hidden=nullptr;   // [HIDDEN*GEMM_MMAX]   K1/K4/K5a/lm_head input
+  __nv_fp8_e4m3 *xq_qdim=nullptr;     // [Q_DIM_RANK*GEMM_MMAX] K3 input (attn_out)
+  __nv_fp8_e4m3 *xq_a=nullptr;        // [TOP_K*MOE_INTER_RANK*GEMM_MMAX] K5b input (a_glb), per-slot
+  float *act_scale=nullptr;           // [1] per-tensor activation dequant scale (reused per GEMM)
+  float *act_scale_a=nullptr;         // [TOP_K] per-slot activation scale for the K5b down GEMMs
+  // GEMM bf16 output buffers (col-major [GEMM_MMAX, N]).
+  __nv_bfloat16 *d_qkv=nullptr, *d_oproj=nullptr, *d_gate=nullptr, *d_k5gu=nullptr, *d_k5d=nullptr, *d_lm=nullptr;
+  // K5 is GROUPED: 8 routed experts, each a separate (X or W) operand -> a per-slot GEMM.  We keep
+  // the TOP_K physical expert shard HOST pointers (the N_EXPERTS table round-robins e -> e%TOP_K),
+  // so given the routed sel_idx[slot] we pick Wgu_phys[sel_idx[slot]%TOP_K] for that slot's GEMM.
+  fp8*   Wgu_phys_h[TOP_K] = {};   // gate+up shard [2*192, HIDDEN] per physical expert (host ptr)
+  fp8*   Wd_phys_h[TOP_K]  = {};   // down    shard [HIDDEN, 192]   per physical expert (host ptr)
+  int    sel_h[TOP_K]      = {};   // host copy of routed expert ids (D2H once, eager path only)
+  // PACKED gate+up: the 8 routed experts' [2*192,HIDDEN] shards concatenated into ONE contiguous
+  // [TOP_K*2*192, HIDDEN] buffer so K5a is a SINGLE GEMM (1 launch, not 8).  In the proxy/graphed
+  // path the pack is built once (fixed slot->shard); the correctness path re-packs the routed shards.
+  fp8*   Wgu_pack=nullptr;          // [TOP_K*2*MOE_INTER_RANK, HIDDEN] fp8
+  LtPanel p_k5gu_pack;              // [K=HIDDEN, N=TOP_K*2*MOE_INTER_RANK]  single grouped gate+up GEMM
+  fp8*   Wd_pack=nullptr;           // [TOP_K*HIDDEN, MOE_INTER_RANK] fp8  (down shards concatenated)
+  LtPanel p_k5d_pack;               // [K=MOE_INTER_RANK, N=TOP_K*HIDDEN]  single grouped down GEMM (flatness)
+#endif
 
   // ---- CUDA-graph capture of this rank's full token (kernels + its NCCL collectives) ----
   cudaGraph_t     graph = nullptr;
@@ -473,6 +618,84 @@ extern "C" __global__ void tp8_residual_add(const float* __restrict__ h_src,
     h_dst[i] = h_src[i] + reduced[i];
 }
 
+#if USE_GEMM
+// forward decls of the existing kernels the GEMM helpers reuse (defined later in this TU).
+extern "C" __global__ void tp8_k1_epilogue(
+    const float* __restrict__ proj, const float* __restrict__ q_norm, const float* __restrict__ k_norm,
+    const float* __restrict__ rope_cos, const float* __restrict__ rope_sin,
+    float* __restrict__ out_q, fp8* __restrict__ kv_k, fp8* __restrict__ kv_v,
+    const float* __restrict__ kv_k_scale, const float* __restrict__ kv_v_scale);
+extern "C" __global__ void tp8_k4_select(
+    const float* __restrict__ g_logits, const float* __restrict__ Wgate_scale,
+    int* __restrict__ sel_idx, float* __restrict__ sel_w);
+// =================================================================================================
+// cuBLASLt fp8 GEMM LAUNCH HELPERS — drop-in replacements for the dense GEMVs (K2 attn unchanged).
+// Each: (1) RMSNorm+quantize OR quantize the fp32 activation to a col-major [K,Mpad] fp8 X (col 0 =
+// the B=1 token; cols 1..15 are zero-padded by the memset in alloc_rank), (2) cuBLASLt GEMM
+// D[Mpad,N] = X^T @ W on tensor cores, (3) a tiny epilogue applying act_scale*Wscale (folding the
+// activation-quant scale back in).  ZERO repack of W (already K-major).  Stream-capturable EXCEPT
+// the K5 grouped path's host sel read (kept on the eager path).
+// =================================================================================================
+// K1 QKV: RMSNorm(h) -> fp8 X[HIDDEN], GEMM -> D[*, QKV_OUT_RANK], scale -> qkv_proj[QKV_OUT_RANK].
+//   Then the EXISTING tp8_k1_epilogue (QK-norm + RoPE + KV write) runs unchanged on qkv_proj.
+static void gemm_k1_launch(RankState& S, const float* h, cudaStream_t s) {
+  const size_t smem = (size_t)HIDDEN * sizeof(float);
+  gemm_rmsnorm_quant<<<1, 1024, smem, s>>>(h, S.w_in_norm, S.xq_hidden, S.act_scale, HIDDEN);
+  S.p_qkv.run(S.xq_hidden, S.Wqkv, S.d_qkv, s);
+  gemm_epi_scale<<<32, 256, 0, s>>>(S.d_qkv, S.Wqkv_scale, S.act_scale, S.qkv_proj,
+                                    QKV_OUT_RANK, S.p_qkv.Mpad);
+  tp8_k1_epilogue<<<1, 256, 0, s>>>(S.qkv_proj, S.q_norm, S.k_norm, S.rope_cos, S.rope_sin,
+                                    S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale);
+}
+// K3 O-proj: quantize attn_out -> fp8 X[Q_DIM_RANK], GEMM -> D[*,HIDDEN], scale -> attn_partial.
+static void gemm_k3_launch(RankState& S, cudaStream_t s) {
+  gemm_quant<<<1, 256, 0, s>>>(S.attn_out, S.xq_qdim, S.act_scale, Q_DIM_RANK);
+  S.p_oproj.run(S.xq_qdim, S.Wo, S.d_oproj, s);
+  gemm_epi_scale<<<32, 256, 0, s>>>(S.d_oproj, S.Wo_scale, S.act_scale, S.attn_partial,
+                                    HIDDEN, S.p_oproj.Mpad);
+}
+// K4 router gate: RMSNorm(h) -> fp8 X[HIDDEN], GEMM -> D[*,N_EXPERTS], scale -> g_logits; then the
+//   EXISTING tp8_k4_select (softmax + top-8 + Wgate_scale) runs unchanged.  (Reuses xq_hidden.)
+static void gemm_k4_launch(RankState& S, const float* h, cudaStream_t s) {
+  const size_t smem = (size_t)HIDDEN * sizeof(float);
+  gemm_rmsnorm_quant<<<1, 1024, smem, s>>>(h, S.w_post_norm, S.xq_hidden, S.act_scale, HIDDEN);
+  S.p_gate.run(S.xq_hidden, S.Wgate, S.d_gate, s);
+  gemm_epi_gate<<<1, 128, 0, s>>>(S.d_gate, S.act_scale, S.g_logits, N_EXPERTS, S.p_gate.Mpad);
+  tp8_k4_select<<<1, 32, 0, s>>>(S.g_logits, S.Wgate_scale, S.sel_idx, S.sel_w);
+}
+// Pack the routed experts' gate+up shards into the contiguous Wgu_pack buffer (8 D2D copies on the
+// same device).  Only needed when the routing differs from the prebuilt fixed pack (correctness).
+static void gemm_k5_pack_gateup(RankState& S, const int* sel_phys, cudaStream_t s) {
+  const size_t shard_n = (size_t)2 * MOE_INTER_RANK * HIDDEN;   // [2*192, HIDDEN] fp8
+  for (int slot = 0; slot < TOP_K; ++slot)
+    CK(cudaMemcpyAsync(S.Wgu_pack + (size_t)slot * shard_n, S.Wgu_phys_h[sel_phys[slot]],
+                       shard_n * sizeof(fp8), cudaMemcpyDeviceToDevice, s));
+}
+// K5 grouped MoE — HYBRID: gate+up = ONE packed cuBLASLt fp8 GEMM (8 experts' shards concatenated;
+// shared X = quant(y) -> D[*, TOP_K*2*192]); SiLU epilogue -> a_glb.  down = the EXISTING fast
+// multi-row-per-warp GEMV (k5b: a_glb[192] per slot -> moe_partial), which is already ~22% MBU and
+// far cheaper than 8 tiny down GEMMs.  `Wgu_pack` must already hold the routed (or fixed) shards.
+static void gemm_k5_launch(RankState& S, const float* y, const int* /*sel_phys*/, cudaStream_t s) {
+  // ---- gate+up: quantize y, ONE GEMM over the packed [TOP_K*2*192, HIDDEN] weights ----
+  gemm_quant<<<32, 256, 0, s>>>(y, S.xq_hidden, S.act_scale, HIDDEN);
+  S.p_k5gu_pack.run(S.xq_hidden, S.Wgu_pack, S.d_k5gu, s);
+  // SiLU epilogue: D layout is [Mpad, TOP_K*2*192], slot s at column block s*384 -> a_glb (uses the
+  // per-routed-expert gate/up scales via sel_idx).
+  gemm_epi_k5a<<<64, 256, 0, s>>>(S.d_k5gu, S.sel_idx, S.Wgu_scale_d, S.act_scale,
+                                  S.a_glb, TOP_K, S.p_k5gu_pack.Mpad);
+  // ---- down: the existing fast GEMV (graph-safe, ~22% MBU) ----
+  tp8_k5b_down<<<S.k5.ctasB, S.k5.block, S.k5.smemB, s>>>(
+      S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.moe_partial, TOP_K);
+}
+// lm_head: quantize hn -> fp8 X[HIDDEN], GEMM -> D[*,v_rows], scale+partial-argmax over the slice.
+static void gemm_lmhead_launch(RankState& S, const float* hn, cudaStream_t s) {
+  gemm_quant<<<1, 256, 0, s>>>(hn, S.xq_hidden, S.act_scale, HIDDEN);
+  S.p_lm.run(S.xq_hidden, S.Wlm, S.d_lm, s);
+  gemm_epi_lmhead_argmax<<<S.lm_blocks, 256, 0, s>>>(S.d_lm, S.Wlm_scale, S.act_scale,
+      S.v_rows, S.v_off, S.p_lm.Mpad, S.block_max, S.block_arg);
+}
+#endif // USE_GEMM
+
 // =================================================================================================
 // FAST TP=8 ROUTER (the #1 measured bottleneck fix).
 // -------------------------------------------------------------------------------------------------
@@ -633,47 +856,60 @@ static inline void ar_sum_hidden(RankState& S, float* buf, int nvls_off, cudaStr
   NK(ncclGroupEnd());
 }
 
+#if USE_GEMM
+// Fixed slot->physical-shard map for the latency-proxy / graphed timing path (slot s -> shard s).
+// Valid for timing (dummy weights; the routed values are meaningless in the proxy) and graph-safe
+// (no per-layer D2H of sel_idx).  The CORRECTNESS path resolves the REAL routed mapping host-side.
+static const int K5_SEL_PHYS_FIXED[TOP_K] = {0,1,2,3,4,5,6,7};
+#endif
+
 static float* enqueue_tp8_layer(RankState& S, float* h_src, float* h_dst) {
   cudaStream_t s = S.stream;
 
+#if USE_GEMM
+  // ---- K1: cuBLASLt fp8 QKV GEMM (RMSNorm+quant -> GEMM -> scale) + the unchanged QK-norm/RoPE epi.
+  gemm_k1_launch(S, h_src, s);
+  // ---- K2: flash-decode (unchanged) ----
+  tp8_k2_launch(S, s);
+  // ---- K3: cuBLASLt fp8 O-proj GEMM -> PARTIAL hidden (h_in=0; residual added post-all-reduce) ----
+  CK(cudaMemsetAsync(S.attn_partial, 0, HIDDEN * sizeof(float), s));
+  gemm_k3_launch(S, s);
+  // ---- AR#1 ---- (out-of-place: result lands in S.attn_reduced; residual-add reads THAT)
+  ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);
+  tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_reduced, h_dst);
+  // ---- K4: cuBLASLt fp8 router gate GEMM -> g_logits -> select ----
+  gemm_k4_launch(S, h_dst, s);
+  // ---- K5: cuBLASLt fp8 GROUPED gate+up/down GEMM -> PARTIAL MoE-down hidden ----
+  CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
+  gemm_k5_launch(S, h_dst, K5_SEL_PHYS_FIXED, s);   // proxy/graphed: fixed slot->shard (graph-safe)
+  // ---- AR#2 ----
+  ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);
+  tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_reduced, h_dst);
+  return h_dst;
+#else
   // ---- K1: sharded RMSNorm + QKV GEMV (this rank's 2048 rows) + QK-norm + RoPE + KV write ----
-  //   tp8_k1_launch runs the GEMV over exactly QKV_OUT_RANK=2048 rows of the SHARDED Wqkv (this rank's
-  //   8 Q heads + the 4 replicated K + 4 replicated V), then a sharded [8Q|4K|4V] epilogue -> out_q
-  //   [Q_DIM_RANK] + this rank's KV-cache write.  Per-rank read = ~1/8 of Q + full (replicated) KV.
   tp8_k1_launch(S, h_src, s);
-
   // ---- K2: flash-decode over this rank's Q_HEADS_RANK=8 heads (KV is the replicated full cache) ----
   tp8_k2_launch(S, s);
-
   // ---- K3: O-proj on the [HIDDEN, Q_DIM_RANK] column-shard -> PARTIAL hidden (NO residual add yet) ---
-  //   We zero attn_partial, then K3 writes h_out = h_in + Wo@attn_out with h_in=ZERO so the output is
-  //   the pure partial O-proj (the residual is added once, locally, after the all-reduce).
   CK(cudaMemsetAsync(S.attn_partial, 0, HIDDEN * sizeof(float), s));   // h_in = 0 -> pure partial
-  // k3_attn_epilogue: out[o] = h_in[o] + dot(Wo[o,:Q_DIM_RANK], attn_out).  We pass a ZERO h_in.
   tp8_k3_launch(S, s);
-
   // ---- AR#1: all-reduce(SUM) the partial O-proj output across the 8 ranks -> full O-proj ----
   ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);
-  // full post-attn residual = h_src + reduced O-proj   (added once, locally, on every rank).
-  tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_partial, h_dst);
-
-  // ---- K4: router (REPLICATED) on the full post-attn residual -> sel_idx[8], sel_w[8] ----
-  //   capture-safe FAST launch (split-K gate GEMV across the whole GPU + tiny select kernel).
+  tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_reduced, h_dst);
+  // ---- K4: router (REPLICATED) -> sel_idx[8], sel_w[8] ----
   tp8_k4_launch(h_dst, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, S.g_logits, s);
-
   // ---- K5: sharded gate+up (192) then sharded down -> PARTIAL MoE-down hidden ----
   CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));    // accumulate partial from 0
   tp8_k5a_gateup<<<S.k5.ctasA, S.k5.block, S.k5.smemA, s>>>(
       h_dst, S.sel_idx, S.Wgu_d, S.Wgu_scale_d, S.a_glb, TOP_K);
   tp8_k5b_down<<<S.k5.ctasB, S.k5.block, S.k5.smemB, s>>>(
       S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.moe_partial, TOP_K);
-
   // ---- AR#2: all-reduce(SUM) the partial MoE-down across ranks -> full MoE contribution ----
   ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);
-  // residual += full MoE contribution (h_dst already holds the post-attn residual; add MoE on top).
-  tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_partial, h_dst);
-
+  tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_reduced, h_dst);
   return h_dst;
+#endif
 }
 
 // ---- enqueue the FULL TP=8 step on a rank: 94 layers + final norm + sharded lm_head + argmax ----
@@ -700,10 +936,14 @@ static void enqueue_tp8_step(RankState& S) {
     nxt = (cur == S.h_a) ? S.h_b : S.h_a;
   }
   // final RMSNorm (replicated) + VOCAB-sharded lm_head + local argmax -> (rank_max, rank_arg).
-  const size_t lm_smem = (size_t)HIDDEN * sizeof(float);
   tp8_final_norm<<<1, 256, 0, s>>>(cur, S.w_final_norm, S.hn);
+#if USE_GEMM
+  gemm_lmhead_launch(S, S.hn, s);                  // cuBLASLt fp8 lm_head GEMM + scale + partial argmax
+#else
+  const size_t lm_smem = (size_t)HIDDEN * sizeof(float);
   tp8_lmhead_argmax_partial<<<S.lm_blocks, 256, lm_smem, s>>>(
       S.hn, S.Wlm, S.Wlm_scale, S.v_rows, S.v_off, S.block_max, S.block_arg);
+#endif
   tp8_argmax_final<<<1, 32, 0, s>>>(S.block_max, S.block_arg, S.lm_blocks, S.rank_max, S.rank_arg);
   // Cross-rank argmax: all-reduce-MAX over the per-rank best logits; the matching token id is then
   // resolved host-side from the gathered (max,arg) pairs (a 2-int all-gather would also work).  We
@@ -732,31 +972,48 @@ static void enqueue_tp8_step(RankState& S) {
 // =================================================================================================
 // segA: K1 -> K2 -> memset(attn_partial) -> K3.  Reads h_in, writes attn_partial (partial O-proj).
 static void enqueue_tp8_segA(RankState& S, float* h_in, cudaStream_t s) {
+#if USE_GEMM
+  gemm_k1_launch(S, h_in, s);
+  tp8_k2_launch(S, s);
+  CK(cudaMemsetAsync(S.attn_partial, 0, HIDDEN * sizeof(float), s));
+  gemm_k3_launch(S, s);
+#else
   tp8_k1_launch(S, h_in, s);
   tp8_k2_launch(S, s);
   CK(cudaMemsetAsync(S.attn_partial, 0, HIDDEN * sizeof(float), s));
   tp8_k3_launch(S, s);
+#endif
 }
-// segB: residual_add(h_in + attn_partial -> h_out) -> K4 -> memset(moe_partial) -> K5a -> K5b.
-//   attn_partial is assumed ALREADY all-reduced (eager AR#1) before this segment replays.
+// segB: residual_add(h_in + attn_reduced -> h_out) -> K4 -> memset(moe_partial) -> K5a -> K5b.
+//   attn_reduced is the AR#1 result (eager AR ran before this segment replays; out-of-place -> OUT half).
 static void enqueue_tp8_segB(RankState& S, float* h_in, float* h_out, cudaStream_t s) {
-  tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.attn_partial, h_out);
+  tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.attn_reduced, h_out);
+#if USE_GEMM
+  gemm_k4_launch(S, h_out, s);
+  CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
+  gemm_k5_launch(S, h_out, K5_SEL_PHYS_FIXED, s);   // graph-safe fixed slot->shard
+#else
   tp8_k4_launch(h_out, S.w_post_norm, S.Wgate, S.Wgate_scale, S.sel_idx, S.sel_w, S.g_logits, s);
   CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
   tp8_k5a_gateup<<<S.k5.ctasA, S.k5.block, S.k5.smemA, s>>>(
       h_out, S.sel_idx, S.Wgu_d, S.Wgu_scale_d, S.a_glb, TOP_K);
   tp8_k5b_down<<<S.k5.ctasB, S.k5.block, S.k5.smemB, s>>>(
       S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.moe_partial, TOP_K);
+#endif
 }
-// head: residual_add(h_in + moe_partial -> h_in) -> final norm -> lm_head -> argmax_final.
-//   moe_partial is assumed ALREADY all-reduced (eager AR#2) before this segment replays.  Writes
-//   rank_max/rank_arg; the eager head-AR-max then picks the global token.
+// head: residual_add(h_in + moe_reduced -> h_in) -> final norm -> lm_head -> argmax_final.
+//   moe_reduced is the AR#2 result (eager AR ran before this segment replays; out-of-place -> OUT half).
+//   Writes rank_max/rank_arg; the eager head-AR-max then picks the global token.
 static void enqueue_tp8_seghead(RankState& S, float* h_in, cudaStream_t s) {
-  tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.moe_partial, h_in);
-  const size_t lm_smem = (size_t)HIDDEN * sizeof(float);
+  tp8_residual_add<<<32, 256, 0, s>>>(h_in, S.moe_reduced, h_in);
   tp8_final_norm<<<1, 256, 0, s>>>(h_in, S.w_final_norm, S.hn);
+#if USE_GEMM
+  gemm_lmhead_launch(S, S.hn, s);
+#else
+  const size_t lm_smem = (size_t)HIDDEN * sizeof(float);
   tp8_lmhead_argmax_partial<<<S.lm_blocks, 256, lm_smem, s>>>(
       S.hn, S.Wlm, S.Wlm_scale, S.v_rows, S.v_off, S.block_max, S.block_arg);
+#endif
   tp8_argmax_final<<<1, 32, 0, s>>>(S.block_max, S.block_arg, S.lm_blocks, S.rank_max, S.rank_arg);
 }
 // Capture a kernel-only segment (no NCCL, no setattr inside) into an instantiated graph exec.
@@ -1016,7 +1273,7 @@ extern "C" __global__ void tp8_k2_partial(
 // the dependent chain per warp is n_splits/W instead of n_splits, and the W=8 warps give intra-CTA
 // latency hiding.  Microbench (ctx 4096, nsp 64, 8 heads): combined K2 33.6us -> 20.5us (1.6x).
 #ifndef K2R_WARPS
-#define K2R_WARPS 8
+#define K2R_WARPS 32   // Fix B: wide reduce (each warp folds n_splits/32 partials) — best with 192 splits
 #endif
 extern "C" __global__ void tp8_k2_reduce(
     const float* __restrict__ part_m, const float* __restrict__ part_l,
@@ -1072,15 +1329,165 @@ extern "C" __global__ void tp8_k2_reduce(
     for (int c = 0; c < K2_VPL; c++) o[c] = racc[c] * inv;
   }
 }
+// =================================================================================================
+// FIX B — FUSED TP=8 flash-decode: partial + reduce in ONE launch, partials on-chip (no HBM round-trip,
+// no 2nd kernel).  The TP=8 shard has a STRUCTURAL property the generic K2 ignored: a rank owns 8 Q
+// heads [8r,8r+8) which ALL map to the SINGLE KV head (8r)/GQA_GROUP (GQA_GROUP=16 > 8) -> every CTA
+// reads ONE KV head's cache.  We load each KV row's K and V ONCE per warp and reuse the dequant across
+// the head's online-softmax recurrence; W warps split the [0,ctx) time range W ways (short dependent
+// chains -> latency hiding); the W partials combine in shared memory.  grid = Q_HEADS_RANK (8) CTAs *
+// W warps; high W keeps the 132 SMs busy while each warp's slice stays long enough to amortize setup.
+//
+// vs the old 2-kernel split-K path this removes: (a) the 2nd kernel launch (tp8_k2_reduce ~5.7us), and
+// (b) the part_m/l/acc HBM write+read (n_splits*8*130 floats round-trip).  Same online-softmax math,
+// bit-identical to the serial reference (verified by the engine correctness gate post-attn residual).
+// =================================================================================================
+#ifndef TP8_K2F_WARPS
+#define TP8_K2F_WARPS 16   // warps/CTA = time-splits; 8 heads * 16 = 128 warps over 132 SMs, each warp
+                           // streams ctx/16 ~256 timesteps (4096) -> short dependent chain, full latency hide
+#endif
+extern "C" __global__ void tp8_k2_fused(
+    const float* __restrict__ q /*[Q_DIM_RANK]*/,
+    const fp8*  __restrict__ kv_k, const fp8* __restrict__ kv_v,
+    const float* __restrict__ kv_k_scale, const float* __restrict__ kv_v_scale,
+    int ctx_len, int rank, float* __restrict__ attn_out /*[Q_DIM_RANK]*/) {
+  const int lane = threadIdx.x & 31;
+  const int wid  = threadIdx.x >> 5;
+  const int W    = blockDim.x >> 5;             // warps per CTA = number of time-splits
+  const int lqh  = blockIdx.x;                  // ONE CTA per LOCAL q_head 0..Q_HEADS_RANK-1
+  if (lqh >= Q_HEADS_RANK) return;
+  const int gqh  = rank * Q_HEADS_RANK + lqh;   // global q_head 0..63
+  const int kvh  = gqh / GQA_GROUP;             // GQA broadcast -> the rank's single KV head
+  const float scale = rsqrtf((float)HEAD_DIM);
+  const int kv_base = kvh * HEAD_DIM;
+  const int c0 = kv_base + lane * K2_VPL;
+
+  float qreg[K2_VPL], ksc[K2_VPL], vsc[K2_VPL];
+  #pragma unroll
+  for (int c = 0; c < K2_VPL; c++) {
+    qreg[c] = q[lqh * HEAD_DIM + lane * K2_VPL + c];           // LOCAL q index (this rank's slice)
+    ksc[c]  = kv_k_scale ? kv_k_scale[c0 + c] : 1.f;
+    vsc[c]  = kv_v_scale ? kv_v_scale[c0 + c] : 1.f;
+  }
+
+  // this warp's contiguous KV time slice [t0,t1).
+  const int chunk = (ctx_len + W - 1) / W;
+  const int t0 = wid * chunk, t1 = min(t0 + chunk, ctx_len);
+
+  float m = -FLT_MAX, l = 0.f, acc[K2_VPL];
+  #pragma unroll
+  for (int c = 0; c < K2_VPL; c++) acc[c] = 0.f;
+
+  const unsigned* __restrict__ k32 = reinterpret_cast<const unsigned*>(kv_k);
+  const unsigned* __restrict__ v32 = reinterpret_cast<const unsigned*>(kv_v);
+  const int row_words = KV_DIM / 4, base_words = kv_base / 4;
+
+  // 2x time-unroll: two independent coalesced K (and V) loads in flight per iteration (hide HBM latency).
+  int t = t0;
+  for (; t + 1 < t1; t += 2) {
+    float kv0[K2_VPL], kv1[K2_VPL];
+    k2_load4(k32 + (size_t)t       * row_words + base_words, lane, ksc, kv0);
+    k2_load4(k32 + (size_t)(t + 1) * row_words + base_words, lane, ksc, kv1);
+    float p0 = 0.f, p1 = 0.f;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) { p0 += qreg[c]*kv0[c]; p1 += qreg[c]*kv1[c]; }
+    float s0 = k2_warp_sum(p0) * scale, s1 = k2_warp_sum(p1) * scale;
+    float vv0[K2_VPL], vv1[K2_VPL];
+    k2_load4(v32 + (size_t)t       * row_words + base_words, lane, vsc, vv0);
+    k2_load4(v32 + (size_t)(t + 1) * row_words + base_words, lane, vsc, vv1);
+    float mn = fmaxf(m, s0), corr = __expf(m - mn), pe = __expf(s0 - mn);
+    l = l * corr + pe;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) acc[c] = acc[c]*corr + pe*vv0[c];
+    m = mn;
+    mn = fmaxf(m, s1); corr = __expf(m - mn); pe = __expf(s1 - mn);
+    l = l * corr + pe;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) acc[c] = acc[c]*corr + pe*vv1[c];
+    m = mn;
+  }
+  for (; t < t1; t++) {
+    float kv[K2_VPL];
+    k2_load4(k32 + (size_t)t * row_words + base_words, lane, ksc, kv);
+    float p = 0.f;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) p += qreg[c]*kv[c];
+    float s = k2_warp_sum(p) * scale;
+    float vv[K2_VPL];
+    k2_load4(v32 + (size_t)t * row_words + base_words, lane, vsc, vv);
+    float mn = fmaxf(m, s), corr = __expf(m - mn), pe = __expf(s - mn);
+    l = l * corr + pe;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) acc[c] = acc[c]*corr + pe*vv[c];
+    m = mn;
+  }
+
+  // combine the W warp-partials in shared memory (warp 0).  smem: m[W] + l[W] + acc[W*HEAD_DIM].
+  extern __shared__ float k2f_sm[];
+  float* sm_m = k2f_sm;            // [W]
+  float* sm_l = sm_m + W;          // [W]
+  float* sm_a = sm_l + W;          // [W*HEAD_DIM]
+  if (lane == 0) { sm_m[wid] = m; sm_l[wid] = l; }
+  float* sao = sm_a + (size_t)wid * HEAD_DIM + lane * K2_VPL;
+  #pragma unroll
+  for (int c = 0; c < K2_VPL; c++) sao[c] = acc[c];
+  __syncthreads();
+  if (wid == 0) {
+    float rm = -FLT_MAX, rl = 0.f, racc[K2_VPL];
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) racc[c] = 0.f;
+    for (int w = 0; w < W; w++) {
+      float ms = sm_m[w], ls = sm_l[w];
+      if (ls <= 0.f) continue;
+      const float* ai = sm_a + (size_t)w * HEAD_DIM + lane * K2_VPL;
+      float mn = fmaxf(rm, ms), co = __expf(rm - mn), cs = __expf(ms - mn);
+      rl = rl * co + ls * cs;
+      #pragma unroll
+      for (int c = 0; c < K2_VPL; c++) racc[c] = racc[c]*co + ai[c]*cs;
+      rm = mn;
+    }
+    float inv = (rl > 0.f) ? (1.f / rl) : 0.f;
+    float* o = attn_out + lqh * HEAD_DIM + lane * K2_VPL;
+    #pragma unroll
+    for (int c = 0; c < K2_VPL; c++) o[c] = racc[c] * inv;
+  }
+}
+
+// Pick warps/CTA (= time-splits) for the fused kernel: 8 heads * W warps over the SMs, slice long enough.
+static inline int tp8_k2f_warps(int ctx_len) {
+  int w = TP8_K2F_WARPS;
+  if (ctx_len > 16384) w = 24;
+  if (ctx_len <= 512)  w = 4;
+  int max_by_chunk = (ctx_len + 31) / 32;       // keep each warp's slice >= ~32 timesteps
+  if (w > max_by_chunk) w = max_by_chunk;
+  if (w < 1) w = 1;
+  return w;
+}
+
+// ---- TP=8 K2 toggle: USE_K2_FUSED=1 the single-launch fused kernel (one CTA/head -> only 8 CTAs,
+//      occupancy-starved on 132 SMs, MEASURED SLOWER: 68us vs 21us).  Default 0 = the split-K 2-kernel
+//      path (128 CTAs in the partial -> fills the SMs; the win is from MORE splits, not fewer launches).
+#ifndef USE_K2_FUSED
+#define USE_K2_FUSED 0
+#endif
 static void tp8_k2_launch(RankState& S, cudaStream_t s) {
+#if USE_K2_FUSED
+  const int warps = tp8_k2f_warps(S.ctx_len);
+  const int block = warps * 32;
+  const size_t smem = (size_t)(2 * warps + warps * HEAD_DIM) * sizeof(float);   // m[W]+l[W]+acc[W*128]
+  tp8_k2_fused<<<Q_HEADS_RANK, block, smem, s>>>(
+      S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale, S.ctx_len, S.rank, S.attn_out);
+#else
   const int warps_per_cta = 4, block = warps_per_cta * 32;
   dim3 gP(S.n_splits, (Q_HEADS_RANK + warps_per_cta - 1) / warps_per_cta);
   tp8_k2_partial<<<gP, block, 0, s>>>(S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale,
                                       S.ctx_len, S.n_splits, S.rank, S.part_m, S.part_l, S.part_acc);
-  // parallel reduce: ONE CTA per head, K2R_WARPS warps; smem = (2*W + W*HEAD_DIM) floats.
-  const int rw = K2R_WARPS, rblock = rw * 32;
+  // parallel reduce: ONE CTA per head, S.k2r_warps warps; smem = (2*W + W*HEAD_DIM) floats.  More warps
+  // = each folds n_splits/W partials (shorter dependent log-sum-exp chain) — matters when n_splits is high.
+  const int rw = S.k2r_warps, rblock = rw * 32;
   const size_t rsmem = (size_t)(2 * rw + rw * HEAD_DIM) * sizeof(float);
   tp8_k2_reduce<<<Q_HEADS_RANK, rblock, rsmem, s>>>(S.part_m, S.part_l, S.part_acc, S.n_splits, S.attn_out);
+#endif
 }
 
 // K3: O-proj on the [HIDDEN, Q_DIM_RANK] column-shard -> PARTIAL hidden (h_in = ZERO, see caller).
@@ -1130,10 +1537,31 @@ static void fill_f32(float* dptr, size_t n, unsigned seed, float scale, bool pos
   CK(cudaMemcpy(dptr, host.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 }
 
+// Fix B: TP=8 K2 split count.  Each rank runs only Q_HEADS_RANK=8 heads (all mapping to ONE KV head),
+// so the generic 64 splits leaves a long dependent online-softmax chain (64 timesteps/split @ ctx4096)
+// -> latency-bound partial.  Sweep (4096): 64 -> 21.5us, 128 -> 18.6us (BEST), 192 -> 19.6 (partial keeps
+// dropping but the reduce's HBM partial-read grows).  128 is the partial/reduce balance for the shard.
+static inline int tp8_k2_splits(int ctx_len) {
+  // Joint sweep (4096) of n_splits x reduce-warps (k2r_warps=32): 64/8 -> 21.5us, 128/32 -> 15.6us,
+  // 192/32 -> 14.6us (BEST), 256/32 -> 14.8us.  192 splits with the 32-warp reduce is the balance:
+  // the partial's dependent chain is short (4096/192 ~21 steps) and the wide reduce hides the partials' read.
+  int s = 192;
+  if (ctx_len <= 1024) s = 96;                   // short ctx: fewer splits keep each chunk amortized
+  if (ctx_len > 16384) s = 256;                  // long ctx: more parallelism, chunks stay long
+  int max_by_chunk = (ctx_len + 31) / 32;
+  if (s > max_by_chunk) s = max_by_chunk;
+  if (s < 1) s = 1;
+  return s;
+}
 static void alloc_rank(RankState& S, int ctx_len) {
   CK(cudaSetDevice(S.dev));
   S.ctx_len  = ctx_len;
-  S.n_splits = k2_pick_splits(ctx_len);
+  S.n_splits = tp8_k2_splits(ctx_len);
+  // K2 n_splits override (sweep the partial's split-K parallelism without a rebuild): K2_SPLITS env.
+  if (const char* e = getenv("K2_SPLITS")) { int v = atoi(e); if (v > 0) S.n_splits = v; }
+  // K2 reduce warps/CTA (more = shorter per-warp fold chain of the n_splits partials).  K2R_WARPS env.
+  S.k2r_warps = K2R_WARPS;
+  if (const char* e = getenv("K2R_W")) { int v = atoi(e); if (v >= 1 && v <= 32) S.k2r_warps = v; }
 
   CK(cudaMalloc(&S.h_a, HIDDEN * sizeof(float)));
   CK(cudaMalloc(&S.h_b, HIDDEN * sizeof(float)));
@@ -1176,10 +1604,16 @@ static void alloc_rank(RankState& S, int ctx_len) {
   // there, the multimem reduce sums in-switch, and the residual-add reads the reduced result).  Else a
   // plain cudaMalloc (NCCL reduces it).  moe_partial below points at the MOE half the same way.
 #if USE_NVLS
-  if (S.nvls && S.nvls->ready) S.attn_partial = S.nvls->uc + NVLS_OFF_ATTN;
-  else                         CK(cudaMalloc(&S.attn_partial, HIDDEN * sizeof(float)));
+  if (S.nvls && S.nvls->ready) {
+    S.attn_partial = S.nvls->uc + NVLS_OFF_ATTN;        // AR INPUT  (K3 writes the partial here)
+    S.attn_reduced = S.nvls->uc + NVLS_OFF_ATTN_OUT;    // AR OUTPUT (out-of-place: residual-add reads here)
+  } else {
+    CK(cudaMalloc(&S.attn_partial, HIDDEN * sizeof(float)));
+    S.attn_reduced = S.attn_partial;                    // NCCL reduces in-place
+  }
 #else
   CK(cudaMalloc(&S.attn_partial, HIDDEN * sizeof(float)));
+  S.attn_reduced = S.attn_partial;
 #endif
 
   // ---- K4 REPLICATED ----
@@ -1205,6 +1639,11 @@ static void alloc_rank(RankState& S, int ctx_len) {
     CK(cudaMalloc(&Sgu_dp[e], 2 * MOE_INTER_RANK * sizeof(float))); fill_f32(Sgu_dp[e], 2*MOE_INTER_RANK, 90u+e, 0.02f, true);
     CK(cudaMalloc(&Sd_dp[e],  HIDDEN * sizeof(float)));             fill_f32(Sd_dp[e],  HIDDEN,           110u+e, 0.02f, true);
   }
+#if USE_GEMM
+  // keep the TOP_K physical shard HOST pointers so the grouped-MoE GEMM can pick the routed expert's
+  // weight per slot (W operand of a cuBLASLt matmul must be a host-visible device pointer).
+  for (int e = 0; e < TOP_K; ++e) { S.Wgu_phys_h[e] = Wgu_dp[e]; S.Wd_phys_h[e] = Wd_dp[e]; }
+#endif
   // K5 indexes by EXPERT ID (0..127, written by K4); round-robin N_EXPERTS-wide pointer arrays into
   // the TOP_K physical shards (valid for any routed id, still ~1/8 the resident mass of a full layer).
   std::vector<fp8*>   Wgu_full(N_EXPERTS), Wd_full(N_EXPERTS);
@@ -1217,10 +1656,16 @@ static void alloc_rank(RankState& S, int ctx_len) {
   CK(cudaMalloc(&S.Wd_scale_d,  N_EXPERTS * sizeof(float*))); CK(cudaMemcpy(S.Wd_scale_d,  Sd_full.data(),  N_EXPERTS*sizeof(float*), cudaMemcpyHostToDevice));
   CK(cudaMalloc(&S.a_glb, (size_t)TOP_K * MOE_INTER_RANK * sizeof(float)));
 #if USE_NVLS
-  if (S.nvls && S.nvls->ready) S.moe_partial = S.nvls->uc + NVLS_OFF_MOE;
-  else                         CK(cudaMalloc(&S.moe_partial, HIDDEN * sizeof(float)));
+  if (S.nvls && S.nvls->ready) {
+    S.moe_partial = S.nvls->uc + NVLS_OFF_MOE;          // AR INPUT  (K5b writes the partial here)
+    S.moe_reduced = S.nvls->uc + NVLS_OFF_MOE_OUT;      // AR OUTPUT (out-of-place: residual-add reads here)
+  } else {
+    CK(cudaMalloc(&S.moe_partial, HIDDEN * sizeof(float)));
+    S.moe_reduced = S.moe_partial;                      // NCCL reduces in-place
+  }
 #else
   CK(cudaMalloc(&S.moe_partial, HIDDEN * sizeof(float)));
+  S.moe_reduced = S.moe_partial;
 #endif
 
   // K5 plan: MULTIPLE-ROWS-PER-WARP (RA gate+up, RB down) — the measured win on the TP=8 192-shard
@@ -1267,6 +1712,66 @@ static void alloc_rank(RankState& S, int ctx_len) {
                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(HIDDEN*sizeof(float))));
   CK(cudaFuncSetAttribute(tp8_k4_gate_gemv,
                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(HIDDEN*sizeof(float))));
+
+#if USE_GEMM
+  // =============================================================================================
+  // cuBLASLt fp8 TN-GEMM SETUP (replaces the dense GEMVs).  One autotuned panel per projection;
+  // activation quant scratch (col-major [K, GEMM_MMAX] fp8, columns 1..15 zero-padded once); GEMM
+  // bf16 output buffers (col-major [GEMM_MMAX, N]).  Panels autotuned at GEMM_MMAX=16 then pinned.
+  // =============================================================================================
+  const int MP = ((GEMM_MMAX + 15) / 16) * 16;     // M padded to the fp8 16-wide tile (=16)
+  CL(cublasLtCreate(&S.lt));
+  // quant scratch (zeroed -> columns 1..15 stay 0; the per-call quant overwrites column 0 only).
+  CK(cudaMalloc(&S.xq_hidden, (size_t)HIDDEN     * MP * sizeof(__nv_fp8_e4m3)));
+  CK(cudaMalloc(&S.xq_qdim,   (size_t)Q_DIM_RANK * MP * sizeof(__nv_fp8_e4m3)));
+  CK(cudaMalloc(&S.xq_a,      (size_t)TOP_K * MOE_INTER_RANK * MP * sizeof(__nv_fp8_e4m3)));
+  CK(cudaMemset(S.xq_hidden, 0, (size_t)HIDDEN     * MP * sizeof(__nv_fp8_e4m3)));
+  CK(cudaMemset(S.xq_qdim,   0, (size_t)Q_DIM_RANK * MP * sizeof(__nv_fp8_e4m3)));
+  CK(cudaMemset(S.xq_a,      0, (size_t)TOP_K * MOE_INTER_RANK * MP * sizeof(__nv_fp8_e4m3)));
+  CK(cudaMalloc(&S.act_scale,   sizeof(float)));
+  CK(cudaMalloc(&S.act_scale_a, TOP_K * sizeof(float)));
+  // GEMM bf16 outputs (col-major [MP, N]).
+  CK(cudaMalloc(&S.d_qkv,   (size_t)MP * QKV_OUT_RANK            * sizeof(__nv_bfloat16)));
+  CK(cudaMalloc(&S.d_oproj, (size_t)MP * HIDDEN                  * sizeof(__nv_bfloat16)));
+  CK(cudaMalloc(&S.d_gate,  (size_t)MP * N_EXPERTS               * sizeof(__nv_bfloat16)));
+  CK(cudaMalloc(&S.d_k5gu,  (size_t)MP * TOP_K * 2*MOE_INTER_RANK* sizeof(__nv_bfloat16)));
+  CK(cudaMalloc(&S.d_k5d,   (size_t)MP * TOP_K * HIDDEN          * sizeof(__nv_bfloat16)));
+  CK(cudaMalloc(&S.d_lm,    (size_t)MP * S.v_rows                * sizeof(__nv_bfloat16)));
+  // autotune events
+  cudaEvent_t ge0, ge1; CK(cudaEventCreate(&ge0)); CK(cudaEventCreate(&ge1));
+  // init+autotune each panel (X,W,D real buffers; K5 uses physical shard 0 for the autotune).
+  S.p_qkv.init  (S.lt, HIDDEN,            QKV_OUT_RANK,             MP, S.xq_hidden, S.Wqkv,  S.d_qkv,   S.stream, ge0, ge1);
+  S.p_oproj.init(S.lt, Q_DIM_RANK,        HIDDEN,                   MP, S.xq_qdim,   S.Wo,    S.d_oproj, S.stream, ge0, ge1);
+  S.p_gate.init (S.lt, HIDDEN,            N_EXPERTS,                MP, S.xq_hidden, S.Wgate, S.d_gate,  S.stream, ge0, ge1);
+  S.p_k5gu.init (S.lt, HIDDEN,            2*MOE_INTER_RANK,         MP, S.xq_hidden, S.Wgu_phys_h[0], S.d_k5gu, S.stream, ge0, ge1);
+  S.p_k5d.init  (S.lt, MOE_INTER_RANK,    HIDDEN,                   MP, S.xq_a,      S.Wd_phys_h[0],  S.d_k5d,  S.stream, ge0, ge1);
+  S.p_lm.init   (S.lt, HIDDEN,            S.v_rows,                 MP, S.xq_hidden, S.Wlm,   S.d_lm,    S.stream, ge0, ge1);
+  // PACKED gate+up: concatenate the 8 physical shards into one [TOP_K*2*192, HIDDEN] buffer so K5a is
+  // a SINGLE grouped GEMM.  Fixed slot s -> physical shard s for the proxy/graphed path (graph-safe).
+  const size_t gu_shard_n = (size_t)2 * MOE_INTER_RANK * HIDDEN;
+  CK(cudaMalloc(&S.Wgu_pack, (size_t)TOP_K * gu_shard_n * sizeof(fp8)));
+  for (int slot = 0; slot < TOP_K; ++slot)
+    CK(cudaMemcpy(S.Wgu_pack + (size_t)slot * gu_shard_n, S.Wgu_phys_h[slot],
+                  gu_shard_n * sizeof(fp8), cudaMemcpyDeviceToDevice));
+  S.p_k5gu_pack.init(S.lt, HIDDEN, TOP_K*2*MOE_INTER_RANK, MP, S.xq_hidden, S.Wgu_pack, S.d_k5gu, S.stream, ge0, ge1);
+  // PACKED down (for the flatness floor only): 8 down shards [HIDDEN,192] concatenated -> ONE GEMM
+  // [K=192, N=TOP_K*HIDDEN].  (The engine runs down as the fast GEMV; this panel measures the
+  // achievable single-GEMM grouped-down floor that matches the validated spec_decode_loop reference.)
+  const size_t d_shard_n = (size_t)HIDDEN * MOE_INTER_RANK;
+  CK(cudaMalloc(&S.Wd_pack, (size_t)TOP_K * d_shard_n * sizeof(fp8)));
+  for (int slot = 0; slot < TOP_K; ++slot)
+    CK(cudaMemcpy(S.Wd_pack + (size_t)slot * d_shard_n, S.Wd_phys_h[slot],
+                  d_shard_n * sizeof(fp8), cudaMemcpyDeviceToDevice));
+  S.p_k5d_pack.init(S.lt, MOE_INTER_RANK, TOP_K*HIDDEN, MP, S.xq_a, S.Wd_pack, S.d_k5d, S.stream, ge0, ge1);
+  if (!(S.p_qkv.haveAlgo && S.p_oproj.haveAlgo && S.p_gate.haveAlgo &&
+        S.p_k5gu.haveAlgo && S.p_k5d.haveAlgo && S.p_lm.haveAlgo &&
+        S.p_k5gu_pack.haveAlgo && S.p_k5d_pack.haveAlgo)) {
+    printf("rank %d: cuBLASLt fp8 GEMM autotune FAILED for at least one panel.\n", S.rank);
+    exit(3);
+  }
+  CK(cudaEventDestroy(ge0)); CK(cudaEventDestroy(ge1));
+#endif
+
   CK(cudaDeviceSynchronize());
 }
 
@@ -1312,12 +1817,35 @@ static void sharded_one_layer_capture(std::vector<RankState>& R,
     float* h_src = S.h_a;          // fresh input (filled in alloc_rank, never mutated before this)
     float* h_dst = S.h_b;
 
+#if USE_GEMM
+    // ---- GEMM path (the thing being validated): cuBLASLt fp8 K1/K3/K4/K5/lmhead vs the reference ----
+    gemm_k1_launch(S, h_src, s);
+    tp8_k2_launch(S, s);
+    CK(cudaMemsetAsync(S.attn_partial, 0, HIDDEN * sizeof(float), s));
+    gemm_k3_launch(S, s);
+    ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);                  // AR#1 (NVLS or NCCL)
+    tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_reduced, h_dst);   // r1 = h_src + AR(O-proj)
+    if (S.rank == 0) CK(cudaMemcpyAsync(r1_out_host, h_dst, HIDDEN * sizeof(float),
+                                        cudaMemcpyDeviceToHost, s));
+    gemm_k4_launch(S, h_dst, s);                                          // GEMM gate -> sel_idx/sel_w
+    // resolve the REAL routed expert -> physical shard map host-side (eager path: D2H is OK here).
+    CK(cudaMemcpyAsync(S.sel_h, S.sel_idx, TOP_K * sizeof(int), cudaMemcpyDeviceToHost, s));
+    CK(cudaStreamSynchronize(s));
+    int sel_phys[TOP_K]; for (int i = 0; i < TOP_K; ++i) sel_phys[i] = ((S.sel_h[i] % TOP_K) + TOP_K) % TOP_K;
+    CK(cudaMemsetAsync(S.moe_partial, 0, HIDDEN * sizeof(float), s));
+    gemm_k5_pack_gateup(S, sel_phys, s);                                  // re-pack the ROUTED shards
+    gemm_k5_launch(S, h_dst, sel_phys, s);                                // grouped fp8 gate+up GEMM + GEMV down
+    ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);                    // AR#2 (NVLS or NCCL)
+    tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_reduced, h_dst);    // r2 = r1 + AR(MoE)
+    if (S.rank == 0) CK(cudaMemcpyAsync(r2_out_host, h_dst, HIDDEN * sizeof(float),
+                                        cudaMemcpyDeviceToHost, s));
+#else
     tp8_k1_launch(S, h_src, s);
     tp8_k2_launch(S, s);
     CK(cudaMemsetAsync(S.attn_partial, 0, HIDDEN * sizeof(float), s));
     tp8_k3_launch(S, s);
     ar_sum_hidden(S, S.attn_partial, NVLS_OFF_ATTN, s);                  // AR#1 (NVLS or NCCL)
-    tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_partial, h_dst);   // r1 = h_src + AR(O-proj)
+    tp8_residual_add<<<32, 256, 0, s>>>(h_src, S.attn_reduced, h_dst);   // r1 = h_src + AR(O-proj)
     if (S.rank == 0) CK(cudaMemcpyAsync(r1_out_host, h_dst, HIDDEN * sizeof(float),
                                         cudaMemcpyDeviceToHost, s));
     // NEW fast router (split-K gate GEMV + select) — validated here against the reference's stock
@@ -1329,9 +1857,10 @@ static void sharded_one_layer_capture(std::vector<RankState>& R,
     tp8_k5b_down<<<S.k5.ctasB, S.k5.block, S.k5.smemB, s>>>(
         S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.moe_partial, TOP_K);
     ar_sum_hidden(S, S.moe_partial, NVLS_OFF_MOE, s);                    // AR#2 (NVLS or NCCL)
-    tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_partial, h_dst);    // r2 = r1 + AR(MoE)
+    tp8_residual_add<<<32, 256, 0, s>>>(h_dst, S.moe_reduced, h_dst);    // r2 = r1 + AR(MoE)
     if (S.rank == 0) CK(cudaMemcpyAsync(r2_out_host, h_dst, HIDDEN * sizeof(float),
                                         cudaMemcpyDeviceToHost, s));
+#endif
   });  // each thread syncs its own stream before joining
 }
 
@@ -1574,11 +2103,23 @@ static int run_correctness_check(std::vector<RankState>& R) {
   const double d1 = maxabsdiff(ref_r1, shd_r1);
   const double d2 = maxabsdiff(ref_r2, shd_r2);
   const double s1 = maxabs(ref_r1), s2 = maxabs(ref_r2);
+#if USE_GEMM
+  // The GEMM path ALSO quantizes the ACTIVATION to fp8 e4m3 (the reference GEMV keeps fp32
+  // activations), so the delta carries the inherent e4m3 activation-rounding (~3 mantissa bits)
+  // ON TOP of the all-reduce stitch this gate checks.  We use the precision-appropriate fp8 tol
+  // (the same 8e-2 spec_verify_forward_gemm.cu gated fp8 on); the GEMM/wgmma is bit-exact, the gap
+  // is fp8 quant the SHIP model already carries.  The structural invariants (shard layout, AR-SUM,
+  // residual-once) are still validated to that tolerance — a wrong layout fails by O(1), not O(1e-2).
+  const double TOL = 8e-2;
+  const char* tol_note = " [fp8 e4m3 activation+weight quant tol; GEMM is bit-exact wgmma]";
+#else
   const double TOL = 1e-2;
+  const char* tol_note = "";
+#endif
   printf("  post-attention residual : max|ref-shd| = %.3e   (ref max|.| = %.3e)\n", d1, s1);
   printf("  post-MoE        residual : max|ref-shd| = %.3e   (ref max|.| = %.3e)\n", d2, s2);
   const bool pass = (d1 < TOL) && (d2 < TOL);
-  printf("  TOL=%.0e  ->  %s\n", TOL, pass ? "PASS" : "FAIL");
+  printf("  TOL=%.0e%s  ->  %s\n", TOL, tol_note, pass ? "PASS" : "FAIL");
   if (!pass) {
     printf("  CORRECTNESS FAILED: the sharded TP=8 layer does not match the full reference.\n");
     return 1;
@@ -1636,18 +2177,32 @@ static void profile_per_kernel(RankState& S, int PEAK_unused) {
   };
 
   printf("\n== PER-KERNEL PROFILE (rank 0, %d reps/kernel, per-token = us/launch x launches/token) ==\n", REPS);
-  // ---- attention ----
-  timeit("K1 qkv_gemv", N_LAYERS, [&]{ tp8_k1_qkv_gemv<<<ctasA, blockA, k1_smem, s>>>(
+#if USE_GEMM
+  printf("   (USE_GEMM=1: the dense GEMV rows below are EXCLUDED from the SUM — kept as the baseline\n");
+  printf("    reference; the cuBLASLt fp8 GEMM rows are what the engine runs and ARE in the SUM.)\n");
+#endif
+  // ---- attention ----  (dense GEMV rows: in-sum only when USE_GEMM=0; else baseline reference)
+  const bool gemv_in_sum = !USE_GEMM;
+  timeit_x("K1 qkv_gemv", N_LAYERS, gemv_in_sum, [&]{ tp8_k1_qkv_gemv<<<ctasA, blockA, k1_smem, s>>>(
       S.h_a, S.w_in_norm, S.Wqkv, S.Wqkv_scale, S.qkv_proj); });
   timeit("K1 epilogue", N_LAYERS, [&]{ tp8_k1_epilogue<<<1, 256, 0, s>>>(
       S.qkv_proj, S.q_norm, S.k_norm, S.rope_cos, S.rope_sin, S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale); });
-  timeit("K2 partial (flash-decode)", N_LAYERS, [&]{ tp8_k2_partial<<<k2gP, k2_block, 0, s>>>(
+  // K2 OLD 2-kernel path (partial+reduce): in-sum only when the fused path is OFF; else baseline ref.
+  const bool k2old_in_sum = !USE_K2_FUSED;
+  timeit_x("K2 partial OLD (flash-decode)", N_LAYERS, k2old_in_sum, [&]{ tp8_k2_partial<<<k2gP, k2_block, 0, s>>>(
       S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale, S.ctx_len, S.n_splits, S.rank, S.part_m, S.part_l, S.part_acc); });
-  const int k2r_w = K2R_WARPS, k2r_block = k2r_w * 32;
+  const int k2r_w = S.k2r_warps, k2r_block = k2r_w * 32;
   const size_t k2r_smem = (size_t)(2 * k2r_w + k2r_w * HEAD_DIM) * sizeof(float);
-  timeit("K2 reduce", N_LAYERS, [&]{ tp8_k2_reduce<<<Q_HEADS_RANK, k2r_block, k2r_smem, s>>>(
+  timeit_x("K2 reduce OLD", N_LAYERS, k2old_in_sum, [&]{ tp8_k2_reduce<<<Q_HEADS_RANK, k2r_block, k2r_smem, s>>>(
       S.part_m, S.part_l, S.part_acc, S.n_splits, S.attn_out); });
-  timeit("K3 oproj", N_LAYERS, [&]{ tp8_k3_oproj<<<k3_ctas, k3_block, k3_smem, s>>>(
+  // K2 FUSED (Fix B): single launch, partials on-chip — the engine's actual K2 when USE_K2_FUSED=1.
+  {
+    const int k2f_w = tp8_k2f_warps(S.ctx_len), k2f_block = k2f_w * 32;
+    const size_t k2f_smem = (size_t)(2 * k2f_w + k2f_w * HEAD_DIM) * sizeof(float);
+    timeit_x("K2 FUSED (Fix B, in-sum)", N_LAYERS, (bool)USE_K2_FUSED, [&]{ tp8_k2_fused<<<Q_HEADS_RANK, k2f_block, k2f_smem, s>>>(
+        S.out_q, S.kv_k, S.kv_v, S.kv_k_scale, S.kv_v_scale, S.ctx_len, S.rank, S.attn_out); });
+  }
+  timeit_x("K3 oproj", N_LAYERS, gemv_in_sum, [&]{ tp8_k3_oproj<<<k3_ctas, k3_block, k3_smem, s>>>(
       S.attn_out, S.Wo, S.Wo_scale, S.attn_partial); });
   // ---- MoE ----
   // OLD single-CTA router (the measured bottleneck) — timed for the before->after record (NOT in sum).
@@ -1657,24 +2212,48 @@ static void profile_per_kernel(RankState& S, int PEAK_unused) {
   {
     const int k4_block = 128, k4_warps = k4_block >> 5;
     const int k4_ctas = (N_EXPERTS * TP8_K4_KSPLIT + k4_warps - 1) / k4_warps;
-    timeit("K4 gate_gemv NEW", N_LAYERS, [&]{
+    timeit_x("K4 gate_gemv NEW", N_LAYERS, gemv_in_sum, [&]{
       CK(cudaMemsetAsync(S.g_logits, 0, N_EXPERTS * sizeof(float), s));
       tp8_k4_gate_gemv<<<k4_ctas, k4_block, k4_smem, s>>>(S.h_a, S.w_post_norm, S.Wgate, S.g_logits); });
     timeit("K4 select NEW", N_LAYERS, [&]{ tp8_k4_select<<<1, 32, 0, s>>>(
       S.g_logits, S.Wgate_scale, S.sel_idx, S.sel_w); });
   }
-  timeit("K5a gateup", N_LAYERS, [&]{ tp8_k5a_gateup<<<S.k5.ctasA, S.k5.block, S.k5.smemA, s>>>(
+  timeit_x("K5a gateup", N_LAYERS, gemv_in_sum, [&]{ tp8_k5a_gateup<<<S.k5.ctasA, S.k5.block, S.k5.smemA, s>>>(
       S.h_a, S.sel_idx, S.Wgu_d, S.Wgu_scale_d, S.a_glb, TOP_K); });
-  timeit("K5b down", N_LAYERS, [&]{ tp8_k5b_down<<<S.k5.ctasB, S.k5.block, S.k5.smemB, s>>>(
+  timeit_x("K5b down", N_LAYERS, gemv_in_sum, [&]{ tp8_k5b_down<<<S.k5.ctasB, S.k5.block, S.k5.smemB, s>>>(
       S.sel_idx, S.sel_w, S.Wd_d, S.Wd_scale_d, S.a_glb, S.moe_partial, TOP_K); });
   // ---- residual adds (2 per layer) + head ----
   timeit("residual_add (x2/layer)", 2 * N_LAYERS, [&]{ tp8_residual_add<<<32, 256, 0, s>>>(
       S.h_a, S.attn_partial, S.h_b); });
   timeit("final_norm", 1, [&]{ tp8_final_norm<<<1, 256, 0, s>>>(S.h_a, S.w_final_norm, S.hn); });
-  timeit("lmhead_argmax_partial", 1, [&]{ tp8_lmhead_argmax_partial<<<S.lm_blocks, 256, lm_smem, s>>>(
+  timeit_x("lmhead_argmax_partial", 1, gemv_in_sum, [&]{ tp8_lmhead_argmax_partial<<<S.lm_blocks, 256, lm_smem, s>>>(
       S.hn, S.Wlm, S.Wlm_scale, S.v_rows, S.v_off, S.block_max, S.block_arg); });
   timeit("argmax_final", 1, [&]{ tp8_argmax_final<<<1, 32, 0, s>>>(
       S.block_max, S.block_arg, S.lm_blocks, S.rank_max, S.rank_arg); });
+
+#if USE_GEMM
+  // =============================================================================================
+  // cuBLASLt fp8 GEMM forward rows — the ENGINE PATH (these ARE in the SUM).  Each row times the
+  // full launch sequence the engine runs (quant + GEMM + scale epilogue), so the SUM is the true
+  // per-rank GEMM forward us/token.  K5 grouped = 8 gate+up GEMMs + 8 down GEMMs + their quants.
+  // =============================================================================================
+  const int MP = S.p_qkv.Mpad;
+  const size_t qsmem = (size_t)HIDDEN * sizeof(float);
+  timeit("GEMM K1 qkv (q+gemm+epi)", N_LAYERS, [&]{
+    gemm_rmsnorm_quant<<<1,1024,qsmem,s>>>(S.h_a, S.w_in_norm, S.xq_hidden, S.act_scale, HIDDEN);
+    S.p_qkv.run(S.xq_hidden, S.Wqkv, S.d_qkv, s);
+    gemm_epi_scale<<<32,256,0,s>>>(S.d_qkv, S.Wqkv_scale, S.act_scale, S.qkv_proj, QKV_OUT_RANK, MP); });
+  timeit("GEMM K3 oproj (q+gemm+epi)", N_LAYERS, [&]{
+    gemm_quant<<<1,256,0,s>>>(S.attn_out, S.xq_qdim, S.act_scale, Q_DIM_RANK);
+    S.p_oproj.run(S.xq_qdim, S.Wo, S.d_oproj, s);
+    gemm_epi_scale<<<32,256,0,s>>>(S.d_oproj, S.Wo_scale, S.act_scale, S.attn_partial, HIDDEN, MP); });
+  timeit("GEMM K4 gate (q+gemm+epi)", N_LAYERS, [&]{
+    gemm_rmsnorm_quant<<<1,1024,qsmem,s>>>(S.h_a, S.w_post_norm, S.xq_hidden, S.act_scale, HIDDEN);
+    S.p_gate.run(S.xq_hidden, S.Wgate, S.d_gate, s);
+    gemm_epi_gate<<<1,128,0,s>>>(S.d_gate, S.act_scale, S.g_logits, N_EXPERTS, MP); });
+  timeit("GEMM K5 gateup(1 GEMM)+down GEMV", N_LAYERS, [&]{ gemm_k5_launch(S, S.h_a, K5_SEL_PHYS_FIXED, s); });
+  timeit("GEMM lm_head (q+gemm+epi)", 1, [&]{ gemm_lmhead_launch(S, S.hn, s); });
+#endif
 
   double total = 0.0; for (auto& r : rows) if (r.in_sum) total += r.per_tok;
   // sort descending by per-token contribution.
@@ -1684,6 +2263,40 @@ static void profile_per_kernel(RankState& S, int PEAK_unused) {
     printf("  %-28s %10.3f %8d %12.2f %7.1f%%%s\n", r.name, r.us_per, r.count, r.per_tok,
            r.in_sum ? 100.0*r.per_tok/total : 0.0, r.in_sum ? "" : "  (excl from sum)");
   printf("  %-28s %10s %8s %12.2f %7.1f%%\n", "SUM (kernels-only/token)", "", "", total, 100.0);
+
+#if USE_GEMM
+  // =============================================================================================
+  // GEMM FORWARD T(M) FLATNESS TABLE — sum the GEMM-able panels (x N_LAYERS, + lm_head) timed at
+  // M = 1,4,8,16.  fp8 always runs the 16-wide tile so T(M)~=T(1) (the spec-verify property): a
+  // ~1.0 ratio proves verify(M) costs ~one decode-forward (M=8 verify == M=1 decode).
+  // =============================================================================================
+  {
+    const int Ms[] = {1,4,8,16}; const int NM = 4;
+    const int FW = 10, FIT = 50;
+    double fwd_us[NM]; for (int i=0;i<NM;i++) fwd_us[i]=0.0;
+    for (int mi=0; mi<NM; ++mi) {
+      double per_layer = 0.0;
+      per_layer += S.p_qkv.time_at_M (Ms[mi], S.xq_hidden, S.Wqkv,           S.d_qkv,   s, e0, e1, FW, FIT);
+      per_layer += S.p_oproj.time_at_M(Ms[mi], S.xq_qdim,   S.Wo,            S.d_oproj, s, e0, e1, FW, FIT);
+      per_layer += S.p_gate.time_at_M (Ms[mi], S.xq_hidden, S.Wgate,         S.d_gate,  s, e0, e1, FW, FIT);
+      // K5: ONE packed gate+up GEMM + ONE packed down GEMM (the achievable grouped-MoE floor, matching
+      // the validated spec_decode_loop reference; both GEMMs for the FLATNESS property).
+      per_layer += S.p_k5gu_pack.time_at_M(Ms[mi], S.xq_hidden, S.Wgu_pack, S.d_k5gu, s, e0, e1, FW, FIT);
+      per_layer += S.p_k5d_pack.time_at_M (Ms[mi], S.xq_a,      S.Wd_pack,  S.d_k5d,  s, e0, e1, FW, FIT);
+      double lm = S.p_lm.time_at_M(Ms[mi], S.xq_hidden, S.Wlm, S.d_lm, s, e0, e1, FW, FIT);
+      fwd_us[mi] = per_layer * N_LAYERS + lm;
+    }
+    printf("\n== GEMM forward T(M) FLATNESS (cuBLASLt fp8, GEMM panels x %d layers + lm_head) ==\n", N_LAYERS);
+    printf("  %-6s %14s %12s %14s\n", "M", "us/forward", "tok/s", "ratio vs M=1");
+    for (int mi=0; mi<NM; ++mi)
+      printf("  M=%-4d %14.1f %12.1f %14.3f\n", Ms[mi], fwd_us[mi], 1e6/fwd_us[mi], fwd_us[mi]/fwd_us[0]);
+    printf("  FLAT => verify(M) ~= decode(1): T(16)/T(1) = %.3f.  GEMM single-forward (M=1) = %.0f tok/s;\n",
+           fwd_us[NM-1]/fwd_us[0], 1e6/fwd_us[0]);
+    printf("  M=8 verify-forward = %.0f tok/s (8 candidates at ~the M=1 wall).  (GEMM-only; +K2 attn in SUM.)\n",
+           1e6/fwd_us[2]);
+  }
+#endif
+
   CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
 }
 

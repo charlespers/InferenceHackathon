@@ -46,14 +46,21 @@
 // --------------------------------------------------------------------------------------------------
 struct NvlsCtx {
   int    rank = 0, dev = 0, npes = 8;
-  // AR data buffer #1 (post-attention O-proj partial) and #2 (post-MoE-down partial).  We pack BOTH
-  // into one MC allocation laid out [attn HIDDEN | moe HIDDEN] so a single multicast object covers both.
-  float* uc = nullptr;          // unicast base: uc[0..HIDDEN)=attn, uc[HIDDEN..2H)=moe  (this rank's view)
+  // OUT-OF-PLACE AR layout (the comms win): the MC allocation packs FOUR [HIDDEN] regions —
+  //   [attn_IN | moe_IN | attn_OUT | moe_OUT]  (4*HIDDEN floats).
+  // The kernels (K3 / K5b) write their partial into the IN halves (uc[0..HIDDEN)=attn_IN,
+  // uc[HIDDEN..2H)=moe_IN); the AR does multimem.ld_reduce FROM IN and multimem.st TO a SEPARATE OUT
+  // half (uc[2H..3H)=attn_OUT, uc[3H..4H)=moe_OUT).  Because the reduce-READ and the broadcast-WRITE
+  // hit DISTINCT buffers, the in-place WAR hazard (a fast rank's st clobbering an input a slow rank's
+  // ld_reduce hasn't read yet) vanishes -> the mid-collective WAR barrier is GONE, leaving only the
+  // entry RAW barrier + a single post-read "inputs consumed" barrier (so IN can be reused next layer).
+  // The consumer (residual-add) reads the OUT half (S.attn_partial/S.moe_partial repointed to it).
+  float* uc = nullptr;          // unicast base (this rank's view of all 4 regions)
   float* mc = nullptr;          // multicast base (same layout) — multimem ops reduce across all ranks
-  // arrival barrier (separate small MC allocation): THREE independent ring-counter arrays — phase-1
-  // (before the reduce-read), phase-2 (between read and store: the in-place WAR-hazard guard), phase-3
-  // (after the store) — each NVLS_BAR_SLOTS deep; multimem.red adds 1/arrival.  bar_uc/bar_mc point at
-  // the base; phase-k counters live at +k*NVLS_BAR_SLOTS.
+  // arrival barrier (separate small MC allocation): TWO independent ring-counter arrays — phase-1
+  // (before the reduce-read: all partials in IN visible, RAW) and phase-2 (after the read: all
+  // ld_reduce done before IN is reused next collective).  Out-of-place dropped the old 3rd (WAR) array.
+  // Each NVLS_BAR_SLOTS deep; multimem.red adds 1/arrival.  Phase-k counters live at +k*NVLS_BAR_SLOTS.
   unsigned* bar_uc = nullptr;   // this rank's local view of the barrier counters
   unsigned* bar_mc = nullptr;   // multicast view (multimem.red broadcasts the +1 into every rank's copy)
   // Per-rank DEVICE generation counter (plain per-rank memory, NOT multicast).  The kernel reads+++ it
@@ -107,24 +114,24 @@ __device__ __forceinline__ void nvls_barrier(unsigned* bar_mc, unsigned* bar_uc,
   __syncthreads();
 }
 
-// One-shot fp32 multimem all-reduce of the [n]-float region at MC offset `elt_off`.  SINGLE BLOCK of
-// 1024 threads -> 1024*4 = 4096 = HIDDEN elements covered in one wave (no cross-block gen ambiguity).
-// Device-side generation counter (gen_ctr, per-rank private) makes the barrier REPLAY-SAFE in a CUDA
-// graph: it advances on the device each call, so host enqueue order is irrelevant.
+// One-shot OUT-OF-PLACE fp32 multimem all-reduce.  SINGLE BLOCK of 1024 threads -> 1024*4 = 4096 =
+// HIDDEN elements in one wave (no cross-block gen ambiguity).  Device-side generation counter (gen_ctr,
+// per-rank private) makes the barrier REPLAY-SAFE in a CUDA graph: it advances on the device each call,
+// so host enqueue order is irrelevant.
 //
-// THREE independent barrier arrays — the in-place ld_reduce/st hazard fix.  A multimem.ld_reduce reads
-// EVERY rank's bound buffer through the switch and multimem.st OVERWRITES every rank's buffer.  With all
-// 8 ranks running concurrently and only a pre- and post-barrier, a fast rank's `st` (writing the SUM
-// back) clobbers a buffer that a slow rank's `ld_reduce` has not yet read -> that slow read sums the
-// already-summed values (e.g. 8x36) and re-broadcasts garbage; cascaded across the 188 collectives this
-// produced the intermittent over-/under-counts (the 1e-2..1e-1 errors, and >>1 blowups under stress).
-// The fix is a barrier BETWEEN the reduce-read and the store-write so ALL reads complete before ANY
-// write.  Three ring-counter arrays (each NVLS_BAR_SLOTS deep), one per phase:
-//   phase-1 bar[0*SLOTS .. 1*SLOTS): all partials written+visible  before any ld_reduce  (RAW).
-//   phase-2 bar[1*SLOTS .. 2*SLOTS): all ld_reduce reads done      before any st         (WAR — the fix).
-//   phase-3 bar[2*SLOTS .. 3*SLOTS): all st writes visible         before buffer reuse   (WAW/next-RAW).
+// OUT-OF-PLACE => only TWO barriers (the comms win).  In-place ld_reduce+st needed three barriers
+// because multimem.st OVERWRITES the very buffer multimem.ld_reduce reads, so a fast rank's store could
+// clobber an input a slow rank hadn't read yet (WAR) -> a mandatory mid-collective barrier between read
+// and write.  Reading from IN and storing to a SEPARATE OUT buffer removes that WAR entirely; the store
+// can fly immediately after the read with no barrier between them.  Remaining hazards:
+//   phase-1 bar[0*SLOTS .. 1*SLOTS): all partials written+visible in IN  before any ld_reduce  (RAW).
+//   phase-2 bar[1*SLOTS .. 2*SLOTS): all ld_reduce reads of IN done      before IN is reused    (next
+//     layer's K3/K5b writes the same IN region; this guards that cross-collective WAR on IN).  The st
+//     to OUT is issued BEFORE this barrier so it overlaps the barrier latency.
+// Each rank's local consumer (residual-add) reads its OUT half AFTER this kernel returns on its own
+// stream — same-stream ordering, no cross-rank barrier needed for the consume.
 __global__ void __launch_bounds__(1024) nvls_allreduce_f32_kernel(
-    float* __restrict__ mc, int elt_off, int n,
+    float* __restrict__ mc, int in_off, int out_off, int n,
     unsigned* bar_mc, unsigned* bar_uc, unsigned* gen_ctr, int npes) {
   // single block -> thread 0 reads+bumps the private gen counter; the value is this collective's gen.
   __shared__ unsigned s_gen;
@@ -132,35 +139,30 @@ __global__ void __launch_bounds__(1024) nvls_allreduce_f32_kernel(
   __syncthreads();
   const unsigned gen_in = s_gen;
 
-  // Make THIS rank's partial (written by the prior K3 / K5b kernel into the MC-bound pages) visible
+  // Make THIS rank's partial (written by the prior K3 / K5b kernel into the MC-bound IN pages) visible
   // system-wide BEFORE we signal arrival, so a peer's multimem.ld_reduce reads the final value.
   __threadfence_system();
-  // Phase 1: every rank's partial is now resident + visible in MC-bound memory (RAW guard).
+  // Phase 1: every rank's partial is now resident + visible in MC-bound IN memory (RAW guard).
   nvls_barrier(bar_mc + 0 * NVLS_BAR_SLOTS, bar_uc + 0 * NVLS_BAR_SLOTS, gen_in, npes);
 
-  // In-switch reduce: read+sum 4 floats (128-bit) from ALL ranks via the switch into registers.  We
-  // SPLIT the read from the write: every rank must finish reading before any rank overwrites (phase 2).
-  float* base = mc + elt_off;
+  // In-switch reduce: read+sum 4 floats (128-bit) from ALL ranks' IN via the switch into registers,
+  // then broadcast the SUM to every rank's OUT buffer.  IN != OUT -> no WAR between the read and write.
+  float* in_base  = mc + in_off;
+  float* out_base = mc + out_off;
   const int i = threadIdx.x * 4;
   uint32_t a = 0, b = 0, c = 0, d = 0;
   const bool active = (i < n);
   if (active) {
     asm volatile("multimem.ld_reduce.global.add.v4.f32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(base + i));
-  }
-  __threadfence_system();   // our reads are complete + ordered before we signal phase-2 arrival.
-  // Phase 2: ALL ranks finished ld_reduce (read every input) before ANY rank's st clobbers it (WAR).
-  nvls_barrier(bar_mc + 1 * NVLS_BAR_SLOTS, bar_uc + 1 * NVLS_BAR_SLOTS, gen_in, npes);
-
-  // Broadcast the reduced result back to every rank's buffer (now safe — all reads are done).
-  if (active) {
+                 : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(in_base + i));
+    // store immediately to the SEPARATE OUT buffer (safe — never aliases any rank's IN).
     asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};"
-                 :: "l"(base + i), "r"(a), "r"(b), "r"(c), "r"(d) : "memory");
+                 :: "l"(out_base + i), "r"(a), "r"(b), "r"(c), "r"(d) : "memory");
   }
-  __threadfence_system();   // our st is globally visible before we signal phase-3 arrival.
-
-  // Phase 3: all ranks issued their st (result complete everywhere) before anyone reuses the buffer.
-  nvls_barrier(bar_mc + 2 * NVLS_BAR_SLOTS, bar_uc + 2 * NVLS_BAR_SLOTS, gen_in, npes);
+  __threadfence_system();   // our IN reads (and OUT store) are complete before we signal phase-2.
+  // Phase 2: ALL ranks finished reading IN before the next collective reuses (overwrites) this IN
+  // region.  (The OUT store flew before this barrier and overlaps its latency.)
+  nvls_barrier(bar_mc + 1 * NVLS_BAR_SLOTS, bar_uc + 1 * NVLS_BAR_SLOTS, gen_in, npes);
 }
 
 // --------------------------------------------------------------------------------------------------
@@ -169,9 +171,10 @@ __global__ void __launch_bounds__(1024) nvls_allreduce_f32_kernel(
 // caller can fall back to NCCL.  Must be called from the main thread BEFORE the per-rank threads run.
 // --------------------------------------------------------------------------------------------------
 static bool nvls_engine_setup(std::vector<NvlsCtx>& ctx, int npes) {
-  const size_t data_floats = (size_t)2 * NVLS_HIDDEN;          // attn[HIDDEN] + moe[HIDDEN]
+  // OUT-OF-PLACE: pack [attn_IN | moe_IN | attn_OUT | moe_OUT] = 4*HIDDEN floats in one MC object.
+  const size_t data_floats = (size_t)4 * NVLS_HIDDEN;          // attn_IN+moe_IN+attn_OUT+moe_OUT
   const size_t data_bytes  = data_floats * sizeof(float);
-  const size_t bar_bytes   = (size_t)3 * NVLS_BAR_SLOTS * sizeof(unsigned);   // phase-1/2/3 ring arrays
+  const size_t bar_bytes   = (size_t)2 * NVLS_BAR_SLOTS * sizeof(unsigned);   // phase-1 (RAW) + phase-2 (read-done)
 
   if (cuInit(0) != CUDA_SUCCESS) { printf("NVLS: cuInit failed\n"); return false; }
 
@@ -264,15 +267,25 @@ static bool nvls_engine_setup(std::vector<NvlsCtx>& ctx, int npes) {
   return true;
 }
 
-// MC-offset helpers (which half of the packed data buffer).
+// MC-offset helpers.  INPUT halves (kernels write partials here; AR ld_reduces from here):
 static constexpr int NVLS_OFF_ATTN = 0;
 static constexpr int NVLS_OFF_MOE  = NVLS_HIDDEN;
+// OUTPUT halves (AR multimem.st broadcasts the reduced result here; residual-add reads here).  Out-of-
+// place: the OUT region is a SEPARATE buffer 2*HIDDEN past IN, so the reduce-read and the store-write
+// hit distinct memory and the in-collective WAR hazard disappears (no mid-collective barrier needed).
+static constexpr int NVLS_OUT_BASE = 2 * NVLS_HIDDEN;
+static constexpr int NVLS_OFF_ATTN_OUT = NVLS_OUT_BASE + 0;
+static constexpr int NVLS_OFF_MOE_OUT  = NVLS_OUT_BASE + NVLS_HIDDEN;
+// Map an IN offset to its matching OUT offset (used by the launch + the engine's residual-add repoint).
+static __host__ __device__ __forceinline__ int nvls_out_off(int in_off) { return in_off + NVLS_OUT_BASE; }
 
-// Launch the NVLS all-reduce of one [HIDDEN] region on this rank's stream (concurrent across ranks).
-//   elt_off = NVLS_OFF_ATTN or NVLS_OFF_MOE.  The generation advances DEVICE-SIDE (gen_ctr) so this is
-//   stream-capturable / replay-safe.  SINGLE block of HIDDEN/4 = 1024 threads covers the whole [HIDDEN].
-static inline void nvls_allreduce_launch(NvlsCtx& c, int elt_off, cudaStream_t s) {
+// Launch the OUT-OF-PLACE NVLS all-reduce of one [HIDDEN] region on this rank's stream (concurrent
+// across ranks).  in_off = NVLS_OFF_ATTN or NVLS_OFF_MOE (where the kernels wrote the partial); the
+// result is broadcast to nvls_out_off(in_off) (NVLS_OFF_*_OUT), which the residual-add consumes.  The
+// generation advances DEVICE-SIDE (gen_ctr) so this is stream-capturable / replay-safe.  SINGLE block
+// of HIDDEN/4 = 1024 threads covers the whole [HIDDEN].
+static inline void nvls_allreduce_launch(NvlsCtx& c, int in_off, cudaStream_t s) {
   const int threads = NVLS_HIDDEN / 4;     // 1024 threads, 4 floats each -> [HIDDEN] in one block
   nvls_allreduce_f32_kernel<<<1, threads, 0, s>>>(
-      c.mc, elt_off, NVLS_HIDDEN, c.bar_mc, c.bar_uc, c.gen_ctr, c.npes);
+      c.mc, in_off, nvls_out_off(in_off), NVLS_HIDDEN, c.bar_mc, c.bar_uc, c.gen_ctr, c.npes);
 }

@@ -9,6 +9,7 @@ pub mod route_aware;
 pub mod route_aware_drafter;
 pub mod telemetry;
 pub mod tree;
+pub mod tree_shape;
 pub mod types;
 
 pub use adaptive_verify::{adaptive_verify_depth, emitted, expected_accepted, verify_cost, VerifyPlan};
@@ -21,4 +22,5 @@ pub use route_aware::{Candidate, ExpertUnion, RouteAwarePolicy};
 pub use route_aware_drafter::{CandidateSource, RouteAwareDrafter};
 pub use telemetry::{SpecTelemetry, TelemetrySnapshot};
 pub use tree::{accept_tree, SpecTree};
+pub use tree_shape::{level_advance_prob, tree_expected_accepted, tree_nodes, TreeCostModel, TreeShape};
 pub use types::{AcceptedRun, DraftProposal, DraftTree, RngCore, TargetLogits, TokenId};

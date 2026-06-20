@@ -1,0 +1,92 @@
+TC ATTENTION FLATNESS PROBE (cuBLAS fp16 TC, QK^T + P.V as GEMMs over 64 heads) — 2026-06-20 ~20:05 UTC
+H100 80GB, idle box + lock free, model-free. Softmax omitted (cheap/flat); H independent K/V (ratio clean).
+
+ctx=4096:  M=1 55.32us  M=4 71.48 (1.29x)  M=8 56.70 (1.03x)  M=16 58.87 (1.06x)   us/q: 55->18->7->3.7
+ctx=8192:  M=1 99.12us  M=4 128.78(1.30x)  M=8 104.38(1.05x)  M=16 108.39(1.09x)   us/q: 99->32->13->6.8
+ctx=2048:  M=1 32.99us  M=4 41.14 (1.25x)  M=8 32.35 (0.98x)  M=16 32.84 (1.00x)   us/q: 33->10->4->2.0
+
+VERDICT: TC attention is FLAT in M (M=8/M=1 ~= 1.0) vs warp-shuffle K2's ~4.0x. The M-scaling is a
+warp-shuffle/CUDA-core artifact, NOT fundamental. (M=4 ~1.3x = a cuBLAS tile-pick blip at the odd size,
+not scaling — M=8/16 align to MMA tiles and are flat.)
+
+--- FULL TC attention incl. SOFTMAX (tc_attn_full.cu/tcf), validated vs CPU fp32 (0.52% global-rel PASS) ---
+ctx=4096:  M=1 73.84us  M=4 108.32(1.47x)  M=8 94.33 (1.28x)  M=16 130.11(1.76x)
+ctx=8192:  M=1 133.93us M=4 201.94(1.51x)  M=8 183.93(1.37x)  M=16 260.44(1.95x)
+vs warp-shuffle k2 ~4x@M=8 -> TC+softmax is ~3x flatter even with a NAIVE split.
+RESIDUAL M-scaling (1.0x GEMM-only -> 1.3x with softmax) = the SPLIT design's HBM round-trip: GEMM1
+materializes M x ctx scores to HBM, softmax re-reads+re-writes, GEMM2 re-reads -> that traffic scales
+linearly in M. A FUSED FlashAttention kernel (scores in SRAM, never spilled) removes it -> approaches 1.0x.
+ABSOLUTES @M=8 ctx4096: TC+softmax 94us vs warp-shuffle k2b-best 165us (TC ~1.75x faster AND flatter).
+At M=1: TC+softmax 74us vs warp k2b 41us (warp wins -> confirms regime split: warp@M=1, fused-TC@M=k).
+CONCLUSION: build a FUSED TC flash-decode verify (FA-style, fp8 KV, tree/causal mask) — not a cuBLAS split.
+
+CORRECTION (honesty): I attributed the 1.0x->1.3x residual to the "HBM round-trip" of materializing
+scores. The arithmetic refutes that as the MAIN cause: scores @M=8/ctx4096 = 64*8*4096*2B = 4MB, round-
+trip (GEMM1 write + softmax r/w + GEMM2 read) ~16MB/iter @3350GB/s = ~5us — small vs the +20us residual.
+The bulk of the residual is the SEPARATE NAIVE SOFTMAX KERNEL: uncoalesced stride-M reads (S is [M x ctx]
+col-major, ldc=M -> consecutive t are M apart) + 3 passes, scaling with the M warp count. A FUSED FA kernel
+computes softmax INLINE during the GEMM accumulation (no separate pass, no stride-M spill) -> removes this
+residual and should approach the GEMM-only ~1.0x. Net conclusion unchanged (FUSE it), mechanism corrected.
+
+--- FULL TC attention v2 (COALESCED softmax, scores [ctx x M]) tc_attn_full2.cu/tcf2 — validated 0.52% ---
+ctx=4096:  M=1 66.88us  M=4 64.63 (0.97x)  M=8 66.84 (1.00x)  M=16 70.41 (1.05x)
+ctx=8192:  M=1 119.94us M=4 121.45(1.01x)  M=8 124.79(1.04x)  M=16 133.59(1.11x)
+=> FULL attention (QK^T + softmax + P.V) is FLAT IN M (1.0-1.05x@M=8), numerically correct. The v1 residual
+WAS the naive softmax's uncoalesced stride-M reads; storing scores [ctx x M] (softmax over the contiguous
+leading dim) fixes it. So even a NON-fused cuBLAS split achieves flat-in-M attention; a fused FA kernel would
+only improve absolutes. vs warp-shuffle k2b M=8=165us, TC-split=67us = ~2.5x faster AND flat.
+VALIDATED LEVER: TC verify attention removes the K2 M-tax. Build it (fp8 KV + tree/causal mask + RoPE);
+M=1 plain decode keeps warp-shuffle (TC underfills there).
+
+--- DESIGN CONCLUSION (buildable decomposition of the spec-verify attention) ---
+The M=k verify attention splits cleanly into two terms:
+  (A) SHARED-CONTEXT attn: all M draft queries attend the committed KV [0,ctx). This is the DOMINANT cost
+      (ctx large) and is exactly the TC GEMM measured here -> FLAT in M (1.0x), no mask needed.
+  (B) DRAFT-SELF attn: each draft position attends the <=k preceding draft tokens in its chain/tree. This is
+      a tiny M x M (k<=16) masked attention -> negligible cost; carries the tree/causal mask + per-node RoPE.
+=> The M-tax disappears because (A) is TC-flat and (B) is O(M^2)-tiny. The engine verify = cuBLAS/mma TC for
+   (A) + a small masked kernel for (B) (my mk_tree_attn handles the masked/tree part). Does NOT require a
+   fully-fused monolithic FA kernel to remove the tax. Open Q to Charles: does his verify already separate
+   context vs draft-self, and does his engine call cuBLASLt/FA (TC) for the context attn or the warp k2?
+
+=== CAPSTONE: COMPLETE spec-verify attention (tc_verify_attn.cu/tcv) — VALIDATED + FLAT ===
+Full causal verify: query m attends [context KV [0,ctx)] U [draft KV 0..m]. (A) context = cuBLAS TC GEMM +
+coalesced softmax (emits mx,sm); (B) draft-self = tiny warp kernel (M x M causal); MERGE = online-softmax
+combine of the two normalized partials via their (mx,sm). Validated vs CPU fp32 full masked attention.
+ctx=2048:  M=1 46.52us  M=8 53.11 (1.14x)  M=16 61.78 (1.33x)   correctness rel=0.06% PASS
+ctx=4096:  M=1 74.00us  M=8 81.01 (1.09x)  M=16 92.75 (1.25x)   correctness rel=0.35% PASS
+ctx=8192:  M=1 128.24us M=8 140.24(1.09x)  M=16 157.31(1.23x)   correctness rel=0.43% PASS
+=> The COMPLETE masked spec-verify attention is FLAT in M (1.09x@M=8) AND numerically correct (<0.5%).
+   vs warp-shuffle k2b M=8=165us, this=81us = ~2x faster AND flat (1.09x vs 4x). The residual M=16 scaling
+   (1.25x) is the tiny serial draft-self term (m+1 steps/query) + cuBLAS odd-M tile — optimizable, already
+   far flatter than warp-shuffle. NEXT (engine): swap fp16->fp8 KV (dequant-on-load, M-independent), tree
+   mask (ancestor set per node, from spec_accept_tree.h) for tree drafting, per-node RoPE. M=1 plain decode
+   keeps the warp-shuffle k2 (TC underfills there). Hand to Charles as the verify-attn recipe/kernel.
+
+=== TREE-MASKED verify attention (tc_verify_tree.cu/tcvt) — VALIDATED + FLAT (the tree-spec lever) ===
+Each draft node attends [context] U [ancestor draft nodes] (parent[] walk; balanced binary tree). Validated
+vs CPU fp32 ancestor-masked attention. EVEN FLATTER than chain (tree depth log2(M)~4 < chain depth 16):
+ctx=4096:  M=1 75.04us  M=8 76.22 (1.02x)  M=16 81.55 (1.09x)   rel=0.42% PASS
+ctx=8192:  M=1 127.80us M=8 133.86(1.05x)  M=16 144.43(1.13x)   rel=0.46% PASS
+=> Wide trees are ~FREE on attention (1.09x@16 nodes) -> push tau via tree WIDTH on a flat verify. Connects
+   tree.rs (lossless tree accept) + build_from_source (head->tree) + this flat tree-masked TC verify attn =
+   the complete tree-spec path with a flat verify. NEXT (engine drop-in): fp8 KV (dequant-on-load) + per-node
+   RoPE pos_id (from tree_attn.h) + wire into Charles's decode loop; M=1 plain decode keeps warp-shuffle k2.
+
+=== FP8 KV (Charles's cache dtype) tc_verify_fp8.cu/tcv8 — accuracy + flatness CONFIRMED ===
+fp8 e4m3 context KV + per-channel scale, dequant-on-load. Validated vs fp32-of-fp8:
+ctx=4096: rel=0.44% PASS, FLAT 1.02x@M=16 (abs M=1..16: 293/292/295/300us)
+ctx=8192: rel=0.49% PASS, FLAT 1.03x@M=16 (abs M=1..16: 558/559/563/573us)
+=> fp8 KV is ACCURATE (<0.5%) and FLAT in M. HONEST CAVEAT on the ABSOLUTE: 293us (vs 81us fp16) is dominated
+   by my proxy's non-fused dequant-MATERIALIZATION (reads 33.5M fp8, writes 67MB fp16 EVERY call). The real
+   engine path does NOT materialize: use cuBLASLt NATIVE fp8 GEMM (no dequant pass) or load fp8 inline like
+   mk_tree_attn_fp8's k2_load4. So the representative fp8 cost ~ the fp16 number (81us@M=8) or LESS (half HBM
+   on the KV read). The dequant proxy only validates accuracy+flatness, not the absolute. NEXT: native-fp8 GEMM.
+
+=== FLATNESS CEILING (tcvc, tree verify M up to 64) — the tree node_budget ===
+ctx=4096: M=1/8/16/24/32/48/64 -> 74.5/76.1/81.2/86.5/92.1/105.9/122.3us (ratio 1.00/1.02/1.09/1.16/1.24/1.42/1.64)
+ctx=8192: M=1/8/16/24/32/48/64 -> 128.5/135.3/146.2/155.9/177.2/225.4/284.2us (ratio 1.00/1.05/1.14/1.21/1.38/1.76/2.21)
+correctness rel 0.37-0.46% PASS. => FLAT to ~M=16 (<1.1x), near-flat to ~M=24, degrades past M=32 (TC tiles
+saturate the SMs; ctx8192 degrades sooner = longer per-warp draft-self + bigger score GEMM). PRACTICAL TREE
+NODE_BUDGET ~16-24 @ctx4096 (feed into tree_shape::TreeCostModel.node_budget). Beyond ~32 nodes the verify
+re-acquires M-scaling -> diminishing tree-width returns. Confirms wide trees pay ONLY up to the ceiling.

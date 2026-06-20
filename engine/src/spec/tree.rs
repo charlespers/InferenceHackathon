@@ -68,6 +68,42 @@ impl SpecTree {
         }
         t
     }
+
+    /// Build a draft TREE from a [`CandidateSource`] (the EAGLE3 head): from the root (last context
+    /// token), expand the top-`branch` candidates at each node down to `depth` levels (BFS). Each edge
+    /// carries the head's candidate token + its draft logprob; `draft_logprob` must be the draft-space
+    /// log-softmax (the d2t/τ-1.4 fix — `DraftVocabMap` already produces it). The result feeds the M=k
+    /// tree verify + [`accept_tree`]. This is the tree analog of `RouteAwareDrafter::draft_chain`.
+    ///
+    /// Total nodes ≈ 1 + branch + branch² + … + branch^depth; cap `branch`/`depth` to stay ≤ the flat
+    /// verify tile (≤16-wide, Charles). Stops a path early if the source returns no candidates.
+    pub fn build_from_source<S: crate::spec::route_aware_drafter::CandidateSource>(
+        source: &S,
+        context: &[TokenId],
+        root_token: TokenId,
+        depth: usize,
+        branch: usize,
+    ) -> SpecTree {
+        let mut t = SpecTree::new(root_token);
+        let mut frontier: Vec<(usize, Vec<TokenId>)> = vec![(0, Vec::new())];
+        for _ in 0..depth {
+            let mut next: Vec<(usize, Vec<TokenId>)> = Vec::new();
+            for (node, path) in frontier {
+                let cands = source.candidates(context, &path, branch);
+                for c in cands.into_iter().take(branch) {
+                    let child = t.add_child(node, c.token, c.draft_logprob);
+                    let mut p = path.clone();
+                    p.push(c.token);
+                    next.push((child, p));
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        t
+    }
 }
 
 fn softmax(logits: &[f32]) -> Vec<f32> {
@@ -206,6 +242,40 @@ mod tests {
         let run = accept_tree(&t, &rows, &mut FixedRng(0.01));
         assert_eq!(run.accepted, vec![6, 7, 8], "accepts the full ramp chain");
         assert_eq!(run.bonus_token, 9, "bonus continues the ramp");
+    }
+
+    #[test]
+    fn build_from_source_makes_a_branch_depth_tree() {
+        use crate::spec::route_aware::Candidate;
+        use crate::spec::route_aware_drafter::CandidateSource;
+        // Mock head: returns `branch` candidates per node; tokens depend on the path length so the
+        // tree is non-degenerate. draft_logprob is a draft-space-style value (<=0).
+        struct MockHead;
+        impl CandidateSource for MockHead {
+            fn candidates(&self, _ctx: &[TokenId], chain: &[TokenId], width: usize) -> Vec<Candidate> {
+                let base = 100 + 10 * chain.len() as u32;
+                (0..width as u32)
+                    .map(|i| Candidate { token: base + i, draft_logprob: -0.1 - 0.1 * i as f32, experts: vec![] })
+                    .collect()
+            }
+        }
+        let t = SpecTree::build_from_source(&MockHead, &[1, 2, 3], /*root*/ 5, /*depth*/ 2, /*branch*/ 2);
+        // nodes = 1 (root) + 2 (level1) + 4 (level2) = 7
+        assert_eq!(t.n_nodes(), 7, "branch=2 depth=2 -> 1+2+4 nodes");
+        // root has 2 children; each level-1 node has 2 children
+        assert_eq!(t.children[0].len(), 2, "root branches into 2");
+        for &c in &t.children[0] {
+            assert_eq!(t.children[c].len(), 2, "each level-1 node branches into 2");
+        }
+        // level-1 tokens are the head's first-position candidates (path len 0 -> base 100)
+        let l1: Vec<TokenId> = t.children[0].iter().map(|&c| t.tokens[c]).collect();
+        assert_eq!(l1, vec![100, 101], "level-1 tokens = head top-2 at the root");
+        // it composes with accept_tree (no panic) and is lossless against a ramp target
+        let rows = ramp_rows(&t, 256);
+        let run = accept_tree(&t, &rows, &mut FixedRng(0.01));
+        for (i, &tok) in run.accepted.iter().chain(std::iter::once(&run.bonus_token)).enumerate() {
+            assert_eq!(tok, 6 + i as TokenId, "built tree still emits the target ramp (lossless)");
+        }
     }
 
     #[test]

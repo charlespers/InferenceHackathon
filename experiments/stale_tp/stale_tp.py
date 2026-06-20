@@ -286,11 +286,12 @@ def install():
 
     wrapper._stale_tp_wrapped = True
 
-    # Rebind in communication_op and in every already-imported module that
-    # imported the symbol directly (e.g. vllm.model_executor.layers.linear,
-    # vllm.distributed.__init__).
+    # Rebind in EVERY already-imported module that holds the original symbol --
+    # the defining module (vllm.distributed.communication_op), its re-exports
+    # (vllm.distributed), and every consumer that imported it by name
+    # (e.g. vllm.model_executor.layers.linear, where RowParallelLinear looks it up).
+    # Single mechanism = the count reflects all rebinds.
     patched_mods = []
-    cop.tensor_model_parallel_all_reduce = wrapper
     for modname, mod in list(sys.modules.items()):
         if mod is None:
             continue
@@ -300,6 +301,11 @@ def install():
                 patched_mods.append(modname)
         except Exception:
             continue
+    # belt-and-suspenders: ensure the defining module is rebound even if it was
+    # not enumerable for some reason.
+    if getattr(cop, "tensor_model_parallel_all_reduce", None) is orig:
+        cop.tensor_model_parallel_all_reduce = wrapper
+        patched_mods.append("vllm.distributed.communication_op")
 
     print(f"[stale_tp] installed: enable={Cfg.enable} K={Cfg.K} mode={Cfg.mode} "
           f"policy={Cfg.policy} decode_only={Cfg.decode_only} period={Cfg.period} "

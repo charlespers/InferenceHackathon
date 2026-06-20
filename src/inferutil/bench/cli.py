@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 from datetime import datetime
 
 from ..model import QWEN3_235B
@@ -34,8 +36,19 @@ def _cmd_run(args) -> None:
         tele = NullTelemetry()
     result = run_benchmark(engine, config, QWEN3_235B, cluster, telemetry=tele)
     runid = datetime.now().strftime("%Y%m%d-%H%M%S")     # CLI-only clock (run identity)
+    driver_version = "unknown"
+    try:
+        if isinstance(tele, NvmlTelemetry) and tele.available:
+            import pynvml
+            v = pynvml.nvmlSystemGetDriverVersion()
+            driver_version = v.decode() if isinstance(v, bytes) else str(v)
+    except Exception:
+        pass
     record = RunRecord(runid=runid, config=config,
-                       env={"gpu": cluster.gpu.name, "n_gpus": cluster.n_gpus}, result=result)
+                       env={"gpu": cluster.gpu.name, "n_gpus": cluster.n_gpus,
+                            "host": socket.gethostname(),
+                            "driver_version": driver_version},
+                       result=result)
     path = write_run(record, args.results_dir)
     if args.json:
         print(json.dumps(result_to_x_summary(record), indent=2))
@@ -50,8 +63,11 @@ def _resolve(args) -> RunRecord:
         if rec is None:
             raise SystemExit(f"no runs for '{args.name}' in {args.results_dir}")
         return rec
-    import os
-    return load_run(os.path.join(args.results_dir, args.name, args.runid + ".json"))
+    path = os.path.join(args.results_dir, args.name, args.runid + ".json")
+    try:
+        return load_run(path)
+    except FileNotFoundError:
+        raise SystemExit(f"no run '{args.runid}' for '{args.name}' in {args.results_dir}")
 
 
 def _cmd_report(args) -> None:
@@ -61,7 +77,10 @@ def _cmd_report(args) -> None:
 
 
 def _cmd_compare(args) -> None:
-    import os
+    for runid in (args.a, args.b):
+        path = os.path.join(args.results_dir, args.name, runid + ".json")
+        if not os.path.exists(path):
+            raise SystemExit(f"no run '{runid}' for '{args.name}' in {args.results_dir}")
     a = load_run(os.path.join(args.results_dir, args.name, args.a + ".json"))
     b = load_run(os.path.join(args.results_dir, args.name, args.b + ".json"))
     print(format_compare(a, b))

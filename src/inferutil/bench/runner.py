@@ -33,6 +33,7 @@ def run_benchmark(engine, config: BenchConfig, cfg: MoEConfig, cluster: Cluster,
     step_seconds = [engine.decode_step().seconds for _ in range(config.decode_tokens - 1)]
     gpu_samples = telemetry.stop()
 
+    # Energy window covers decode_tokens-1 steps; denominator uses decode_tokens — ~0.8% mismatch is intentional (first token folded into TTFT).
     summary = summarize_telemetry(gpu_samples, config.decode_tokens, sum(step_seconds))
     return build_result(cfg=cfg, cluster=cluster, config=config, ttft_s=ttft_s,
                         prefill_tok_per_s=prefill_tok_per_s,

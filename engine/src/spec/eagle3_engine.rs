@@ -17,6 +17,7 @@ use crate::spec::accept::accept_multi_drafter;
 use crate::spec::model::ModelRunner;
 use crate::spec::route_aware_drafter::{CandidateSource, RouteAwareDrafter};
 use crate::spec::telemetry::SpecTelemetry;
+use crate::spec::tree::{accept_tree, SpecTree};
 use crate::spec::types::{AcceptedRun, DraftTree, RngCore, TokenId};
 
 /// Aux-hidden-state contract the target must expose for a REAL EAGLE3 head (the head reads 3 aux
@@ -236,6 +237,64 @@ impl<S: CandidateSource, T: ModelRunner> Eagle3Engine<S, T> {
         }
         Ok((logits.len().saturating_sub(1)) as TokenId)
     }
+
+    /// One TREE-spec round: build a draft tree (top-`branch` per node, depth `depth`) from the head,
+    /// verify every node, and accept the longest matching PATH via lossless [`accept_tree`]. The tree
+    /// analog of [`Self::step`] — a wider/flatter verify accepts more often (higher τ) for ~the same
+    /// cost on the flat M=k verify (validated: `mk_tree_attn` ~flat in tree width). Degenerate (head
+    /// produced nothing) → one normal target decode, as in [`Self::step`].
+    pub fn step_tree(
+        &self,
+        context: &[TokenId],
+        depth: usize,
+        branch: usize,
+        rng: &mut impl RngCore,
+    ) -> Result<(AcceptedRun, Eagle3RoundStats)> {
+        let root = *context.last().unwrap_or(&0);
+        let tree = SpecTree::build_from_source(&self.drafter.source, context, root, depth, branch);
+        let n_drafted = tree.n_nodes().saturating_sub(1);
+        if n_drafted == 0 {
+            return Ok((
+                AcceptedRun { accepted: vec![], accept_mask: vec![], bonus_token: self.fallback_decode(context)?, winning_drafter: None },
+                Eagle3RoundStats { n_accepted: 0, n_drafted: 0, verify_depth: 0, union_size: 0 },
+            ));
+        }
+        let rows = self.tree_target_rows(context, &tree)?;
+        let run = accept_tree(&tree, &rows, rng);
+        let stats = Eagle3RoundStats {
+            n_accepted: run.n_accepted(),
+            n_drafted,
+            verify_depth: run.accepted.len(), // depth of the accepted path
+            union_size: n_drafted as u32,     // tree nodes verified (the M of the M=k verify)
+        };
+        Ok((run, stats))
+    }
+
+    /// Target verify rows for a tree: `rows[i]` = `P(· | context + path-to-node-i)` (predicts node i's
+    /// children); `rows[0]` = `P(· | context)`. One target forward per node here (mock path); the
+    /// native engine produces all rows in ONE M=k tree-masked forward (`mk_tree_attn` + flat GEMM).
+    fn tree_target_rows(&self, context: &[TokenId], tree: &SpecTree) -> Result<Vec<Vec<f32>>> {
+        let mut rows = Vec::with_capacity(tree.n_nodes());
+        for i in 0..tree.n_nodes() {
+            let mut path = Vec::new();
+            let mut cur = i;
+            while cur != 0 {
+                path.push(tree.tokens[cur]);
+                cur = tree.parent[cur];
+            }
+            path.reverse();
+            let mut ctx: Vec<TokenId> = Vec::with_capacity(context.len() + path.len());
+            ctx.extend_from_slice(context);
+            ctx.extend_from_slice(&path);
+            if ctx.is_empty() {
+                rows.push(vec![0.0; self.config.vocab_size]);
+                continue;
+            }
+            let (prefix, last) = ctx.split_at(ctx.len() - 1);
+            rows.push(self.target.forward_single(prefix, last[0])?);
+        }
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +511,28 @@ mod tests {
         assert_eq!(run(5.0, 0.0), expected, "λ must NOT change the output (lossless)");
         assert_eq!(run(0.0, 0.86), expected, "verify-depth (floor) must NOT change the output");
         assert_eq!(run(5.0, 0.86), expected, "λ and verify-depth jointly invariant");
+    }
+
+    #[test]
+    fn step_tree_is_lossless_and_accepts_the_ramp_path() {
+        // Build a draft TREE from RampHead (correct ramp token + a distractor per node) verified by the
+        // deterministic RampTarget. The accepted path + bonus must be the exact target ramp regardless
+        // of tree width/depth (lossless), and the correct branch is accepted deeper than 0 (τ>1).
+        let vocab = 256;
+        let engine = Eagle3Engine::new(
+            RouteAwareDrafter::new(RampHead(vocab), 0.0),
+            RampTarget(vocab),
+            Eagle3Config { depth: 4, width: 2, vocab_size: vocab, floor_fraction: 0.0 },
+        );
+        let (run, stats) = engine.step_tree(&[5], /*depth*/ 3, /*branch*/ 2, &mut FixedRng).unwrap();
+        let emitted: Vec<TokenId> =
+            run.accepted.iter().copied().chain(std::iter::once(run.bonus_token)).collect();
+        for (i, &t) in emitted.iter().enumerate() {
+            assert_eq!(t, 6 + i as TokenId, "tree-spec emits the target ramp (lossless)");
+        }
+        assert!(run.accepted.len() >= 1, "the correct ramp branch is accepted (tau > 1)");
+        assert_eq!(stats.union_size as usize, stats.n_drafted, "union_size = tree nodes verified");
+        assert!(stats.n_drafted >= 3, "a depth-3 branch-2 tree drafts several nodes");
     }
 
     #[test]

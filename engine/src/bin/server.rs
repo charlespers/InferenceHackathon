@@ -36,6 +36,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
 
+use engine::routing::pipeline::PredictionPipeline;
+use engine::routing::scheduler::NullSink;
 use engine::routing::sim::RoutingSimulator;
 
 const VLLM_URL_DEFAULT: &str = "http://localhost:8001";
@@ -206,6 +208,10 @@ struct LiveStats {
 struct AppState {
     client: reqwest::Client,
     vllm_url: String,
+    /// Full prediction pipeline: Markov predictor + prefetch scheduler.
+    /// Used with real per-token routing from the vLLM hook.
+    pipeline: Mutex<PredictionPipeline<NullSink>>,
+    /// Fallback simulator when the vLLM hook is not connected.
     simulator: Mutex<RoutingSimulator>,
     /// Placement JSON cached for x_telemetry ({"placement": {"0": {"0": 2, ...}}})
     placement_json: Value,
@@ -307,11 +313,16 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(TASKS_PORT_DEFAULT);
 
+    let pipeline = PredictionPipeline::from_stats_files(
+        ROUTING_STATS_PATH, PLACEMENT_PATH, NullSink,
+    ).unwrap_or_else(|e| {
+        eprintln!("[server] pipeline init failed ({e}), using uniform prior");
+        PredictionPipeline::from_stats_files("/dev/null", "/dev/null", NullSink)
+            .unwrap_or_else(|_| unreachable!())
+    });
+
     let simulator = RoutingSimulator::from_routing_stats(ROUTING_STATS_PATH)
-        .unwrap_or_else(|e| {
-            eprintln!("[server] routing stats unavailable ({e}), using uniform predictor");
-            RoutingSimulator::default()
-        });
+        .unwrap_or_else(|_| RoutingSimulator::default());
 
     let placement_json: Value = std::fs::read_to_string(PLACEMENT_PATH)
         .ok()
@@ -321,6 +332,7 @@ async fn main() {
     let state = Arc::new(AppState {
         client: reqwest::Client::new(),
         vllm_url: vllm_url.clone(),
+        pipeline: Mutex::new(pipeline),
         simulator: Mutex::new(simulator),
         placement_json,
         tasks: Mutex::new(TaskTracker::new()),
@@ -529,11 +541,16 @@ async fn proxy_and_inject(
                 if t_first.is_none() { t_first = Some(now); }
                 let t_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
-                // Run predictor for this token.
-                // If the vLLM routing hook (start_vllm.py) is connected, use
-                // real per-layer expert selections; otherwise fall back to simulation.
-                let hr = if let Some(real_routing) = state.routing_reader.pop_token() {
-                    state.simulator.lock().unwrap().score_real_routing(&real_routing)
+                // Run prediction pipeline for this token.
+                // With real routing (vLLM hook): feed all 94 layers through
+                // PredictionPipeline (Markov update + prefetch scheduling).
+                // Without: fall back to RoutingSimulator from activation counts.
+                let real_routing = state.routing_reader.pop_token();
+                let hr = if let Some(ref routing) = real_routing {
+                    let routing_typed: Vec<Vec<u32>> = routing.iter()
+                        .map(|layer| layer.iter().copied().collect())
+                        .collect();
+                    state.pipeline.lock().unwrap().feed_token_routing(&routing_typed)
                 } else {
                     state.simulator.lock().unwrap().simulate_token()
                 };
@@ -542,6 +559,7 @@ async fn proxy_and_inject(
 
                 chunk["x_telemetry"] = make_telemetry(
                     token_count, t_ms, &state.placement_json,
+                    real_routing.as_deref(),
                 );
                 state.tasks.lock().unwrap().tick(task_id);
                 token_count += 1;
@@ -715,20 +733,41 @@ async fn tasks_handler(
 // Telemetry helpers
 // ---------------------------------------------------------------------------
 
-fn make_telemetry(token_index: u32, t_ms: f64, placement_json: &Value) -> Value {
-    let top_k = 8usize;
-    let layer = token_index as usize % N_LAYERS;
-    let layer_placement = &placement_json["placement"][layer.to_string()];
+/// Build x_telemetry for one token.
+///
+/// `real_routing`: if Some, contains the actual per-layer expert IDs from the
+/// vLLM hook — shape [layer][expert]. We sample 8 (layer, expert_id, gpu)
+/// entries spaced evenly across the 94 MoE layers so the UI ROUTE bars
+/// reflect real routing. Without real routing, falls back to a placeholder.
+fn make_telemetry(
+    token_index: u32,
+    t_ms: f64,
+    placement_json: &Value,
+    real_routing: Option<&[Vec<u32>]>,
+) -> Value {
+    const SAMPLE_LAYERS: [usize; 8] = [0, 13, 26, 39, 52, 65, 78, 91];
 
-    let experts: Vec<Value> = (0..top_k)
-        .map(|k| {
+    let experts: Vec<Value> = if let Some(routing) = real_routing {
+        SAMPLE_LAYERS.iter().filter_map(|&layer| {
+            let layer_experts = routing.get(layer)?;
+            let expert_id = *layer_experts.first()? as usize;
+            let gpu = placement_json["placement"][layer.to_string()][expert_id.to_string()]
+                .as_u64()
+                .unwrap_or((expert_id % N_GPUS) as u64);
+            Some(json!({"layer": layer, "expert_id": expert_id, "gpu": gpu}))
+        }).collect()
+    } else {
+        // Placeholder: deterministic round-robin so UI isn't always empty
+        let layer = token_index as usize % N_LAYERS;
+        let layer_placement = &placement_json["placement"][layer.to_string()];
+        (0..8usize).map(|k| {
             let expert_id = (token_index as usize * 7 + k * 13) % N_EXPERTS;
             let gpu = layer_placement[expert_id.to_string()]
                 .as_u64()
                 .unwrap_or((expert_id % N_GPUS) as u64);
             json!({"layer": layer, "expert_id": expert_id, "gpu": gpu})
-        })
-        .collect();
+        }).collect()
+    };
 
     json!({
         "token_index": token_index,

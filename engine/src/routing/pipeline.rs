@@ -93,6 +93,23 @@ impl<S: PrefetchSink> PredictionPipeline<S> {
     pub fn total_prefetch_hits(&self) -> u64 {
         self.scheduler.total_hits()
     }
+
+    /// Feed one full token's real routing data (from the vLLM hook) through
+    /// the pipeline. Calls `on_layer_done` for each layer, doing Markov online
+    /// updates and issuing prefetch actions to the sink.
+    ///
+    /// Returns the hit rate for this token specifically (delta hits / delta
+    /// prefetched), so callers can report per-request accuracy.
+    pub fn feed_token_routing(&mut self, routing: &[Vec<ExpertId>]) -> f32 {
+        let before_hits = self.scheduler.total_hits();
+        let before_prefetched = self.scheduler.total_prefetched();
+        for (layer, experts) in routing.iter().enumerate() {
+            self.on_layer_done(layer, &[], experts);
+        }
+        let delta_prefetched = self.scheduler.total_prefetched() - before_prefetched;
+        let delta_hits = self.scheduler.total_hits() - before_hits;
+        if delta_prefetched == 0 { 0.0 } else { delta_hits as f32 / delta_prefetched as f32 }
+    }
 }
 
 // ---------------------------------------------------------------------------

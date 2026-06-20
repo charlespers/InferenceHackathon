@@ -81,6 +81,7 @@
 #include <thread>
 #include <atomic>
 #include <cuda_runtime.h>
+#include <cuda.h>      // driver API: cuMulticast* for NVLS in-switch all-reduce
 #include <nccl.h>
 #include "common.cuh"
 using namespace q3;
@@ -237,6 +238,13 @@ struct RankState {
   int rank = 0, dev = 0;
   cudaStream_t stream = nullptr;
   ncclComm_t   comm   = nullptr;
+
+  // NVLS in-switch all-reduce: multicast VAs for the two partials + a barrier flag.  When set
+  // (NVLS=1), the eager NCCL all-reduces are replaced by an in-kernel multimem AR (~4us vs 17.9us).
+  float    *attn_mc = nullptr;   // multicast VA aliasing attn_partial across all 8 ranks
+  float    *moe_mc  = nullptr;   // multicast VA aliasing moe_partial
+  unsigned *flag_mc = nullptr;   // multicast VA of the barrier counters [2] (all ranks share)
+  unsigned  nvls_gen = 0;        // persistent per-rank barrier generation (monotonic, never reset)
 
   // residual ping-pong (full [HIDDEN] on every rank after each all-reduce).
   float *h_a = nullptr, *h_b = nullptr;
@@ -739,6 +747,52 @@ static void enqueue_tp8_seghead(RankState& S, float* h_in, cudaStream_t s) {
       S.hn, S.Wlm, S.Wlm_scale, S.v_rows, S.v_off, S.block_max, S.block_arg);
   tp8_argmax_final<<<1, 32, 0, s>>>(S.block_max, S.block_arg, S.lm_blocks, S.rank_max, S.rank_arg);
 }
+// =================================================================================================
+// NVLS in-switch all-reduce — replaces the 17.9us NCCL AR with a ~4us multimem reduce.
+// -------------------------------------------------------------------------------------------------
+// Each rank reduces its OWN disjoint [lo,hi) slice of the multicast VA (so each element is summed by
+// exactly ONE rank — else the switch double-counts), bracketed by a device-side multimem flag barrier
+// (arrive = multimem.red.add on the multicast counter; wait = spin on multimem.ld_reduce until the
+// global arrival sum hits npes*gen).  No host round-trip — runs entirely on the rank's stream.
+// `gen_base` makes the two barriers (pre/post) of this AR use distinct generations.
+__global__ void tp8_nvls_ar_f32(float* __restrict__ acc_mc, unsigned* __restrict__ flag_mc,
+                                int n, int rank, int npes, unsigned gen_base) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int nthr = gridDim.x * blockDim.x;
+  // --- barrier #1: every rank has written its partial into its bound physical buffer ---
+  if (tid == 0) {
+    __threadfence_system();
+    asm volatile("multimem.red.global.add.u32 [%0], 1;" :: "l"(flag_mc + (gen_base & 1)) : "memory");
+    unsigned want = (gen_base/2 + 1) * (unsigned)npes, got = 0;
+    do { asm volatile("multimem.ld_reduce.global.add.u32 %0, [%1];" : "=r"(got) : "l"(flag_mc + (gen_base & 1)) : "memory"); }
+    while (got < want);
+  }
+  __syncthreads();
+  // --- this rank reduces+broadcasts its disjoint slice via the switch ---
+  const int chunk = ((n/4) + npes - 1) / npes * 4;
+  const int lo = rank * chunk, hi = min(n, lo + chunk);
+  for (int i = lo + tid*4; i < hi; i += nthr*4) {
+    float a,b,c,d;
+    asm volatile("multimem.ld_reduce.global.add.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(a),"=f"(b),"=f"(c),"=f"(d) : "l"(acc_mc+i) : "memory");
+    asm volatile("multimem.st.global.v4.f32 [%0], {%1,%2,%3,%4};" :: "l"(acc_mc+i),"f"(a),"f"(b),"f"(c),"f"(d) : "memory");
+  }
+  // --- barrier #2: all ranks' slices written before anyone reads the full buffer ---
+  __syncthreads();
+  if (tid == 0) {
+    __threadfence_system();
+    asm volatile("multimem.red.global.add.u32 [%0], 1;" :: "l"(flag_mc + (1 - (gen_base & 1))) : "memory");
+    unsigned want = (gen_base/2 + 1) * (unsigned)npes, got = 0;
+    do { asm volatile("multimem.ld_reduce.global.add.u32 %0, [%1];" : "=r"(got) : "l"(flag_mc + (1 - (gen_base & 1))) : "memory"); }
+    while (got < want);
+  }
+}
+// One AR call on this rank's stream.  S.nvls_gen is the persistent per-rank counter (each AR uses 2
+// generations: pre-barrier + post-barrier).  Monotonic across ALL tokens (flag counters never reset).
+static inline void nvls_ar(RankState& S, float* mc, cudaStream_t s) {
+  tp8_nvls_ar_f32<<<1, 256, 0, s>>>(mc, S.flag_mc, HIDDEN, S.rank, TP, S.nvls_gen);
+  S.nvls_gen += 2;
+}
+
 // Capture a kernel-only segment (no NCCL, no setattr inside) into an instantiated graph exec.
 template <typename Fn>
 static cudaGraphExec_t capture_segment(cudaStream_t s, Fn fn) {
@@ -754,15 +808,14 @@ static cudaGraphExec_t capture_segment(cudaStream_t s, Fn fn) {
 // Replay ONE token in the kernels-only-graph + eager-AR mode (host launches segments, eager ARs).
 static void replay_tp8_step_kgraph(RankState& S) {
   cudaStream_t s = S.stream;
+  const bool nvls = (S.attn_mc != nullptr);
   for (int layer = 0; layer < N_LAYERS; ++layer) {
     CK(cudaGraphLaunch(S.exec_segA, s));                          // K1,K2,K3 -> attn_partial
-    NK(ncclGroupStart());
-    NK(ncclAllReduce(S.attn_partial, S.attn_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s)); // eager AR#1
-    NK(ncclGroupEnd());
+    if (nvls) { nvls_ar(S, S.attn_mc, s); }                       // in-switch multimem AR#1 (~4us)
+    else { NK(ncclGroupStart()); NK(ncclAllReduce(S.attn_partial, S.attn_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s)); NK(ncclGroupEnd()); }
     CK(cudaGraphLaunch(S.exec_segB, s));                          // resid,K4,K5 -> moe_partial
-    NK(ncclGroupStart());
-    NK(ncclAllReduce(S.moe_partial, S.moe_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s));    // eager AR#2
-    NK(ncclGroupEnd());
+    if (nvls) { nvls_ar(S, S.moe_mc, s); }                        // in-switch multimem AR#2 (~4us)
+    else { NK(ncclGroupStart()); NK(ncclAllReduce(S.moe_partial, S.moe_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, s)); NK(ncclGroupEnd()); }
   }
   CK(cudaGraphLaunch(S.exec_seghead, s));                         // resid,norm,lm_head,argmax
   NK(ncclGroupStart());
@@ -1663,6 +1716,71 @@ static void profile_per_kernel(RankState& S, int PEAK_unused) {
 }
 
 // =================================================================================================
+// NVLS setup: VMM-allocate the two partial buffers (+ a barrier flag) as multicast objects spanning
+// all 8 GPUs, repoint S.attn_partial/S.moe_partial at the bound physical memory, and hand every rank
+// the shared multicast VAs.  Returns 0 on success, -1 if NVLS isn't available (caller falls back to NCCL).
+// =================================================================================================
+#define DCK(x) do{ CUresult r_=(x); if(r_!=CUDA_SUCCESS){ const char* es=nullptr; cuGetErrorString(r_,&es); \
+  printf("CU err %s:%d: %s\n",__FILE__,__LINE__,es?es:"?"); return -1; } }while(0)
+
+// Create one multicast object over the 8 devices, bind a fresh phys buffer per rank, map a unicast
+// view per rank (returned in uc[]) and one all-device multicast VA (returned in *mc_va_out).
+static int mc_make(const std::vector<RankState>& R, size_t bytes,
+                   std::vector<CUdeviceptr>& uc, CUdeviceptr* mc_va_out) {
+  const int N = (int)R.size();
+  CUmulticastObjectProp mcp; memset(&mcp,0,sizeof(mcp));
+  mcp.numDevices=N; mcp.handleTypes=CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR; mcp.size=bytes;
+  size_t mcg=0; DCK(cuMulticastGetGranularity(&mcg,&mcp,CU_MULTICAST_GRANULARITY_RECOMMENDED));
+  size_t size=((bytes+mcg-1)/mcg)*mcg; mcp.size=size;
+  CUmemGenericAllocationHandle mc; DCK(cuMulticastCreate(&mc,&mcp));
+  for (int d=0; d<N; ++d) DCK(cuMulticastAddDevice(mc, R[d].dev));
+  uc.resize(N);
+  for (int d=0; d<N; ++d) {
+    CK(cudaSetDevice(R[d].dev));
+    CUmemAllocationProp p; memset(&p,0,sizeof(p));
+    p.type=CU_MEM_ALLOCATION_TYPE_PINNED; p.location.type=CU_MEM_LOCATION_TYPE_DEVICE; p.location.id=R[d].dev;
+    p.requestedHandleTypes=CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    size_t mg=0; DCK(cuMemGetAllocationGranularity(&mg,&p,CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+    size_t ms=((size+mg-1)/mg)*mg;
+    CUmemGenericAllocationHandle phys; DCK(cuMemCreate(&phys,ms,&p,0));
+    DCK(cuMulticastBindMem(mc,0,phys,0,size,0));
+    DCK(cuMemAddressReserve(&uc[d],size,0,0,0));
+    DCK(cuMemMap(uc[d],size,0,phys,0));
+    CUmemAccessDesc ad; memset(&ad,0,sizeof(ad));
+    ad.location.type=CU_MEM_LOCATION_TYPE_DEVICE; ad.location.id=R[d].dev; ad.flags=CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    DCK(cuMemSetAccess(uc[d],size,&ad,1));
+    CK(cudaMemset((void*)uc[d],0,size));
+  }
+  CUdeviceptr mc_va; DCK(cuMemAddressReserve(&mc_va,size,mcg,0,0)); DCK(cuMemMap(mc_va,size,0,mc,0));
+  std::vector<CUmemAccessDesc> ad(N);
+  for (int d=0; d<N; ++d){ memset(&ad[d],0,sizeof(CUmemAccessDesc));
+    ad[d].location.type=CU_MEM_LOCATION_TYPE_DEVICE; ad[d].location.id=R[d].dev; ad[d].flags=CU_MEM_ACCESS_FLAGS_PROT_READWRITE; }
+  DCK(cuMemSetAccess(mc_va,size,ad.data(),N));
+  *mc_va_out = mc_va;
+  return 0;
+}
+
+static int setup_nvls(std::vector<RankState>& R) {
+  // multicast-capable?  (H100 + NVSwitch) — driver-API attribute (132)
+  int mc_sup=0; DCK(cuDeviceGetAttribute(&mc_sup, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, R[0].dev));
+  if (!mc_sup) { printf("NVLS: multicast NOT supported on this device — keeping NCCL ARs.\n"); return -1; }
+  std::vector<CUdeviceptr> uc_a, uc_m, uc_f; CUdeviceptr mca=0, mcm=0, mcf=0;
+  if (mc_make(R, (size_t)HIDDEN*sizeof(float), uc_a, &mca) != 0) return -1;
+  if (mc_make(R, (size_t)HIDDEN*sizeof(float), uc_m, &mcm) != 0) return -1;
+  if (mc_make(R, (size_t)2*sizeof(unsigned),   uc_f, &mcf) != 0) return -1;
+  for (size_t r=0;r<R.size();++r) {
+    CK(cudaSetDevice(R[r].dev));
+    cudaFree(R[r].attn_partial); cudaFree(R[r].moe_partial);   // drop the old cudaMalloc'd buffers
+    R[r].attn_partial = (float*)uc_a[r];                       // K3 now writes into the bound phys mem
+    R[r].moe_partial  = (float*)uc_m[r];
+    R[r].attn_mc = (float*)mca; R[r].moe_mc = (float*)mcm; R[r].flag_mc = (unsigned*)mcf;
+    R[r].nvls_gen = 0;
+  }
+  printf("NVLS: in-switch multimem all-reduce ENABLED (attn+MoE partials multicast-bound across %d GPUs).\n", (int)R.size());
+  return 0;
+}
+
+// =================================================================================================
 // main() — one process, 8 GPUs, NCCL.  Measures the REAL TP=8 B=1 decode latency + AR overhead.
 // =================================================================================================
 int main(int argc, char** argv) {
@@ -1702,6 +1820,12 @@ int main(int argc, char** argv) {
     CK(cudaSetDevice(r));
     CK(cudaStreamCreate(&R[r].stream));
     alloc_rank(R[r], ctx_len);
+  }
+
+  // ---- NVLS: replace the 17.9us NCCL ARs with ~4us in-switch multimem ARs (env NVLS=1) ----
+  const bool use_nvls = getenv("NVLS") && atoi(getenv("NVLS")) != 0;
+  if (use_nvls) {
+    if (setup_nvls(R) != 0) { printf("NVLS setup failed; using NCCL ARs.\n"); }
   }
 
   // ---- per-token ACTIVE HBM read volume PER GPU (the ~1/8 shard each rank reads) ----------------

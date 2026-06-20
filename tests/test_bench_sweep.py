@@ -5,6 +5,7 @@ from inferutil import QWEN3_235B, Cluster, H100_SXM
 from inferutil.bench.config import BenchConfig
 from inferutil.bench.sweep import (
     depth_sweep, config_sweep, quant_grid, layout_grid, full_grid, SweepPoint,
+    realized_efficiency,
 )
 
 CLUSTER = Cluster(gpu=H100_SXM, n_gpus=8)
@@ -52,6 +53,22 @@ def test_layout_sweep_is_pure_speed_search():
     # one quant point -> all differences are layout (no quality change)
     assert len({(p.dtype_bytes, p.kv_dtype_bytes) for p in pts}) == 1
     assert pts[0].decode_tok_s == max(p.decode_tok_s for p in pts)   # top is fastest
+
+
+def test_efficiency_scales_predicted_tok_s():
+    floor = depth_sweep(QWEN3_235B, CLUSTER, CFG, [512])[0]
+    half = depth_sweep(QWEN3_235B, CLUSTER, CFG, [512], efficiency=0.5)[0]
+    assert abs(half.decode_tok_s - 0.5 * floor.decode_tok_s) < 1e-6   # linear derate
+    assert half.tpot_ms > floor.tpot_ms
+    # MBU also scales with the realized throughput
+    assert abs(half.mbu_decode - 0.5 * floor.mbu_decode) < 1e-9
+
+
+def test_realized_efficiency_roundtrips():
+    floor = depth_sweep(QWEN3_235B, CLUSTER, CFG, [CFG.seq_len])[0].decode_tok_s
+    # if measured == 0.2 * floor, realized e must be 0.2
+    e, f = realized_efficiency(QWEN3_235B, CLUSTER, CFG, 0.2 * floor)
+    assert abs(e - 0.2) < 1e-9 and abs(f - floor) < 1e-6
 
 
 if __name__ == "__main__":

@@ -43,12 +43,27 @@ class SweepPoint:
     hint: str
 
 
+def realized_efficiency(cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
+                        measured_tok_s: float):
+    """Whole-model realized efficiency e = measured_tok_s / analytical_floor_tok_s.
+    Feed e back into sweeps/plan (--efficiency) so predictions are calibrated to
+    reality instead of the optimistic floor (e=1.0). Returns (e, floor_tok_s)."""
+    floor = decode_latency(
+        cfg, cluster, plan=config.plan, dtype_bytes=config.dtype_bytes,
+        kv_dtype_bytes=config.kv_dtype_bytes, seq_len=config.seq_len,
+        tp=config.tp, ep=config.ep).tokens_per_s
+    e = (measured_tok_s / floor) if floor else None
+    return e, floor
+
+
 def _point(cfg: MoEConfig, cluster: Cluster, *, label: str, plan: str,
            dtype_bytes: float, kv_dtype_bytes: int, tp: int, ep: int,
-           seq_len: int) -> SweepPoint:
+           seq_len: int, efficiency: float = 1.0) -> SweepPoint:
     bd = decode_latency(cfg, cluster, plan=plan, dtype_bytes=dtype_bytes,
                         kv_dtype_bytes=kv_dtype_bytes, seq_len=seq_len, tp=tp, ep=ep)
-    tok_s = bd.tokens_per_s
+    # e<1 = realized whole-model efficiency (kernels/launch leave the floor on the
+    # table). e=1.0 is the analytical floor (optimistic upper bound).
+    tok_s = bd.tokens_per_s * efficiency
     weight_bytes = cfg.active_params * dtype_bytes
     kv_bytes = seq_len * cfg.kv_bytes_per_token(kv_dtype_bytes)
     bpt = weight_bytes + kv_bytes
@@ -70,11 +85,11 @@ def _point(cfg: MoEConfig, cluster: Cluster, *, label: str, plan: str,
 
 
 def depth_sweep(cfg: MoEConfig, cluster: Cluster, config: BenchConfig,
-                depths: List[int]) -> List[SweepPoint]:
+                depths: List[int], efficiency: float = 1.0) -> List[SweepPoint]:
     """Decode behaviour vs context depth at a fixed config (KV-decay curve)."""
     return [_point(cfg, cluster, label=f"ctx{d}", plan=config.plan,
                    dtype_bytes=config.dtype_bytes, kv_dtype_bytes=config.kv_dtype_bytes,
-                   tp=config.tp, ep=config.ep, seq_len=d)
+                   tp=config.tp, ep=config.ep, seq_len=d, efficiency=efficiency)
             for d in depths]
 
 
@@ -123,11 +138,12 @@ def full_grid(base: BenchConfig, n_gpus: int,
     return out
 
 
-def config_sweep(cfg: MoEConfig, cluster: Cluster,
-                 configs: List[BenchConfig]) -> List[SweepPoint]:
+def config_sweep(cfg: MoEConfig, cluster: Cluster, configs: List[BenchConfig],
+                 efficiency: float = 1.0) -> List[SweepPoint]:
     """Rank candidate configs by predicted decode tok/s (descending)."""
     pts = [_point(cfg, cluster, label=c.name, plan=c.plan, dtype_bytes=c.dtype_bytes,
-                  kv_dtype_bytes=c.kv_dtype_bytes, tp=c.tp, ep=c.ep, seq_len=c.seq_len)
+                  kv_dtype_bytes=c.kv_dtype_bytes, tp=c.tp, ep=c.ep, seq_len=c.seq_len,
+                  efficiency=efficiency)
            for c in configs]
     pts.sort(key=lambda p: -p.decode_tok_s)
     return pts

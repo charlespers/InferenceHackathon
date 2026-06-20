@@ -25,7 +25,8 @@ from ..speculative import sweep as spec_sweep, memory_feasibility
 from .attribution import diagnose
 from .levers import recommend
 from .manifest import build_manifest
-from .sweep import depth_sweep, config_sweep, quant_grid, layout_grid, full_grid
+from .sweep import (depth_sweep, config_sweep, quant_grid, layout_grid, full_grid,
+                    realized_efficiency)
 from .gate import Thresholds, evaluate, regression_gate
 
 DEFAULT_RESULTS_DIR = "results"
@@ -160,8 +161,8 @@ def _cmd_plan(args) -> None:
     config = BenchConfig(name="plan", plan=args.plan, dtype_bytes=args.dtype,
                          kv_dtype_bytes=args.kv_dtype, tp=args.tp, ep=args.ep,
                          prompt_tokens=args.prompt, decode_tokens=args.decode, repeats=1)
-    # Analytical floor result for this config (efficiency=1.0 -> at the floor).
-    eng = MockEngine(QWEN3_235B, cluster, efficiency=1.0, jitter=0.0)
+    # Analytical result (efficiency=1.0 -> floor; pass measured e for a calibrated plan).
+    eng = MockEngine(QWEN3_235B, cluster, efficiency=args.efficiency, jitter=0.0)
     result = run_benchmark(eng, config, QWEN3_235B, cluster)
     rec = RunRecord(runid="analytical", config=config,
                     env={"gpu": cluster.gpu.name, "n_gpus": cluster.n_gpus},
@@ -172,27 +173,46 @@ def _cmd_plan(args) -> None:
     print(format_plan(rec, b, levers, best))
 
 
+def _cmd_calibrate(args) -> None:
+    cluster = _measured_cluster(Cluster(gpu=GPUS[args.gpu], n_gpus=args.n_gpus),
+                                args.peak_bw_gbs)
+    config = BenchConfig(name="cal", plan=args.plan, dtype_bytes=args.dtype,
+                         kv_dtype_bytes=args.kv_dtype, tp=args.tp, ep=args.ep,
+                         prompt_tokens=args.prompt, decode_tokens=args.decode)
+    e, floor = realized_efficiency(QWEN3_235B, cluster, config, args.measured_tok_s)
+    print(f"== CALIBRATE  plan={config.plan} w{config.dtype_bytes}b "
+          f"kv{config.kv_dtype_bytes}b tp={config.tp} ep={config.ep} ctx={config.seq_len} ==")
+    print(f"  measured     : {args.measured_tok_s:.1f} tok/s")
+    print(f"  analytical floor (e=1.0): {floor:.1f} tok/s")
+    if e is not None:
+        print(f"  realized whole-model efficiency e = {e:.3f}  "
+              f"({e*100:.1f}% of floor)")
+        print(f"  -> feed it in:  sweep/plan --efficiency {e:.3f}")
+
+
 def _cmd_sweep(args) -> None:
     cluster = _measured_cluster(Cluster(gpu=GPUS[args.gpu], n_gpus=args.n_gpus),
                                 args.peak_bw_gbs)
     config = BenchConfig(name="sweep", plan=args.plan, dtype_bytes=args.dtype,
                          kv_dtype_bytes=args.kv_dtype, tp=args.tp, ep=args.ep,
                          prompt_tokens=args.prompt, decode_tokens=args.decode)
+    e = args.efficiency
+    etag = "floor (e=1.0)" if e >= 1.0 else f"calibrated e={e:g}"
     if args.depths:
         depths = [int(x) for x in args.depths.split(",")]
-        pts = depth_sweep(QWEN3_235B, cluster, config, depths)
-        title = (f"DEPTH SWEEP  plan={config.plan} w{config.dtype_bytes}b "
+        pts = depth_sweep(QWEN3_235B, cluster, config, depths, efficiency=e)
+        title = (f"DEPTH SWEEP [{etag}]  plan={config.plan} w{config.dtype_bytes}b "
                  f"kv{config.kv_dtype_bytes}b tp={config.tp} ep={config.ep}")
     elif args.full:
-        pts = config_sweep(QWEN3_235B, cluster, full_grid(config, cluster.n_gpus))
-        title = f"FULL SWEEP (quant x layout)  plan={config.plan} ctx={config.seq_len}"
+        pts = config_sweep(QWEN3_235B, cluster, full_grid(config, cluster.n_gpus), efficiency=e)
+        title = f"FULL SWEEP (quant x layout) [{etag}]  plan={config.plan} ctx={config.seq_len}"
     elif args.layout:
-        pts = config_sweep(QWEN3_235B, cluster, layout_grid(config, cluster.n_gpus))
-        title = (f"LAYOUT SWEEP (tp x ep)  plan={config.plan} "
+        pts = config_sweep(QWEN3_235B, cluster, layout_grid(config, cluster.n_gpus), efficiency=e)
+        title = (f"LAYOUT SWEEP (tp x ep) [{etag}]  plan={config.plan} "
                  f"w{config.dtype_bytes}b kv{config.kv_dtype_bytes}b ctx={config.seq_len}")
     else:
-        pts = config_sweep(QWEN3_235B, cluster, quant_grid(config))
-        title = f"CONFIG SWEEP (quant grid)  plan={config.plan} ctx={config.seq_len}"
+        pts = config_sweep(QWEN3_235B, cluster, quant_grid(config), efficiency=e)
+        title = f"CONFIG SWEEP (quant grid) [{etag}]  plan={config.plan} ctx={config.seq_len}"
     print(format_sweep(pts, n_gpus=cluster.n_gpus, usd_per_gpu_hr=args.gpu_hr,
                        title=title))
 
@@ -288,9 +308,26 @@ def main(argv=None) -> None:
     pl.add_argument("--ep", type=int, default=8)
     pl.add_argument("--prompt", type=int, default=512)
     pl.add_argument("--decode", type=int, default=128)
+    pl.add_argument("--efficiency", type=float, default=1.0,
+                    help="realized whole-model efficiency (1.0=floor; pass measured e for a calibrated plan)")
     pl.add_argument("--peak-bw-gbs", type=float, default=None,
                     help="measured HBM GB/s per GPU; overrides the spec sheet")
     pl.set_defaults(func=_cmd_plan)
+
+    ca = sub.add_parser("calibrate",
+                        help="back out realized whole-model efficiency e from a measured tok/s")
+    ca.add_argument("--measured-tok-s", type=float, required=True)
+    ca.add_argument("--gpu", default="H100-SXM-80GB", choices=list(GPUS))
+    ca.add_argument("--n-gpus", type=int, default=8)
+    ca.add_argument("--plan", default="hybrid", choices=["tp", "ep", "hybrid"])
+    ca.add_argument("--dtype", type=float, default=1.0)
+    ca.add_argument("--kv-dtype", type=int, default=2, choices=[1, 2])
+    ca.add_argument("--tp", type=int, default=2)
+    ca.add_argument("--ep", type=int, default=8)
+    ca.add_argument("--prompt", type=int, default=512)
+    ca.add_argument("--decode", type=int, default=128)
+    ca.add_argument("--peak-bw-gbs", type=float, default=None)
+    ca.set_defaults(func=_cmd_calibrate)
 
     sw = sub.add_parser("sweep",
                         help="analytical depth/config sweep (no GPU required)")
@@ -310,6 +347,8 @@ def main(argv=None) -> None:
     sw.add_argument("--full", action="store_true",
                     help="sweep the full quant x layout grid")
     sw.add_argument("--gpu-hr", type=float, default=3.0, help="$/GPU-hr for $/Mtok")
+    sw.add_argument("--efficiency", type=float, default=1.0,
+                    help="realized whole-model efficiency (1.0=floor; pass measured e for calibrated tok/s)")
     sw.add_argument("--peak-bw-gbs", type=float, default=None,
                     help="measured HBM GB/s per GPU; overrides the spec sheet")
     sw.set_defaults(func=_cmd_sweep)

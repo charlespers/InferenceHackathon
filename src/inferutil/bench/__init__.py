@@ -26,7 +26,7 @@ from .attribution import Bottleneck, diagnose
 from .levers import Lever, recommend
 from .prefill import prefill_latency
 from .sweep import (SweepPoint, depth_sweep, config_sweep,
-                    quant_grid, layout_grid, full_grid)
+                    quant_grid, layout_grid, full_grid, realized_efficiency)
 from .cost import energy_metrics, rental_usd_per_mtok
 from .manifest import build_manifest, model_hash
 
@@ -51,7 +51,7 @@ __all__ = [
     "Lever", "recommend",
     "prefill_latency",
     "SweepPoint", "depth_sweep", "config_sweep",
-    "quant_grid", "layout_grid", "full_grid",
+    "quant_grid", "layout_grid", "full_grid", "realized_efficiency",
     "energy_metrics", "rental_usd_per_mtok",
     "build_manifest", "model_hash",
 ]

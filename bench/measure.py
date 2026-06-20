@@ -50,12 +50,13 @@ if __name__ == "__main__":
     ap.add_argument("--ctx", type=int, default=2048, help="approx prompt tokens (padded)")
     ap.add_argument("--decode", type=int, default=128)
     ap.add_argument("--engine", default=None)
+    ap.add_argument("--model", default="qwen3-235b-a22b", help="served model name to request")
     ap.add_argument("--warmup", type=int, default=1)
     a = ap.parse_args()
     prompt = ("Summarize the following. " + "context " * max(0, a.ctx)).strip()
     for _ in range(a.warmup):
-        stream_once(a.base, "warm up", 8, a.engine)
-    res = stream_once(a.base, prompt, a.decode, a.engine)
+        stream_once(a.base, "warm up", 8, a.engine, a.model)
+    res = stream_once(a.base, prompt, a.decode, a.engine, a.model)
     print(json.dumps(res, indent=2))
     print(f"\nTTFT {res['ttft_ms']:.1f} ms | TPOT {res['tpot_ms']:.2f} ms | "
           f"decode {res['decode_tok_s']:.1f} tok/s | {res['tokens']} tokens")

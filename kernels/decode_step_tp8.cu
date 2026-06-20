@@ -1243,51 +1243,56 @@ int main(int argc, char** argv) {
   }
 
   // ---- warm up once OUTSIDE timing (lazy module load, cudaFuncSetAttribute, NCCL channel setup) ----
-  for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r)); enqueue_tp8_step(R[r]); }
-  for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r)); CK(cudaStreamSynchronize(R[r].stream)); }
+  //   Driven via run_all_ranks (one thread/rank) so the per-rank NCCL groups can't deadlock.
+  run_all_ranks(R, [](RankState& S){ enqueue_tp8_step(S); });
 
-  // ---- (a) FULL TP=8 step timing.  Time on rank 0's stream with events bracketing all 8 ranks; we
-  //          sync ALL ranks each iter so the measured time is the slowest-rank step (the real B=1 cost).
+  // ---- (a) FULL TP=8 step timing.  Time on rank 0's stream with events recorded INSIDE rank 0's
+  //          thread; every rank syncs its own stream each iter so the measured time is the
+  //          slowest-rank step (the real B=1 cost).  WARM iters then IT timed iters, all in-thread.
   cudaEvent_t ev0, ev1;
   CK(cudaSetDevice(0)); CK(cudaEventCreate(&ev0)); CK(cudaEventCreate(&ev1));
 
-  for (int i = 0; i < WARM; ++i) {
-    for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r)); enqueue_tp8_step(R[r]); }
-    for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r)); CK(cudaStreamSynchronize(R[r].stream)); }
+  float ms_full = 0.f;
+  {
+    std::vector<std::thread> th; th.reserve(TP);
+    for (int r = 0; r < TP; ++r) {
+      th.emplace_back([&, r]() {
+        CK(cudaSetDevice(R[r].dev));
+        for (int i = 0; i < WARM; ++i) { enqueue_tp8_step(R[r]); CK(cudaStreamSynchronize(R[r].stream)); }
+        if (r == 0) CK(cudaEventRecord(ev0, R[0].stream));
+        for (int i = 0; i < IT; ++i) { enqueue_tp8_step(R[r]); CK(cudaStreamSynchronize(R[r].stream)); }
+        if (r == 0) CK(cudaEventRecord(ev1, R[0].stream));
+      });
+    }
+    for (auto& t : th) t.join();
   }
-  CK(cudaSetDevice(0)); CK(cudaEventRecord(ev0, R[0].stream));
-  for (int i = 0; i < IT; ++i) {
-    for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r)); enqueue_tp8_step(R[r]); }
-    // sync every rank so the next iter's collectives don't pile up and the timing is per-step.
-    for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r)); CK(cudaStreamSynchronize(R[r].stream)); }
-  }
-  CK(cudaSetDevice(0)); CK(cudaEventRecord(ev1, R[0].stream)); CK(cudaEventSynchronize(ev1));
-  float ms_full; CK(cudaEventElapsedTime(&ms_full, ev0, ev1)); ms_full /= IT;
+  CK(cudaSetDevice(0)); CK(cudaEventSynchronize(ev1));
+  CK(cudaEventElapsedTime(&ms_full, ev0, ev1)); ms_full /= IT;
 
   // ---- (b) all-reduce-only timing: same 189 collectives/step, NO kernels, to isolate AR overhead --
-  for (int i = 0; i < WARM; ++i) {
-    for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r));
-      for (int l = 0; l < ar_per_step; ++l) {
-        NK(ncclGroupStart());
-        NK(ncclAllReduce(R[r].attn_partial, R[r].attn_partial, HIDDEN, ncclFloat32, ncclSum, R[r].comm, R[r].stream));
-        NK(ncclGroupEnd());
-      }
+  auto enqueue_ar_only = [](RankState& S, int n) {
+    for (int l = 0; l < n; ++l) {
+      NK(ncclGroupStart());
+      NK(ncclAllReduce(S.attn_partial, S.attn_partial, HIDDEN, ncclFloat32, ncclSum, S.comm, S.stream));
+      NK(ncclGroupEnd());
     }
-  }
-  for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r)); CK(cudaStreamSynchronize(R[r].stream)); }
-  CK(cudaSetDevice(0)); CK(cudaEventRecord(ev0, R[0].stream));
-  for (int i = 0; i < IT; ++i) {
-    for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r));
-      for (int l = 0; l < ar_per_step; ++l) {
-        NK(ncclGroupStart());
-        NK(ncclAllReduce(R[r].attn_partial, R[r].attn_partial, HIDDEN, ncclFloat32, ncclSum, R[r].comm, R[r].stream));
-        NK(ncclGroupEnd());
-      }
+  };
+  float ms_ar = 0.f;
+  {
+    std::vector<std::thread> th; th.reserve(TP);
+    for (int r = 0; r < TP; ++r) {
+      th.emplace_back([&, r]() {
+        CK(cudaSetDevice(R[r].dev));
+        for (int i = 0; i < WARM; ++i) { enqueue_ar_only(R[r], ar_per_step); CK(cudaStreamSynchronize(R[r].stream)); }
+        if (r == 0) CK(cudaEventRecord(ev0, R[0].stream));
+        for (int i = 0; i < IT; ++i) { enqueue_ar_only(R[r], ar_per_step); CK(cudaStreamSynchronize(R[r].stream)); }
+        if (r == 0) CK(cudaEventRecord(ev1, R[0].stream));
+      });
     }
-    for (int r = 0; r < TP; ++r) { CK(cudaSetDevice(r)); CK(cudaStreamSynchronize(R[r].stream)); }
+    for (auto& t : th) t.join();
   }
-  CK(cudaSetDevice(0)); CK(cudaEventRecord(ev1, R[0].stream)); CK(cudaEventSynchronize(ev1));
-  float ms_ar; CK(cudaEventElapsedTime(&ms_ar, ev0, ev1)); ms_ar /= IT;
+  CK(cudaSetDevice(0)); CK(cudaEventSynchronize(ev1));
+  CK(cudaEventElapsedTime(&ms_ar, ev0, ev1)); ms_ar /= IT;
 
   // =============================================================================================
   // report.

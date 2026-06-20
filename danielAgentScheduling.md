@@ -94,6 +94,15 @@ Never edit the other loop's files/branch. Merge clean pieces to `main`; rebase o
 
 ## Slot log (append; newest first)
 <!-- format: <UTC> LOOP-X: acquired/released + what ran + result file -->
+- 2026-06-20 08:53 LOOP-A: **RE-ARMED for 09:45** (pid 93213) — venv FIXED. Also fixed the
+  lock-release bug (rmdir failed on non-empty dir w/ holder → now `rm -f holder; rmdir`) and
+  cleared my orphaned lock. **Team gotcha (INTEGRATION.md §6): vLLM 0.11.0 has no transformers
+  upper bound → pulls transformers 5.x which removed `all_special_tokens_extended` → tokenizer
+  crash. Pinned `transformers==4.57.1`** (venv + build script). Verified tokenizer+config load non-GPU.
+- 2026-06-20 08:45 LOOP-A: acquired+released gpu.lock; **EAGLE3 run CRASHED at startup** — NOT
+  GPU/EAGLE3: transformers 5.12.1 vs vLLM 0.11.0 tokenizer incompat (all 3 launches incl baseline
+  died at tokenizer init in ~30s). No GPU load reached. Root-caused + fixed (see 08:53). Slot clean,
+  no contention. logs: /alloc/data/eagle3/vllm_*.log.
 - 2026-06-20 08:32 LOOP-A: **RE-ARMED upgraded slot** (pid 89371) for 08:45 — now a 2-point
   k-sweep (k=3 + opportunistic k=8) for the F-backout. analyzer (eagle3_analyze.py) + Charles's
   backout_floor.py both on box. Plan: eagle3 k=3 (parity+τ+S) → baseline → eagle3 k=8, all eager.

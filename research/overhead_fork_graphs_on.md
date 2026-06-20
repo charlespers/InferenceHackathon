@@ -44,3 +44,21 @@ of Charles's methods address it: `backout_floor.py` (F from LOOP-A's spec run, n
 fraction; **E-attr** (Nsight `cuda_gpu_kern_sum` achieved-BW + idle-gap, plus an eager-vs-graphs A/B) splits
 kernel-busy-at-low-BW (B) from idle-gaps (host) definitively in one slot. Prediction to falsify: the
 eager-vs-graphs delta is *small* (graphs already on) and the kernels show *low achieved BW* → kernel-bound.
+
+## CONFIRMED + SELF-CORRECTION (2026-06-20, LOOP-A's 13:45 diag, commit 967ccdf)
+Measured eager-vs-graphs on plain B=1 decode (isolated venv): **eager 4.4 tok/s (227ms) → graphs 29.92
+(33ms) = 6.8×**; production matches (eager ~10 → graphs 85.7 ≈ 8.5×, commit 27be031).
+- **CONFIRMED — the load-bearing claim holds:** graphs deliver a *huge* win and it is **already banked in
+  the 85.7 baseline** ⇒ the ladder's "rung 1: +CUDA graphs" is **illusory** (no second graphs win to take).
+- **SELF-CORRECTION:** my "prediction to falsify" was wrong as worded — the eager→graphs delta is **large**
+  (6.8×), not small. The reason refines the fork: the eager floor is **HOST-dominated** (per-step Python
+  scheduler/sample/detok, ~190ms in the slow venv / ~88ms implied production), not kernel-launch (~1.13ms,
+  k6). So the "overhead" the ladder split as "launch 3.5 + host 1.5" is really **mostly HOST, removed by
+  graphs**. This does NOT change the conclusion: that host floor is *gone* post-graphs, so the residual 7ms
+  in the 85.7 (graphs-on) baseline is **kernel + comms (Story B)** — what graphs can't touch. Story A's
+  "launch/host" is real but it lives in the eager regime the baseline already escaped.
+- **Caveat:** this diag is a host-dominated *eager-vs-graphs* split; it does NOT itself prove the post-graphs
+  residual is kernel-vs-(small)host. That still needs the production eager-vs-graphs A/B at the achieved-BW
+  level (E-attr) — the diag's 5.5%-roofline graphs-on number is *consistent* with kernel-bound but is untuned
+  Triton, not the production engine. Net: Story B stands on the e≈0.18 evidence; the illusory-rung point is now
+  empirically nailed.
